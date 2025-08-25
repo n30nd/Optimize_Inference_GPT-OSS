@@ -1,551 +1,776 @@
-// TODO: GPU optimized version for AMD MI250 using HIP (no HIPBLAS)
+// TODO: Modify this file to optimize end-to-end throughput
 #include "getp_eval.cpp"
 #include <hip/hip_runtime.h>
 
 #ifndef GETP_RUN
 #define GETP_RUN
 
-// GPU memory structures
+#define HIP_CHECK(cmd) \
+  do { \
+    hipError_t error = cmd; \
+    if (error != hipSuccess) { \
+      fprintf(stderr, "HIP error (%s:%d): %s\n", __FILE__, __LINE__, hipGetErrorString(error)); \
+      exit(EXIT_FAILURE); \
+    } \
+  } while(0)
+
+// GPU versions of weights and state
 typedef struct {
-    // GPU weights pointers
-    float *d_token_embedding_table;
-    float *d_rms_attn_w;
-    float *d_rms_ffn_w;
-    float *d_w_qkv;
-    float *d_w_o;
-    float *d_b_qkv;
-    float *d_b_o;
-    float *d_attn_sinks;
-    float *d_w_router;
-    float *d_b_router;
-    float *d_w_mlp1;
-    float *d_w_mlp2;
-    float *d_b_mlp1;
-    float *d_b_mlp2;
-    float *d_rms_out_w;
-    float *d_out;
-} GPUWeights;
+  float *token_embedding_table;
+  float *out;
+  float *rms_attn_w;
+  float *rms_ffn_w;
+  float *rms_out_w;
+  float *w_qkv;
+  float *b_qkv;
+  float *w_o;
+  float *b_o;
+  float *attn_sinks;
+  float *w_router;
+  float *b_router;
+  float *w_mlp1;
+  float *w_mlp2;
+  float *b_mlp1;
+  float *b_mlp2;
+} GPUTransformerWeights;
 
 typedef struct {
-    // GPU state pointers
-    float *d_x;
-    float *d_t;
-    float *d_tb;
-    float *d_tb2;
-    float *d_router_score;
-    float *d_topk_v;
-    int *d_topk_i;
-    float *d_mlp1_out;
-    float *d_gate;
-    float *d_up;
-    float *d_gate_up;
-    float *d_e_agg;
-    float *d_qkv;
-    float *d_q;
-    float *d_k;
-    float *d_v;
-    float *d_att;
-    float *d_logits;
-    float *d_key_cache;
-    float *d_value_cache;
-    float *d_mask;
-    
-    // Working buffers
-    float *d_cos_vals;
-    float *d_sin_vals;
-} GPUState;
+  float *x;
+  float *t;
+  float *tb;
+  float *tb2;
+  float *router_score;
+  float *topk_v;
+  int *topk_i;
+  float *mlp1_out;
+  float *gate;
+  float *up;
+  float *gate_up;
+  float *e_agg;
+  float *qkv;
+  float *q;
+  float *k;
+  float *v;
+  float *att;
+  float *logits;
+  float *key_cache;
+  float *value_cache;
+  float *mask;
+  float *cos_vals;
+  float *sin_vals;
+} GPURunState;
 
-// Global GPU structures
-static GPUWeights g_gpu_weights;
-static GPUState g_gpu_state;
-static float *g_cpu_logits = NULL; // Dynamic allocation
+// Global GPU data structures
+GPUTransformerWeights gpu_weights;
+GPURunState gpu_state;
 
-#define HIP_CHECK(call) \
-    do { \
-        hipError_t err = call; \
-        if (err != hipSuccess) { \
-            fprintf(stderr, "HIP error at %s:%d - %s\n", __FILE__, __LINE__, hipGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
-
-// Simple RMSNorm kernel without complex reduction
-__global__ void rmsnorm_simple_kernel(float *output, const float *input, const float *weight, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // Compute sum of squares across all threads
-    float sum_sq = 0.0f;
-    for (int i = 0; i < size; i++) {
-        sum_sq += input[i] * input[i];
+// HIP Kernels
+__global__ void rmsnorm_kernel(float *o, float *x, float *weight, int size) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < size) {
+    __shared__ float shared_ss;
+    if (threadIdx.x == 0) {
+      shared_ss = 0.0f;
+      for (int j = 0; j < size; j++) {
+        shared_ss += x[j] * x[j];
+      }
+      shared_ss /= size;
+      shared_ss += 1e-5f;
+      shared_ss = 1.0f / sqrtf(shared_ss);
     }
+    __syncthreads();
     
-    float rms = sqrtf(sum_sq / size + 1e-5f);
-    
-    if (idx < size) {
-        output[idx] = (input[idx] / rms) * weight[idx];
-    }
+    o[tid] = weight[tid] * (shared_ss * x[tid]);
+  }
 }
 
-// Simple softmax kernel
-__global__ void softmax_simple_kernel(float *x, int size) {
-    int idx = threadIdx.x;
-    
-    // Find max value
-    float max_val = -INFINITY;
-    for (int i = 0; i < size; i++) {
-        if (x[i] > max_val) max_val = x[i];
+__global__ void matmul_kernel(float *xout, float *x, float *w, int n, int d) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < d) {
+    float val = 0.0f;
+    for (int j = 0; j < n; j++) {
+      val += w[i * n + j] * x[j];
+    }
+    xout[i] = val;
+  }
+}
+
+__global__ void add_bias_kernel(float *output, float *bias, int size) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < size) {
+    output[tid] += bias[tid];
+  }
+}
+
+__global__ void copy_kernel(float *dst, float *src, int size) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < size) {
+    dst[tid] = src[tid];
+  }
+}
+
+__global__ void softmax_kernel(float *x, int size) {
+  __shared__ float max_val;
+  __shared__ float sum_val;
+  
+  if (threadIdx.x == 0) {
+    max_val = x[0];
+    for (int i = 1; i < size; i++) {
+      if (x[i] > max_val) {
+        max_val = x[i];
+      }
     }
     
-    // Compute exp and sum
+    sum_val = 0.0f;
+    for (int i = 0; i < size; i++) {
+      x[i] = expf(x[i] - max_val);
+      sum_val += x[i];
+    }
+    
+    for (int i = 0; i < size; i++) {
+      x[i] /= sum_val;
+    }
+  }
+  __syncthreads();
+}
+
+__global__ void compute_cos_sin_kernel(float *cos_out, float *sin_out, int pos, 
+                                       float base, int head_dim, float scaling_factor,
+                                       float initial_context_length, float ntk_beta, 
+                                       float ntk_alpha) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int d_half = head_dim / 2;
+  
+  if (tid < d_half) {
+    // Compute inv_freq for this thread
+    float freq = powf(base, ((float)(2 * tid)) / (float)head_dim);
+    float inv_freq;
+    
+    if (scaling_factor > 1.0f) {
+      float low = d_half * logf(initial_context_length / (ntk_beta * 2.0f * M_PI)) / logf(base);
+      float high = d_half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(base);
+      
+      float interpolation = 1.0f / (scaling_factor * freq);
+      float extrapolation = 1.0f / freq;
+      
+      float ramp = ((float)tid - low) / (high - low);
+      if (ramp < 0) ramp = 0;
+      if (ramp > 1) ramp = 1;
+      
+      float mask = 1.0f - ramp;
+      inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
+    } else {
+      inv_freq = 1.0f / freq;
+    }
+    
+    float concentration = (scaling_factor > 1.0f) ? (0.1f * logf(scaling_factor) + 1.0f) : 1.0f;
+    float val = (float)pos * inv_freq;
+    cos_out[tid] = cosf(val) * concentration;
+    sin_out[tid] = sinf(val) * concentration;
+  }
+}
+
+__global__ void apply_rotary_emb_kernel(float *x, float *cos, float *sin, int n_heads, int head_dim) {
+  int h = blockIdx.x;
+  int i = threadIdx.x;
+  int half = head_dim / 2;
+  
+  if (h < n_heads && i < half) {
+    float x1 = x[h * head_dim + i];
+    float x2 = x[h * head_dim + half + i];
+    
+    float c = cos[i];
+    float s = sin[i];
+    
+    float o1 = x1 * c - x2 * s;
+    float o2 = x2 * c + x1 * s;
+    
+    x[h * head_dim + i] = o1;
+    x[h * head_dim + half + i] = o2;
+  }
+}
+
+__global__ void attention_scores_kernel(float *att, float *q, float *key_cache, 
+                                        int head_dim, int loff, int kv_dim, int kv_mul,
+                                        int h, int pos, int seq_len, float *mask) {
+  int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t <= pos) {
+    float *k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
+    float score = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+      score += q[i] * k[i];
+    }
+    score /= sqrtf(head_dim);
+    
+    // Apply sliding window mask if enabled
+    if (mask != NULL) {
+      score += mask[pos * seq_len + t];
+    }
+    
+    att[t] = score;
+  }
+}
+
+__global__ void attention_weighted_sum_kernel(float *tb, float *att, float *value_cache,
+                                              int head_dim, int loff, int kv_dim, int kv_mul,
+                                              int h, int pos) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < head_dim) {
     float sum = 0.0f;
-    for (int i = 0; i < size; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
+    for (int t = 0; t <= pos; t++) {
+      float *v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
+      float a = att[t];
+      sum += a * v[i];
+    }
+    tb[h * head_dim + i] = sum;
+  }
+}
+
+__global__ void swiglu_kernel(float *gate_up, float *gate, float *up, int intermediate_dim, float swiglu_limit) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < intermediate_dim) {
+    float val = gate[tid];
+    float up_val = up[tid];
+    
+    // Clamping
+    if (val > swiglu_limit) val = swiglu_limit;
+    if (up_val > swiglu_limit) up_val = swiglu_limit;
+    if (up_val < -swiglu_limit) up_val = -swiglu_limit;
+    
+    // SwiGLU: silu(x) = x * sigmoid(alpha * x)
+    const float alpha = 1.702f;
+    val *= (1.0f / (1.0f + expf(-alpha * val)));
+    val *= (up_val + 1.0f);
+    
+    gate_up[tid] = val;
+  }
+}
+
+__global__ void split_gate_up_kernel(float *gate, float *up, float *mlp1_out, int intermediate_dim) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < intermediate_dim) {
+    gate[tid] = mlp1_out[2 * tid];
+    up[tid] = mlp1_out[2 * tid + 1];
+  }
+}
+
+__global__ void weighted_sum_kernel(float *e_agg, float *tb2, float expert_w, int hidden_dim) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < hidden_dim) {
+    e_agg[tid] += tb2[tid] * expert_w;
+  }
+}
+
+__global__ void residual_connection_kernel(float *x, float *residual, int size) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < size) {
+    x[tid] += residual[tid];
+  }
+}
+
+// CPU implementations for topk (will call from host)
+void topk_cpu(float *topk_values, int *topk_indices, float *router_score, int num_experts, int experts_per_token) {
+  typedef struct { float value; int index; } Pair;
+  
+  Pair *pairs = (Pair*)malloc(num_experts * sizeof(Pair));
+  for (int i = 0; i < num_experts; ++i) {
+    pairs[i].value = router_score[i];
+    pairs[i].index = i;
+  }
+  
+  // Simple selection sort for top-k
+  for (int i = 0; i < experts_per_token; i++) {
+    int max_idx = i;
+    for (int j = i + 1; j < num_experts; j++) {
+      if (pairs[j].value > pairs[max_idx].value) {
+        max_idx = j;
+      }
+    }
+    if (max_idx != i) {
+      Pair temp = pairs[i];
+      pairs[i] = pairs[max_idx];
+      pairs[max_idx] = temp;
+    }
+    topk_values[i] = pairs[i].value;
+    topk_indices[i] = pairs[i].index;
+  }
+  
+  free(pairs);
+}
+
+void gpu_malloc_run_state(GPURunState *s, Config *p) {
+  int kv_dim = p->head_dim * p->n_kv_heads;
+  
+  HIP_CHECK(hipMalloc(&s->x, p->hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->t, p->hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->tb, p->head_dim * p->n_attn_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->tb2, p->hidden_dim * sizeof(float)));
+  
+  HIP_CHECK(hipMalloc(&s->router_score, p->n_experts * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->topk_v, p->experts_per_token * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->topk_i, p->experts_per_token * sizeof(int)));
+  
+  HIP_CHECK(hipMalloc(&s->mlp1_out, 2 * p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate, p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->up, p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up, p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->e_agg, p->hidden_dim * sizeof(float)));
+  
+  HIP_CHECK(hipMalloc(&s->qkv, p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->q, p->n_attn_heads * p->head_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->k, p->n_kv_heads * p->head_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->v, p->n_kv_heads * p->head_dim * sizeof(float)));
+  
+  HIP_CHECK(hipMalloc(&s->key_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->att, p->n_attn_heads * p->seq_len * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->logits, p->vocab_size * sizeof(float)));
+  
+  if (p->sliding_window > 0) {
+    HIP_CHECK(hipMalloc(&s->mask, p->seq_len * p->seq_len * sizeof(float)));
+  } else {
+    s->mask = NULL;
+  }
+  
+  HIP_CHECK(hipMalloc(&s->cos_vals, (p->head_dim / 2) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->sin_vals, (p->head_dim / 2) * sizeof(float)));
+}
+
+void gpu_free_run_state(GPURunState *s) {
+  hipFree(s->x);
+  hipFree(s->t);
+  hipFree(s->tb);
+  hipFree(s->tb2);
+  hipFree(s->router_score);
+  hipFree(s->topk_v);
+  hipFree(s->topk_i);
+  hipFree(s->mlp1_out);
+  hipFree(s->gate);
+  hipFree(s->up);
+  hipFree(s->gate_up);
+  hipFree(s->e_agg);
+  hipFree(s->qkv);
+  hipFree(s->q);
+  hipFree(s->k);
+  hipFree(s->v);
+  hipFree(s->key_cache);
+  hipFree(s->value_cache);
+  hipFree(s->att);
+  hipFree(s->logits);
+  if (s->mask) hipFree(s->mask);
+  hipFree(s->cos_vals);
+  hipFree(s->sin_vals);
+}
+
+void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
+  int head_dim = p->head_dim;
+  int n_layers = p->n_layers;
+  int n_experts = p->n_experts;
+  int hidden_dim = p->hidden_dim;
+  int intermediate_dim = p->intermediate_dim;
+  int vocab_size = p->vocab_size;
+  int n_attn_heads = p->n_attn_heads;
+  int n_kv_heads = p->n_kv_heads;
+  
+  // Allocate and copy weights
+  size_t token_embed_size = vocab_size * hidden_dim * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->token_embedding_table, token_embed_size));
+  HIP_CHECK(hipMemcpy(gpu_w->token_embedding_table, cpu_w->token_embedding_table, token_embed_size, hipMemcpyHostToDevice));
+  
+  HIP_CHECK(hipMalloc(&gpu_w->out, token_embed_size));
+  HIP_CHECK(hipMemcpy(gpu_w->out, cpu_w->out, token_embed_size, hipMemcpyHostToDevice));
+  
+  size_t rms_size = n_layers * hidden_dim * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->rms_attn_w, rms_size));
+  HIP_CHECK(hipMemcpy(gpu_w->rms_attn_w, cpu_w->rms_attn_w, rms_size, hipMemcpyHostToDevice));
+  
+  HIP_CHECK(hipMalloc(&gpu_w->rms_ffn_w, rms_size));
+  HIP_CHECK(hipMemcpy(gpu_w->rms_ffn_w, cpu_w->rms_ffn_w, rms_size, hipMemcpyHostToDevice));
+  
+  size_t rms_out_size = hidden_dim * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->rms_out_w, rms_out_size));
+  HIP_CHECK(hipMemcpy(gpu_w->rms_out_w, cpu_w->rms_out_w, rms_out_size, hipMemcpyHostToDevice));
+  
+  size_t qkv_w_size = n_layers * hidden_dim * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads) * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->w_qkv, qkv_w_size));
+  HIP_CHECK(hipMemcpy(gpu_w->w_qkv, cpu_w->w_qkv, qkv_w_size, hipMemcpyHostToDevice));
+  
+  size_t qkv_b_size = n_layers * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads) * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->b_qkv, qkv_b_size));
+  HIP_CHECK(hipMemcpy(gpu_w->b_qkv, cpu_w->b_qkv, qkv_b_size, hipMemcpyHostToDevice));
+  
+  size_t o_w_size = n_layers * (head_dim * n_attn_heads) * hidden_dim * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->w_o, o_w_size));
+  HIP_CHECK(hipMemcpy(gpu_w->w_o, cpu_w->w_o, o_w_size, hipMemcpyHostToDevice));
+  
+  size_t o_b_size = n_layers * hidden_dim * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->b_o, o_b_size));
+  HIP_CHECK(hipMemcpy(gpu_w->b_o, cpu_w->b_o, o_b_size, hipMemcpyHostToDevice));
+  
+  size_t attn_sinks_size = n_layers * n_attn_heads * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->attn_sinks, attn_sinks_size));
+  HIP_CHECK(hipMemcpy(gpu_w->attn_sinks, cpu_w->attn_sinks, attn_sinks_size, hipMemcpyHostToDevice));
+  
+  size_t router_w_size = n_layers * hidden_dim * n_experts * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->w_router, router_w_size));
+  HIP_CHECK(hipMemcpy(gpu_w->w_router, cpu_w->w_router, router_w_size, hipMemcpyHostToDevice));
+  
+  size_t router_b_size = n_layers * n_experts * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->b_router, router_b_size));
+  HIP_CHECK(hipMemcpy(gpu_w->b_router, cpu_w->b_router, router_b_size, hipMemcpyHostToDevice));
+  
+  size_t mlp1_w_size = n_layers * n_experts * 2 * intermediate_dim * hidden_dim * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->w_mlp1, mlp1_w_size));
+  HIP_CHECK(hipMemcpy(gpu_w->w_mlp1, cpu_w->w_mlp1, mlp1_w_size, hipMemcpyHostToDevice));
+  
+  size_t mlp1_b_size = n_layers * n_experts * 2 * intermediate_dim * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->b_mlp1, mlp1_b_size));
+  HIP_CHECK(hipMemcpy(gpu_w->b_mlp1, cpu_w->b_mlp1, mlp1_b_size, hipMemcpyHostToDevice));
+  
+  size_t mlp2_w_size = n_layers * n_experts * hidden_dim * intermediate_dim * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->w_mlp2, mlp2_w_size));
+  HIP_CHECK(hipMemcpy(gpu_w->w_mlp2, cpu_w->w_mlp2, mlp2_w_size, hipMemcpyHostToDevice));
+  
+  size_t mlp2_b_size = n_layers * n_experts * hidden_dim * sizeof(float);
+  HIP_CHECK(hipMalloc(&gpu_w->b_mlp2, mlp2_b_size));
+  HIP_CHECK(hipMemcpy(gpu_w->b_mlp2, cpu_w->b_mlp2, mlp2_b_size, hipMemcpyHostToDevice));
+}
+
+void gpu_free_weights(GPUTransformerWeights *gpu_w) {
+  hipFree(gpu_w->token_embedding_table);
+  hipFree(gpu_w->out);
+  hipFree(gpu_w->rms_attn_w);
+  hipFree(gpu_w->rms_ffn_w);
+  hipFree(gpu_w->rms_out_w);
+  hipFree(gpu_w->w_qkv);
+  hipFree(gpu_w->b_qkv);
+  hipFree(gpu_w->w_o);
+  hipFree(gpu_w->b_o);
+  hipFree(gpu_w->attn_sinks);
+  hipFree(gpu_w->w_router);
+  hipFree(gpu_w->b_router);
+  hipFree(gpu_w->w_mlp1);
+  hipFree(gpu_w->b_mlp1);
+  hipFree(gpu_w->w_mlp2);
+  hipFree(gpu_w->b_mlp2);
+}
+
+float *gpu_forward(Transformer *transformer, int token, int pos) {
+  Config *p = &transformer->config;
+  
+  int head_dim = p->head_dim;
+  int hidden_dim = p->hidden_dim;
+  int kv_dim = p->head_dim * p->n_kv_heads;
+  int kv_mul = p->n_attn_heads / p->n_kv_heads;
+  int intermediate_dim = p->intermediate_dim;
+  int n_experts = p->n_experts;
+  
+  dim3 block(256);
+  dim3 grid_hidden = dim3((hidden_dim + block.x - 1) / block.x);
+  dim3 grid_vocab = dim3((p->vocab_size + block.x - 1) / block.x);
+  dim3 grid_intermediate = dim3((intermediate_dim + block.x - 1) / block.x);
+  dim3 grid_experts = dim3((n_experts + block.x - 1) / block.x);
+  
+  // Copy token embedding
+  float *token_row = gpu_weights.token_embedding_table + token * hidden_dim;
+  HIP_CHECK(hipMemcpy(gpu_state.x, token_row, hidden_dim * sizeof(float), hipMemcpyDeviceToDevice));
+  
+  // Forward through layers
+  for (int l = 0; l < p->n_layers; l++) {
+    // Attention RMSNorm
+    float *rms_attn_w = gpu_weights.rms_attn_w + l * hidden_dim;
+    rmsnorm_kernel<<<grid_hidden, block>>>(gpu_state.t, gpu_state.x, rms_attn_w, hidden_dim);
+    HIP_CHECK(hipDeviceSynchronize());
+    
+    // QKV projection
+    int loff = l * p->seq_len * kv_dim;
+    float *w_qkv = gpu_weights.w_qkv + l * hidden_dim * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+    float *b_qkv = gpu_weights.b_qkv + l * (head_dim * p->n_attn_heads + 2 * head_dim * p->n_kv_heads);
+    
+    int qkv_out_dim = (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
+    dim3 grid_qkv = dim3((qkv_out_dim + block.x - 1) / block.x);
+    matmul_kernel<<<grid_qkv, block>>>(gpu_state.qkv, gpu_state.t, w_qkv, hidden_dim, qkv_out_dim);
+    add_bias_kernel<<<grid_qkv, block>>>(gpu_state.qkv, b_qkv, qkv_out_dim);
+    HIP_CHECK(hipDeviceSynchronize());
+    
+    // Separate Q, K, V
+    int q_size = head_dim * p->n_attn_heads;
+    int k_size = head_dim * p->n_kv_heads;
+    int v_size = head_dim * p->n_kv_heads;
+    
+    HIP_CHECK(hipMemcpy(gpu_state.q, gpu_state.qkv, q_size * sizeof(float), hipMemcpyDeviceToDevice));
+    HIP_CHECK(hipMemcpy(gpu_state.k, gpu_state.qkv + q_size, k_size * sizeof(float), hipMemcpyDeviceToDevice));
+    HIP_CHECK(hipMemcpy(gpu_state.v, gpu_state.qkv + q_size + k_size, v_size * sizeof(float), hipMemcpyDeviceToDevice));
+    
+    // Store K, V in cache
+    float *k_cache_pos = gpu_state.key_cache + loff + pos * kv_dim;
+    float *v_cache_pos = gpu_state.value_cache + loff + pos * kv_dim;
+    HIP_CHECK(hipMemcpy(k_cache_pos, gpu_state.k, k_size * sizeof(float), hipMemcpyDeviceToDevice));
+    HIP_CHECK(hipMemcpy(v_cache_pos, gpu_state.v, v_size * sizeof(float), hipMemcpyDeviceToDevice));
+    
+    // RoPE
+    float ntk_beta = 32.0f;
+    float ntk_alpha = 1.0f;
+    dim3 grid_rope = dim3((head_dim / 2 + block.x - 1) / block.x);
+    compute_cos_sin_kernel<<<grid_rope, block>>>(gpu_state.cos_vals, gpu_state.sin_vals, pos,
+                                                 p->rope_theta, head_dim, p->rope_scaling_factor,
+                                                 p->initial_context_length, ntk_beta, ntk_alpha);
+    HIP_CHECK(hipDeviceSynchronize());
+    
+    apply_rotary_emb_kernel<<<p->n_attn_heads, head_dim/2>>>(gpu_state.q, gpu_state.cos_vals, gpu_state.sin_vals, p->n_attn_heads, head_dim);
+    apply_rotary_emb_kernel<<<p->n_kv_heads, head_dim/2>>>(gpu_state.k, gpu_state.cos_vals, gpu_state.sin_vals, p->n_kv_heads, head_dim);
+    HIP_CHECK(hipDeviceSynchronize());
+    
+    // Update K cache after RoPE
+    HIP_CHECK(hipMemcpy(k_cache_pos, gpu_state.k, k_size * sizeof(float), hipMemcpyDeviceToDevice));
+    
+    // Multi-head attention
+    for (int h = 0; h < p->n_attn_heads; h++) {
+      float *q = gpu_state.q + h * head_dim;
+      float *att = gpu_state.att + h * p->seq_len;
+      
+      // Compute attention scores
+      dim3 grid_att = dim3((pos + 1 + block.x - 1) / block.x);
+      attention_scores_kernel<<<grid_att, block>>>(att, q, gpu_state.key_cache, head_dim, loff, 
+                                                   kv_dim, kv_mul, h, pos, p->seq_len,
+                                                   (p->sliding_window > 0 && l % 2 == 0) ? gpu_state.mask : NULL);
+      HIP_CHECK(hipDeviceSynchronize());
+      
+      // Add attention sink
+      float sink_score;
+      HIP_CHECK(hipMemcpy(&sink_score, gpu_weights.attn_sinks + l * p->n_attn_heads + h, sizeof(float), hipMemcpyDeviceToHost));
+      HIP_CHECK(hipMemcpy(att + pos + 1, &sink_score, sizeof(float), hipMemcpyHostToDevice));
+      
+      // Softmax
+      softmax_kernel<<<1, 1>>>(att, pos + 2);
+      HIP_CHECK(hipDeviceSynchronize());
+      
+      // Weighted sum
+      dim3 grid_head_dim = dim3((head_dim + block.x - 1) / block.x);
+      attention_weighted_sum_kernel<<<grid_head_dim, block>>>(gpu_state.tb, att, gpu_state.value_cache,
+                                                              head_dim, loff, kv_dim, kv_mul, h, pos);
+      HIP_CHECK(hipDeviceSynchronize());
     }
     
-    // Normalize
-    for (int i = 0; i < size; i++) {
-        x[i] /= sum;
-    }
-}
-
-__global__ void add_bias_kernel(float *output, const float *bias, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        output[idx] += bias[idx];
-    }
-}
-
-__global__ void copy_embeddings_kernel(float *output, const float *embeddings, int token, int hidden_dim) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < hidden_dim) {
-        output[idx] = embeddings[token * hidden_dim + idx];
-    }
-}
-
-__global__ void element_add_kernel(float *a, const float *b, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        a[idx] += b[idx];
-    }
-}
-
-// Simple matrix-vector multiplication kernel
-__global__ void matvec_simple_kernel(float *output, const float *input, const float *weight, 
-                                    int in_features, int out_features) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    // Output projection
+    float *w_o = gpu_weights.w_o + l * (head_dim * p->n_attn_heads) * hidden_dim;
+    float *b_o = gpu_weights.b_o + l * hidden_dim;
+    matmul_kernel<<<grid_hidden, block>>>(gpu_state.tb2, gpu_state.tb, w_o, head_dim * p->n_attn_heads, hidden_dim);
+    add_bias_kernel<<<grid_hidden, block>>>(gpu_state.tb2, b_o, hidden_dim);
+    HIP_CHECK(hipDeviceSynchronize());
     
-    if (row < out_features) {
-        float sum = 0.0f;
-        for (int col = 0; col < in_features; col++) {
-            sum += weight[row * in_features + col] * input[col];
-        }
-        output[row] = sum;
-    }
-}
-
-// GPU matrix multiplication wrapper
-void gpu_matmul(float *output, const float *input, const float *weight, int in_features, int out_features) {
-    int block_size = 256;
-    dim3 grid((out_features + block_size - 1) / block_size);
-    dim3 block(block_size);
-    matvec_simple_kernel<<<grid, block>>>(output, input, weight, in_features, out_features);
-}
-
-// Simple kernels for MLP operations
-__global__ void extract_gate_up_kernel(float *gate, float *up, const float *gate_up_interleaved, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        gate[idx] = gate_up_interleaved[2 * idx];
-        up[idx] = gate_up_interleaved[2 * idx + 1];
-    }
-}
-
-__global__ void swiglu_kernel(float *gate_up, const float *gate, const float *up, int size, float limit) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        float val = gate[idx];
-        float up_val = up[idx];
-        
-        // Clamping
-        val = fminf(fmaxf(val, -limit), limit);
-        up_val = fminf(fmaxf(up_val, -limit), limit);
-        
-        // SwiGLU: silu(x) * (up(x) + 1)
-        const float alpha = 1.702f;
-        val *= (1.0f / (1.0f + expf(-alpha * val)));
-        val *= (up_val + 1.0f);
-        
-        gate_up[idx] = val;
-    }
-}
-
-__global__ void copy_qkv_kernel(float *q, float *k, float *v, const float *qkv, 
-                               int n_attn_heads, int n_kv_heads, int head_dim) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int q_size = n_attn_heads * head_dim;
-    int k_size = n_kv_heads * head_dim;
-    int v_size = n_kv_heads * head_dim;
+    // Residual connection
+    residual_connection_kernel<<<grid_hidden, block>>>(gpu_state.x, gpu_state.tb2, hidden_dim);
+    HIP_CHECK(hipDeviceSynchronize());
     
-    if (idx < q_size) {
-        q[idx] = qkv[idx];
-    } else if (idx < q_size + k_size) {
-        k[idx - q_size] = qkv[idx];
-    } else if (idx < q_size + k_size + v_size) {
-        v[idx - q_size - k_size] = qkv[idx];
+    // MoE
+    // FFN RMSNorm
+    float *rms_ffn_w = gpu_weights.rms_ffn_w + l * hidden_dim;
+    rmsnorm_kernel<<<grid_hidden, block>>>(gpu_state.t, gpu_state.x, rms_ffn_w, hidden_dim);
+    HIP_CHECK(hipDeviceSynchronize());
+    
+    // Router
+    float *w_router = gpu_weights.w_router + l * hidden_dim * n_experts;
+    float *b_router = gpu_weights.b_router + l * n_experts;
+    matmul_kernel<<<grid_experts, block>>>(gpu_state.router_score, gpu_state.t, w_router, hidden_dim, n_experts);
+    add_bias_kernel<<<grid_experts, block>>>(gpu_state.router_score, b_router, n_experts);
+    HIP_CHECK(hipDeviceSynchronize());
+    
+    // Copy router scores to CPU for topk
+    float *cpu_router_score = (float*)malloc(n_experts * sizeof(float));
+    float *cpu_topk_v = (float*)malloc(p->experts_per_token * sizeof(float));
+    int *cpu_topk_i = (int*)malloc(p->experts_per_token * sizeof(int));
+    
+    HIP_CHECK(hipMemcpy(cpu_router_score, gpu_state.router_score, n_experts * sizeof(float), hipMemcpyDeviceToHost));
+    topk_cpu(cpu_topk_v, cpu_topk_i, cpu_router_score, n_experts, p->experts_per_token);
+    
+    // Softmax on topk values
+    float sum = 0.0f;
+    float max_val = cpu_topk_v[0];
+    for (int i = 1; i < p->experts_per_token; i++) {
+      if (cpu_topk_v[i] > max_val) max_val = cpu_topk_v[i];
     }
+    for (int i = 0; i < p->experts_per_token; i++) {
+      cpu_topk_v[i] = expf(cpu_topk_v[i] - max_val);
+      sum += cpu_topk_v[i];
+    }
+    for (int i = 0; i < p->experts_per_token; i++) {
+      cpu_topk_v[i] /= sum;
+    }
+    
+    HIP_CHECK(hipMemcpy(gpu_state.topk_v, cpu_topk_v, p->experts_per_token * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(gpu_state.topk_i, cpu_topk_i, p->experts_per_token * sizeof(int), hipMemcpyHostToDevice));
+    
+    // Initialize expert aggregation
+    HIP_CHECK(hipMemset(gpu_state.e_agg, 0, hidden_dim * sizeof(float)));
+    
+    // Process selected experts
+    for (int idx = 0; idx < p->experts_per_token; idx++) {
+      int e = cpu_topk_i[idx];
+      float expert_w = cpu_topk_v[idx];
+      
+      // MLP1 (gate_up projection)
+      float *w_mlp1 = gpu_weights.w_mlp1 + (l * n_experts + e) * (2 * intermediate_dim) * hidden_dim;
+      float *b_mlp1 = gpu_weights.b_mlp1 + (l * n_experts + e) * (2 * intermediate_dim);
+      
+      dim3 grid_mlp1 = dim3((2 * intermediate_dim + block.x - 1) / block.x);
+      matmul_kernel<<<grid_mlp1, block>>>(gpu_state.mlp1_out, gpu_state.t, w_mlp1, hidden_dim, 2 * intermediate_dim);
+      add_bias_kernel<<<grid_mlp1, block>>>(gpu_state.mlp1_out, b_mlp1, 2 * intermediate_dim);
+      HIP_CHECK(hipDeviceSynchronize());
+      
+      // Split gate and up
+      split_gate_up_kernel<<<grid_intermediate, block>>>(gpu_state.gate, gpu_state.up, gpu_state.mlp1_out, intermediate_dim);
+      HIP_CHECK(hipDeviceSynchronize());
+      
+      // SwiGLU
+      swiglu_kernel<<<grid_intermediate, block>>>(gpu_state.gate_up, gpu_state.gate, gpu_state.up, intermediate_dim, p->swiglu_limit);
+      HIP_CHECK(hipDeviceSynchronize());
+      
+      // MLP2 (down projection)
+      float *w_mlp2 = gpu_weights.w_mlp2 + (l * n_experts + e) * hidden_dim * intermediate_dim;
+      float *b_mlp2 = gpu_weights.b_mlp2 + (l * n_experts + e) * hidden_dim;
+      
+      matmul_kernel<<<grid_hidden, block>>>(gpu_state.tb2, gpu_state.gate_up, w_mlp2, intermediate_dim, hidden_dim);
+      add_bias_kernel<<<grid_hidden, block>>>(gpu_state.tb2, b_mlp2, hidden_dim);
+      HIP_CHECK(hipDeviceSynchronize());
+      
+      // Weighted sum to expert aggregation
+      weighted_sum_kernel<<<grid_hidden, block>>>(gpu_state.e_agg, gpu_state.tb2, expert_w, hidden_dim);
+      HIP_CHECK(hipDeviceSynchronize());
+    }
+    
+    // Final residual connection
+    residual_connection_kernel<<<grid_hidden, block>>>(gpu_state.x, gpu_state.e_agg, hidden_dim);
+    HIP_CHECK(hipDeviceSynchronize());
+    
+    free(cpu_router_score);
+    free(cpu_topk_v);
+    free(cpu_topk_i);
+  }
+  
+  // Final RMSNorm
+  rmsnorm_kernel<<<grid_hidden, block>>>(gpu_state.x, gpu_state.x, gpu_weights.rms_out_w, hidden_dim);
+  HIP_CHECK(hipDeviceSynchronize());
+  
+  // Output projection
+  matmul_kernel<<<grid_vocab, block>>>(gpu_state.logits, gpu_state.x, gpu_weights.out, hidden_dim, p->vocab_size);
+  HIP_CHECK(hipDeviceSynchronize());
+  
+  // Copy logits back to CPU
+  static float *cpu_logits = NULL;
+  if (cpu_logits == NULL) {
+    cpu_logits = (float*)malloc(p->vocab_size * sizeof(float));
+  }
+  HIP_CHECK(hipMemcpy(cpu_logits, gpu_state.logits, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
+  
+  return cpu_logits;
 }
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
-    printf("Initializing GPU resources...\n");
-    
-    // Initialize HIP
-    HIP_CHECK(hipSetDevice(0));
-    
-    Config *p = &transformer->config;
-    TransformerWeights *w = &transformer->weights;
-    
-    int hidden_dim = p->hidden_dim;
-    int vocab_size = p->vocab_size;
-    int n_layers = p->n_layers;
-    int n_experts = p->n_experts;
-    int head_dim = p->head_dim;
-    int n_attn_heads = p->n_attn_heads;
-    int n_kv_heads = p->n_kv_heads;
-    int seq_len = p->seq_len;
-    int intermediate_dim = p->intermediate_dim;
-    int experts_per_token = p->experts_per_token;
-    int kv_dim = head_dim * n_kv_heads;
-    
-    printf("Allocating GPU memory for vocab_size=%d, hidden_dim=%d...\n", vocab_size, hidden_dim);
-    
-    // Allocate CPU buffer for logits
-    g_cpu_logits = (float*)malloc(vocab_size * sizeof(float));
-    if (!g_cpu_logits) {
-        fprintf(stderr, "Failed to allocate CPU logits buffer\n");
-        exit(EXIT_FAILURE);
+  // Initialize GPU
+  HIP_CHECK(hipSetDevice(0));
+  
+  // Allocate GPU memory for weights and state
+  gpu_copy_weights(&gpu_weights, &transformer->weights, &transformer->config);
+  gpu_malloc_run_state(&gpu_state, &transformer->config);
+  
+  // Initialize mask for sliding window if needed
+  if (transformer->config.sliding_window > 0 && gpu_state.mask != NULL) {
+    float *cpu_mask = (float*)malloc(transformer->config.seq_len * transformer->config.seq_len * sizeof(float));
+    for (int i = 0; i < transformer->config.seq_len; i++) {
+      for (int j = 0; j < transformer->config.seq_len; j++) {
+        if (i - j >= transformer->config.sliding_window) {
+          cpu_mask[i * transformer->config.seq_len + j] = -INFINITY;
+        } else {
+          cpu_mask[i * transformer->config.seq_len + j] = 0.0f;
+        }
+      }
     }
-    
-    // Allocate GPU memory for weights
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_token_embedding_table, (size_t)vocab_size * hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_rms_attn_w, (size_t)n_layers * hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_rms_ffn_w, (size_t)n_layers * hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_w_qkv, (size_t)n_layers * hidden_dim * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads) * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_w_o, (size_t)n_layers * (head_dim * n_attn_heads) * hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_b_qkv, (size_t)n_layers * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads) * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_b_o, (size_t)n_layers * hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_attn_sinks, (size_t)n_layers * n_attn_heads * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_w_router, (size_t)n_layers * hidden_dim * n_experts * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_b_router, (size_t)n_layers * n_experts * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_w_mlp1, (size_t)n_layers * n_experts * 2 * intermediate_dim * hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_w_mlp2, (size_t)n_layers * n_experts * hidden_dim * intermediate_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_b_mlp1, (size_t)n_layers * n_experts * 2 * intermediate_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_b_mlp2, (size_t)n_layers * n_experts * hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_rms_out_w, (size_t)hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_weights.d_out, (size_t)vocab_size * hidden_dim * sizeof(float)));
-    
-    // Allocate GPU memory for state
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_x, (size_t)hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_t, (size_t)hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_tb, (size_t)head_dim * n_attn_heads * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_tb2, (size_t)hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_router_score, (size_t)n_experts * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_topk_v, (size_t)experts_per_token * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_topk_i, (size_t)experts_per_token * sizeof(int)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_mlp1_out, (size_t)2 * intermediate_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_gate, (size_t)intermediate_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_up, (size_t)intermediate_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_gate_up, (size_t)intermediate_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_e_agg, (size_t)hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_qkv, (size_t)head_dim * (n_attn_heads + 2 * n_kv_heads) * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_q, (size_t)n_attn_heads * head_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_k, (size_t)n_kv_heads * head_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_v, (size_t)n_kv_heads * head_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_att, (size_t)n_attn_heads * seq_len * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_logits, (size_t)vocab_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_key_cache, (size_t)n_layers * seq_len * kv_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_value_cache, (size_t)n_layers * seq_len * kv_dim * sizeof(float)));
-    
-    if (p->sliding_window > 0) {
-        HIP_CHECK(hipMalloc(&g_gpu_state.d_mask, (size_t)seq_len * seq_len * sizeof(float)));
-    }
-    
-    // Working buffers
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_cos_vals, (size_t)(head_dim / 2) * sizeof(float)));
-    HIP_CHECK(hipMalloc(&g_gpu_state.d_sin_vals, (size_t)(head_dim / 2) * sizeof(float)));
-    
-    printf("Copying weights to GPU...\n");
-    
-    // Copy weights from CPU to GPU
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_token_embedding_table, w->token_embedding_table, (size_t)vocab_size * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_rms_attn_w, w->rms_attn_w, (size_t)n_layers * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_rms_ffn_w, w->rms_ffn_w, (size_t)n_layers * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_w_qkv, w->w_qkv, (size_t)n_layers * hidden_dim * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads) * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_w_o, w->w_o, (size_t)n_layers * (head_dim * n_attn_heads) * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_b_qkv, w->b_qkv, (size_t)n_layers * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads) * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_b_o, w->b_o, (size_t)n_layers * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_attn_sinks, w->attn_sinks, (size_t)n_layers * n_attn_heads * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_w_router, w->w_router, (size_t)n_layers * hidden_dim * n_experts * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_b_router, w->b_router, (size_t)n_layers * n_experts * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_w_mlp1, w->w_mlp1, (size_t)n_layers * n_experts * 2 * intermediate_dim * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_w_mlp2, w->w_mlp2, (size_t)n_layers * n_experts * hidden_dim * intermediate_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_b_mlp1, w->b_mlp1, (size_t)n_layers * n_experts * 2 * intermediate_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_b_mlp2, w->b_mlp2, (size_t)n_layers * n_experts * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_rms_out_w, w->rms_out_w, (size_t)hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(g_gpu_weights.d_out, w->out, (size_t)vocab_size * hidden_dim * sizeof(float), hipMemcpyHostToDevice));
-    
-    // Initialize KV cache to zero
-    HIP_CHECK(hipMemset(g_gpu_state.d_key_cache, 0, (size_t)n_layers * seq_len * kv_dim * sizeof(float)));
-    HIP_CHECK(hipMemset(g_gpu_state.d_value_cache, 0, (size_t)n_layers * seq_len * kv_dim * sizeof(float)));
-    
-    HIP_CHECK(hipDeviceSynchronize());
-    printf("GPU initialization completed.\n");
+    HIP_CHECK(hipMemcpy(gpu_state.mask, cpu_mask, 
+                       transformer->config.seq_len * transformer->config.seq_len * sizeof(float), 
+                       hipMemcpyHostToDevice));
+    free(cpu_mask);
+  }
+  
+  printf("GPU warm-up completed successfully.\n");
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
-    printf("Cleaning up GPU resources...\n");
-    
-    // Free CPU buffer
-    if (g_cpu_logits) {
-        free(g_cpu_logits);
-        g_cpu_logits = NULL;
-    }
-    
-    // Free GPU weights
-    hipFree(g_gpu_weights.d_token_embedding_table);
-    hipFree(g_gpu_weights.d_rms_attn_w);
-    hipFree(g_gpu_weights.d_rms_ffn_w);
-    hipFree(g_gpu_weights.d_w_qkv);
-    hipFree(g_gpu_weights.d_w_o);
-    hipFree(g_gpu_weights.d_b_qkv);
-    hipFree(g_gpu_weights.d_b_o);
-    hipFree(g_gpu_weights.d_attn_sinks);
-    hipFree(g_gpu_weights.d_w_router);
-    hipFree(g_gpu_weights.d_b_router);
-    hipFree(g_gpu_weights.d_w_mlp1);
-    hipFree(g_gpu_weights.d_w_mlp2);
-    hipFree(g_gpu_weights.d_b_mlp1);
-    hipFree(g_gpu_weights.d_b_mlp2);
-    hipFree(g_gpu_weights.d_rms_out_w);
-    hipFree(g_gpu_weights.d_out);
-    
-    // Free GPU state
-    hipFree(g_gpu_state.d_x);
-    hipFree(g_gpu_state.d_t);
-    hipFree(g_gpu_state.d_tb);
-    hipFree(g_gpu_state.d_tb2);
-    hipFree(g_gpu_state.d_router_score);
-    hipFree(g_gpu_state.d_topk_v);
-    hipFree(g_gpu_state.d_topk_i);
-    hipFree(g_gpu_state.d_mlp1_out);
-    hipFree(g_gpu_state.d_gate);
-    hipFree(g_gpu_state.d_up);
-    hipFree(g_gpu_state.d_gate_up);
-    hipFree(g_gpu_state.d_e_agg);
-    hipFree(g_gpu_state.d_qkv);
-    hipFree(g_gpu_state.d_q);
-    hipFree(g_gpu_state.d_k);
-    hipFree(g_gpu_state.d_v);
-    hipFree(g_gpu_state.d_att);
-    hipFree(g_gpu_state.d_logits);
-    hipFree(g_gpu_state.d_key_cache);
-    hipFree(g_gpu_state.d_value_cache);
-    if (g_gpu_state.d_mask) hipFree(g_gpu_state.d_mask);
-    hipFree(g_gpu_state.d_cos_vals);
-    hipFree(g_gpu_state.d_sin_vals);
-    
-    printf("GPU cleanup completed.\n");
-}
-
-// Simplified GPU forward function
-float *gpu_forward(Transformer *transformer, int token, int pos) {
-    Config *p = &transformer->config;
-    
-    int hidden_dim = p->hidden_dim;
-    int head_dim = p->head_dim;
-    int n_attn_heads = p->n_attn_heads;
-    int n_kv_heads = p->n_kv_heads;
-    int n_layers = p->n_layers;
-    int vocab_size = p->vocab_size;
-    
-    // Copy token embedding to GPU
-    dim3 block(256);
-    dim3 grid((hidden_dim + block.x - 1) / block.x);
-    copy_embeddings_kernel<<<grid, block>>>(g_gpu_state.d_x, g_gpu_weights.d_token_embedding_table, token, hidden_dim);
-    
-    // Forward through all layers (simplified version)
-    for (int l = 0; l < n_layers; l++) {
-        // RMSNorm for attention
-        rmsnorm_simple_kernel<<<grid, block>>>(
-            g_gpu_state.d_t, g_gpu_state.d_x, 
-            g_gpu_weights.d_rms_attn_w + l * hidden_dim, hidden_dim);
-        
-        // QKV projection
-        gpu_matmul(g_gpu_state.d_qkv, g_gpu_state.d_t, 
-                  g_gpu_weights.d_w_qkv + l * hidden_dim * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads),
-                  hidden_dim, (n_attn_heads + 2 * n_kv_heads) * head_dim);
-        
-        // Add bias
-        dim3 bias_grid(((n_attn_heads + 2 * n_kv_heads) * head_dim + block.x - 1) / block.x);
-        add_bias_kernel<<<bias_grid, block>>>(g_gpu_state.d_qkv, 
-                                            g_gpu_weights.d_b_qkv + l * (head_dim * n_attn_heads + 2 * head_dim * n_kv_heads),
-                                            (n_attn_heads + 2 * n_kv_heads) * head_dim);
-        
-        // Copy Q, K, V
-        dim3 qkv_grid(((n_attn_heads + 2 * n_kv_heads) * head_dim + block.x - 1) / block.x);
-        copy_qkv_kernel<<<qkv_grid, block>>>(g_gpu_state.d_q, g_gpu_state.d_k, g_gpu_state.d_v, 
-                                            g_gpu_state.d_qkv, n_attn_heads, n_kv_heads, head_dim);
-        
-        // Update KV cache (simplified - copy current K,V to cache)
-        int kv_dim = head_dim * n_kv_heads;
-        int cache_offset = l * p->seq_len * kv_dim + pos * kv_dim;
-        HIP_CHECK(hipMemcpy(g_gpu_state.d_key_cache + cache_offset, g_gpu_state.d_k, 
-                           kv_dim * sizeof(float), hipMemcpyDeviceToDevice));
-        HIP_CHECK(hipMemcpy(g_gpu_state.d_value_cache + cache_offset, g_gpu_state.d_v, 
-                           kv_dim * sizeof(float), hipMemcpyDeviceToDevice));
-        
-        // Simplified attention: just use identity for now (skip complex attention computation)
-        HIP_CHECK(hipMemcpy(g_gpu_state.d_tb, g_gpu_state.d_q, 
-                           head_dim * n_attn_heads * sizeof(float), hipMemcpyDeviceToDevice));
-        
-        // Output projection
-        gpu_matmul(g_gpu_state.d_tb2, g_gpu_state.d_tb, 
-                  g_gpu_weights.d_w_o + l * (head_dim * n_attn_heads) * hidden_dim,
-                  head_dim * n_attn_heads, hidden_dim);
-        
-        // Add bias and residual
-        add_bias_kernel<<<grid, block>>>(g_gpu_state.d_tb2, 
-                                        g_gpu_weights.d_b_o + l * hidden_dim, hidden_dim);
-        element_add_kernel<<<grid, block>>>(g_gpu_state.d_x, g_gpu_state.d_tb2, hidden_dim);
-        
-        // FFN 
-        rmsnorm_simple_kernel<<<grid, block>>>(
-            g_gpu_state.d_t, g_gpu_state.d_x, 
-            g_gpu_weights.d_rms_ffn_w + l * hidden_dim, hidden_dim);
-        
-        // Simplified MoE: use first expert only
-        int expert_idx = 0;
-        
-        // MLP1 (gate_up projection)
-        gpu_matmul(g_gpu_state.d_mlp1_out, g_gpu_state.d_t,
-                  g_gpu_weights.d_w_mlp1 + (l * p->n_experts + expert_idx) * 2 * p->intermediate_dim * hidden_dim,
-                  hidden_dim, 2 * p->intermediate_dim);
-        
-        // Add bias
-        dim3 mlp_grid((2 * p->intermediate_dim + block.x - 1) / block.x);
-        add_bias_kernel<<<mlp_grid, block>>>(g_gpu_state.d_mlp1_out,
-                                            g_gpu_weights.d_b_mlp1 + (l * p->n_experts + expert_idx) * 2 * p->intermediate_dim,
-                                            2 * p->intermediate_dim);
-        
-        // Extract gate and up parts
-        dim3 gate_grid((p->intermediate_dim + block.x - 1) / block.x);
-        extract_gate_up_kernel<<<gate_grid, block>>>(g_gpu_state.d_gate, g_gpu_state.d_up, 
-                                                    g_gpu_state.d_mlp1_out, p->intermediate_dim);
-        
-        swiglu_kernel<<<gate_grid, block>>>(g_gpu_state.d_gate_up, g_gpu_state.d_gate, 
-                                          g_gpu_state.d_up, p->intermediate_dim, p->swiglu_limit);
-        
-        // MLP2 (down projection)
-        gpu_matmul(g_gpu_state.d_tb2, g_gpu_state.d_gate_up,
-                  g_gpu_weights.d_w_mlp2 + (l * p->n_experts + expert_idx) * hidden_dim * p->intermediate_dim,
-                  p->intermediate_dim, hidden_dim);
-        
-        // Add bias
-        add_bias_kernel<<<grid, block>>>(g_gpu_state.d_tb2,
-                                        g_gpu_weights.d_b_mlp2 + (l * p->n_experts + expert_idx) * hidden_dim,
-                                        hidden_dim);
-        
-        // Residual connection
-        element_add_kernel<<<grid, block>>>(g_gpu_state.d_x, g_gpu_state.d_tb2, hidden_dim);
-    }
-    
-    // Final RMSNorm
-    rmsnorm_simple_kernel<<<grid, block>>>(
-        g_gpu_state.d_x, g_gpu_state.d_x, g_gpu_weights.d_rms_out_w, hidden_dim);
-    
-    // Output projection
-    gpu_matmul(g_gpu_state.d_logits, g_gpu_state.d_x, g_gpu_weights.d_out, hidden_dim, vocab_size);
-    
-    HIP_CHECK(hipDeviceSynchronize());
-    
-    // Copy logits back to CPU for sampling
-    HIP_CHECK(hipMemcpy(g_cpu_logits, g_gpu_state.d_logits, vocab_size * sizeof(float), hipMemcpyDeviceToHost));
-    
-    return g_cpu_logits;
+  // Free GPU memory
+  gpu_free_weights(&gpu_weights);
+  gpu_free_run_state(&gpu_state);
+  
+  printf("GPU cleanup completed successfully.\n");
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
                                Sampler *sampler, const char *input_seq,
                                int *output_tokens, int steps) {
-    const char *empty_prompt = "";
-    if (input_seq == NULL) {
-        input_seq = empty_prompt;
+  const char *empty_prompt = "";
+  if (input_seq == NULL) {
+    input_seq = empty_prompt;
+  }
+
+  // encode the (string) prompt into tokens sequence
+  int num_prompt_tokens = 0;
+  int *prompt_tokens = (int *)malloc((strlen(input_seq) + 3) *
+                                     sizeof(int)); // +3 for '\0', ?BOS, ?EOS
+  encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
+         transformer->config.initial_context_length);
+  if (num_prompt_tokens < 1) {
+    fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // start the main loop
+  int next;                     // will store the next token in the sequence
+  int token = prompt_tokens[0]; // kick off with the first token in the prompt
+  int pos = 0;                  // position in the sequence
+
+  while (pos < steps) {
+    // forward the transformer to get logits for the next token
+    float *logits = gpu_forward(transformer, token, pos);  // Use GPU version
+
+    // advance the state machine
+    pos++;
+    if (pos < num_prompt_tokens) {
+      // if we are still processing the input prompt, force the next prompt token
+      next = prompt_tokens[pos];
+    } else {
+      // otherwise sample the next token from the logits
+      next = sample(sampler, logits);
+      // save the output token, it will be printed to file
+      output_tokens[pos - num_prompt_tokens] = next;
     }
 
-    // encode the (string) prompt into tokens sequence
-    int num_prompt_tokens = 0;
-    int *prompt_tokens = (int *)malloc((strlen(input_seq) + 3) * sizeof(int));
-    encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
-           transformer->config.initial_context_length);
-    if (num_prompt_tokens < 1) {
-        fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-        exit(EXIT_FAILURE);
+    // data-dependent terminating condition: the EOS (=199999 or =200002) token
+    // delimits sequences
+    if (next == 199999 || next == 200002) {
+      break;
     }
 
-    // start the main loop
-    int next;
-    int token = prompt_tokens[0];
-    int pos = 0;
+    token = next;
+  }
 
-    // print the very first token
-    const char *first_piece = decode_piece(tokenizer, 200006, token);
-    safe_printf(first_piece);
-    fflush(stdout);
+  // Marker for end of sequence
+  output_tokens[pos - num_prompt_tokens + 1] = -1;
 
-    while (pos < steps) {
-        // forward the transformer to get logits for the next token using GPU
-        float *logits = gpu_forward(transformer, token, pos);
+  free(prompt_tokens);
 
-        // advance the state machine
-        pos++;
-        if (pos < num_prompt_tokens) {
-            next = prompt_tokens[pos];
-        } else {
-            next = sample(sampler, logits);
-            output_tokens[pos - num_prompt_tokens] = next;
-        }
-
-        // data-dependent terminating condition
-        if (next == 199999 || next == 200002) {
-            break;
-        }
-
-        // print the token as string
-        const char *piece = decode_piece(tokenizer, token, next);
-        safe_printf(piece);
-        fflush(stdout);
-
-        token = next;
-    }
-
-    printf("\n");
-    output_tokens[pos - num_prompt_tokens + 1] = -1;
-    free(prompt_tokens);
-
-    return pos - num_prompt_tokens + 1;
+  return pos - num_prompt_tokens + 1;
 }
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
-    long long num_token_out = 0;
-    for (int idx = 0; idx < requests->num_reqs; ++idx) {
-        const char *input_seq = get_str_req_ptr(requests, idx);
-        int *output_tokens = get_tok_gen_ptr(requests, idx);
-        num_token_out +=
-            simple_getp_generate(transformer, tokenizer, sampler, input_seq,
-                                 output_tokens, requests->max_seq_len);
-    }
-    return num_token_out;
+  long long num_token_out = 0;
+  for (int idx = 0; idx < requests->num_reqs; ++idx) {
+    const char *input_seq = get_str_req_ptr(requests, idx);
+    int *output_tokens = get_tok_gen_ptr(requests, idx);
+    num_token_out +=
+        simple_getp_generate(transformer, tokenizer, sampler, input_seq,
+                             output_tokens, requests->max_seq_len);
+  }
+  return num_token_out;
 }
 
 #endif // GETP_RUN
