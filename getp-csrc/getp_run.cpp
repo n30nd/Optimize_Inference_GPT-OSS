@@ -584,9 +584,11 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
                                                      /*n=*/hidden_dim, /*d=*/p->vocab_size);
   HIP_CHECK(hipDeviceSynchronize());
 
-  // Copy logits to CPU (reuse static buffer across calls)
-  static float *cpu_logits = NULL;
-  if (cpu_logits == NULL) cpu_logits = (float*)malloc(p->vocab_size * sizeof(float));
+  // Copy logits to CPU (thread-local buffer across calls)
+  thread_local float *cpu_logits = NULL;
+  if (cpu_logits == NULL) {
+    cpu_logits = (float*)malloc(p->vocab_size * sizeof(float));
+  }
   HIP_CHECK(hipMemcpy(cpu_logits, gpu_ctx->state.logits_fp32, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
   return cpu_logits;
 }
