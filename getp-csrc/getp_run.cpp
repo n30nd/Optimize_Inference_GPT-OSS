@@ -345,197 +345,15 @@ void topk_cpu(float *topk_values, int *topk_indices, const float *router_score, 
 }
 
 // ------------------------- Alloc/Free run state -------------------------
+void gpu_malloc_run_state(GPURunState *s, Config *p);
+void gpu_free_run_state(GPURunState *s);
 
-void gpu_malloc_run_state(GPURunState *s, Config *p) {
-  int kv_dim = p->head_dim * p->n_kv_heads;
-
-  HIP_CHECK(hipMalloc(&s->x,   p->hidden_dim * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->t,   p->hidden_dim * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->tb,  p->head_dim * p->n_attn_heads * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->tb2, p->hidden_dim * sizeof(hip_bfloat16)));
-
-  HIP_CHECK(hipMalloc(&s->router_score,      p->n_experts * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->topk_v,            p->experts_per_token * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->topk_i,            p->experts_per_token * sizeof(int)));
-
-  HIP_CHECK(hipMalloc(&s->mlp1_out, 2 * p->intermediate_dim * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->gate,     p->intermediate_dim * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->up,       p->intermediate_dim * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->gate_up,  p->intermediate_dim * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->e_agg,    p->hidden_dim * sizeof(hip_bfloat16)));
-
-  HIP_CHECK(hipMalloc(&s->qkv, p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->q,   p->n_attn_heads * p->head_dim * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->k,   p->n_kv_heads   * p->head_dim * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->v,   p->n_kv_heads   * p->head_dim * sizeof(hip_bfloat16)));
-
-  HIP_CHECK(hipMalloc(&s->key_cache,   p->n_layers * p->seq_len * kv_dim * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->att,         p->n_attn_heads * p->seq_len * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->logits,      p->vocab_size * sizeof(hip_bfloat16)));
-
-  if (p->sliding_window > 0) {
-    HIP_CHECK(hipMalloc(&s->mask, p->seq_len * p->seq_len * sizeof(hip_bfloat16)));
-  } else {
-    s->mask = NULL;
-  }
-
-  HIP_CHECK(hipMalloc(&s->cos_vals, (p->head_dim / 2) * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&s->sin_vals, (p->head_dim / 2) * sizeof(hip_bfloat16)));
-
-  HIP_CHECK(hipMalloc(&s->acc_buffer,  p->hidden_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->logits_fp32, p->vocab_size * sizeof(float)));
-}
-
-void gpu_free_run_state(GPURunState *s) {
-  hipFree(s->x);
-  hipFree(s->t);
-  hipFree(s->tb);
-  hipFree(s->tb2);
-  hipFree(s->router_score);
-  hipFree(s->topk_v);
-  hipFree(s->topk_i);
-  hipFree(s->mlp1_out);
-  hipFree(s->gate);
-  hipFree(s->up);
-  hipFree(s->gate_up);
-  hipFree(s->e_agg);
-  hipFree(s->qkv);
-  hipFree(s->q);
-  hipFree(s->k);
-  hipFree(s->v);
-  hipFree(s->key_cache);
-  hipFree(s->value_cache);
-  hipFree(s->att);
-  hipFree(s->logits);
-  if (s->mask) hipFree(s->mask);
-  hipFree(s->cos_vals);
-  hipFree(s->sin_vals);
-  hipFree(s->acc_buffer);
-  hipFree(s->logits_fp32);
-}
 
 // ------------------------- Chunked copy+convert of weights -------------------------
+void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p);
+void gpu_free_weights(GPUTransformerWeights *gpu_w);
 
-void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
-  int head_dim      = p->head_dim;
-  int n_layers      = p->n_layers;
-  int n_experts     = p->n_experts;
-  int hidden_dim    = p->hidden_dim;
-  int intermediate_dim = p->intermediate_dim;
-  int vocab_size    = p->vocab_size;
-  int n_attn_heads  = p->n_attn_heads;
-  int n_kv_heads    = p->n_kv_heads;
 
-  // Helper: host FP32 -> device staging FP32 (tile) -> device BF16 dest
-  auto copy_and_convert = [&](const float *cpu_data, hip_bfloat16 **gpu_data, size_t count) {
-    const size_t bf16_size = count * sizeof(hip_bfloat16);
-    HIP_CHECK(hipMalloc(gpu_data, bf16_size));
-
-    auto toGB = [](size_t bytes){ return (double)bytes / GB; };
-    printf("BF16 SIZE: %.2f GB\n", toGB(bf16_size));
-    printf("FP32 SIZE: %.2f GB\n", toGB(count * sizeof(float)));
-
-    hipStream_t stream;
-    HIP_CHECK(hipStreamCreate(&stream));
-
-    const size_t STAGING_BYTES = (size_t)512 * 1024 * 1024; // 512 MB
-    size_t staging_elems = std::max((size_t)1, STAGING_BYTES / sizeof(float));
-
-    const size_t INT_MAX_ELEMS = (size_t)std::numeric_limits<int>::max() - 1024;
-    if (staging_elems > INT_MAX_ELEMS) staging_elems = INT_MAX_ELEMS;
-
-    float *d_stage_fp32 = nullptr;
-    HIP_CHECK(hipMalloc(&d_stage_fp32, staging_elems * sizeof(float)));
-
-    size_t done = 0;
-    const dim3 block(256);
-    while (done < count) {
-      size_t tile = std::min(staging_elems, count - done);
-      size_t tile_bytes_fp32 = tile * sizeof(float);
-
-      HIP_CHECK(hipMemcpyAsync(d_stage_fp32, cpu_data + done, tile_bytes_fp32,
-                               hipMemcpyHostToDevice, stream));
-
-      int n = static_cast<int>(tile);
-      dim3 grid((n + block.x - 1) / block.x);
-      convert_fp32_to_bf16_kernel<<<grid, block, 0, stream>>>(d_stage_fp32, *gpu_data + done, n);
-      HIP_CHECK(hipGetLastError());
-
-      done += tile;
-    }
-
-    HIP_CHECK(hipStreamSynchronize(stream));
-    hipFree(d_stage_fp32);
-    hipStreamDestroy(stream);
-  };
-
-  // Counts as size_t to avoid overflow
-  size_t token_embed_count = (size_t)vocab_size * (size_t)hidden_dim;
-  copy_and_convert(cpu_w->token_embedding_table, &gpu_w->token_embedding_table, token_embed_count);
-  copy_and_convert(cpu_w->out,                    &gpu_w->out,                    token_embed_count);
-
-  size_t rms_count = (size_t)n_layers * (size_t)hidden_dim;
-  copy_and_convert(cpu_w->rms_attn_w, &gpu_w->rms_attn_w, rms_count);
-  copy_and_convert(cpu_w->rms_ffn_w,  &gpu_w->rms_ffn_w,  rms_count);
-
-  size_t rms_out_count = (size_t)hidden_dim;
-  copy_and_convert(cpu_w->rms_out_w,  &gpu_w->rms_out_w,  rms_out_count);
-
-  size_t qkv_w_count = (size_t)n_layers * (size_t)hidden_dim *
-                       ((size_t)head_dim * (size_t)n_attn_heads + (size_t)2 * (size_t)head_dim * (size_t)n_kv_heads);
-  copy_and_convert(cpu_w->w_qkv, &gpu_w->w_qkv, qkv_w_count);
-
-  size_t qkv_b_count = (size_t)n_layers *
-                       ((size_t)head_dim * (size_t)n_attn_heads + (size_t)2 * (size_t)head_dim * (size_t)n_kv_heads);
-  copy_and_convert(cpu_w->b_qkv, &gpu_w->b_qkv, qkv_b_count);
-
-  size_t o_w_count = (size_t)n_layers * (size_t)head_dim * (size_t)n_attn_heads * (size_t)hidden_dim;
-  copy_and_convert(cpu_w->w_o, &gpu_w->w_o, o_w_count);
-
-  size_t o_b_count = (size_t)n_layers * (size_t)hidden_dim;
-  copy_and_convert(cpu_w->b_o, &gpu_w->b_o, o_b_count);
-
-  size_t attn_sinks_count = (size_t)n_layers * (size_t)n_attn_heads;
-  copy_and_convert(cpu_w->attn_sinks, &gpu_w->attn_sinks, attn_sinks_count);
-
-  size_t router_w_count = (size_t)n_layers * (size_t)hidden_dim * (size_t)n_experts;
-  copy_and_convert(cpu_w->w_router, &gpu_w->w_router, router_w_count);
-
-  size_t router_b_count = (size_t)n_layers * (size_t)n_experts;
-  copy_and_convert(cpu_w->b_router, &gpu_w->b_router, router_b_count);
-
-  size_t mlp1_w_count = (size_t)n_layers * (size_t)n_experts * (size_t)2 * (size_t)intermediate_dim * (size_t)hidden_dim;
-  copy_and_convert(cpu_w->w_mlp1, &gpu_w->w_mlp1, mlp1_w_count);
-
-  size_t mlp1_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)2 * (size_t)intermediate_dim;
-  copy_and_convert(cpu_w->b_mlp1, &gpu_w->b_mlp1, mlp1_b_count);
-
-  size_t mlp2_w_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim * (size_t)intermediate_dim;
-  copy_and_convert(cpu_w->w_mlp2, &gpu_w->w_mlp2, mlp2_w_count);
-
-  size_t mlp2_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim;
-  copy_and_convert(cpu_w->b_mlp2, &gpu_w->b_mlp2, mlp2_b_count);
-}
-
-void gpu_free_weights(GPUTransformerWeights *gpu_w) {
-  hipFree(gpu_w->token_embedding_table);
-  hipFree(gpu_w->out);
-  hipFree(gpu_w->rms_attn_w);
-  hipFree(gpu_w->rms_ffn_w);
-  hipFree(gpu_w->rms_out_w);
-  hipFree(gpu_w->w_qkv);
-  hipFree(gpu_w->b_qkv);
-  hipFree(gpu_w->w_o);
-  hipFree(gpu_w->b_o);
-  hipFree(gpu_w->attn_sinks);
-  hipFree(gpu_w->w_router);
-  hipFree(gpu_w->b_router);
-  hipFree(gpu_w->w_mlp1);
-  hipFree(gpu_w->b_mlp1);
-  hipFree(gpu_w->w_mlp2);
-  hipFree(gpu_w->b_mlp2);
-}
 
 // ------------------------- Forward -------------------------
 
@@ -857,3 +675,196 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 }
 
 #endif // GETP_RUN
+
+
+
+
+void gpu_malloc_run_state(GPURunState *s, Config *p) {
+  int kv_dim = p->head_dim * p->n_kv_heads;
+
+  HIP_CHECK(hipMalloc(&s->x,   p->hidden_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->t,   p->hidden_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->tb,  p->head_dim * p->n_attn_heads * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->tb2, p->hidden_dim * sizeof(hip_bfloat16)));
+
+  HIP_CHECK(hipMalloc(&s->router_score,      p->n_experts * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->topk_v,            p->experts_per_token * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->topk_i,            p->experts_per_token * sizeof(int)));
+
+  HIP_CHECK(hipMalloc(&s->mlp1_out, 2 * p->intermediate_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->gate,     p->intermediate_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->up,       p->intermediate_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->gate_up,  p->intermediate_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->e_agg,    p->hidden_dim * sizeof(hip_bfloat16)));
+
+  HIP_CHECK(hipMalloc(&s->qkv, p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->q,   p->n_attn_heads * p->head_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->k,   p->n_kv_heads   * p->head_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->v,   p->n_kv_heads   * p->head_dim * sizeof(hip_bfloat16)));
+
+  HIP_CHECK(hipMalloc(&s->key_cache,   p->n_layers * p->seq_len * kv_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->att,         p->n_attn_heads * p->seq_len * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->logits,      p->vocab_size * sizeof(hip_bfloat16)));
+
+  if (p->sliding_window > 0) {
+    HIP_CHECK(hipMalloc(&s->mask, p->seq_len * p->seq_len * sizeof(hip_bfloat16)));
+  } else {
+    s->mask = NULL;
+  }
+
+  HIP_CHECK(hipMalloc(&s->cos_vals, (p->head_dim / 2) * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->sin_vals, (p->head_dim / 2) * sizeof(hip_bfloat16)));
+
+  HIP_CHECK(hipMalloc(&s->acc_buffer,  p->hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->logits_fp32, p->vocab_size * sizeof(float)));
+}
+
+
+void gpu_free_run_state(GPURunState *s) {
+  hipFree(s->x);
+  hipFree(s->t);
+  hipFree(s->tb);
+  hipFree(s->tb2);
+  hipFree(s->router_score);
+  hipFree(s->topk_v);
+  hipFree(s->topk_i);
+  hipFree(s->mlp1_out);
+  hipFree(s->gate);
+  hipFree(s->up);
+  hipFree(s->gate_up);
+  hipFree(s->e_agg);
+  hipFree(s->qkv);
+  hipFree(s->q);
+  hipFree(s->k);
+  hipFree(s->v);
+  hipFree(s->key_cache);
+  hipFree(s->value_cache);
+  hipFree(s->att);
+  hipFree(s->logits);
+  if (s->mask) hipFree(s->mask);
+  hipFree(s->cos_vals);
+  hipFree(s->sin_vals);
+  hipFree(s->acc_buffer);
+  hipFree(s->logits_fp32);
+}
+
+void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
+  int head_dim      = p->head_dim;
+  int n_layers      = p->n_layers;
+  int n_experts     = p->n_experts;
+  int hidden_dim    = p->hidden_dim;
+  int intermediate_dim = p->intermediate_dim;
+  int vocab_size    = p->vocab_size;
+  int n_attn_heads  = p->n_attn_heads;
+  int n_kv_heads    = p->n_kv_heads;
+
+  // Helper: host FP32 -> device staging FP32 (tile) -> device BF16 dest
+  auto copy_and_convert = [&](const float *cpu_data, hip_bfloat16 **gpu_data, size_t count) {
+    const size_t bf16_size = count * sizeof(hip_bfloat16);
+    HIP_CHECK(hipMalloc(gpu_data, bf16_size));
+
+    auto toGB = [](size_t bytes){ return (double)bytes / GB; };
+    printf("BF16 SIZE: %.2f GB\n", toGB(bf16_size));
+    printf("FP32 SIZE: %.2f GB\n", toGB(count * sizeof(float)));
+
+    hipStream_t stream;
+    HIP_CHECK(hipStreamCreate(&stream));
+
+    const size_t STAGING_BYTES = (size_t)512 * 1024 * 1024; // 512 MB
+    size_t staging_elems = std::max((size_t)1, STAGING_BYTES / sizeof(float));
+
+    const size_t INT_MAX_ELEMS = (size_t)std::numeric_limits<int>::max() - 1024;
+    if (staging_elems > INT_MAX_ELEMS) staging_elems = INT_MAX_ELEMS;
+
+    float *d_stage_fp32 = nullptr;
+    HIP_CHECK(hipMalloc(&d_stage_fp32, staging_elems * sizeof(float)));
+
+    size_t done = 0;
+    const dim3 block(256);
+    while (done < count) {
+      size_t tile = std::min(staging_elems, count - done);
+      size_t tile_bytes_fp32 = tile * sizeof(float);
+
+      HIP_CHECK(hipMemcpyAsync(d_stage_fp32, cpu_data + done, tile_bytes_fp32,
+                               hipMemcpyHostToDevice, stream));
+
+      int n = static_cast<int>(tile);
+      dim3 grid((n + block.x - 1) / block.x);
+      convert_fp32_to_bf16_kernel<<<grid, block, 0, stream>>>(d_stage_fp32, *gpu_data + done, n);
+      HIP_CHECK(hipGetLastError());
+
+      done += tile;
+    }
+
+    HIP_CHECK(hipStreamSynchronize(stream));
+    hipFree(d_stage_fp32);
+    hipStreamDestroy(stream);
+  };
+
+  // Counts as size_t to avoid overflow
+  size_t token_embed_count = (size_t)vocab_size * (size_t)hidden_dim;
+  copy_and_convert(cpu_w->token_embedding_table, &gpu_w->token_embedding_table, token_embed_count);
+  copy_and_convert(cpu_w->out,                    &gpu_w->out,                    token_embed_count);
+
+  size_t rms_count = (size_t)n_layers * (size_t)hidden_dim;
+  copy_and_convert(cpu_w->rms_attn_w, &gpu_w->rms_attn_w, rms_count);
+  copy_and_convert(cpu_w->rms_ffn_w,  &gpu_w->rms_ffn_w,  rms_count);
+
+  size_t rms_out_count = (size_t)hidden_dim;
+  copy_and_convert(cpu_w->rms_out_w,  &gpu_w->rms_out_w,  rms_out_count);
+
+  size_t qkv_w_count = (size_t)n_layers * (size_t)hidden_dim *
+                       ((size_t)head_dim * (size_t)n_attn_heads + (size_t)2 * (size_t)head_dim * (size_t)n_kv_heads);
+  copy_and_convert(cpu_w->w_qkv, &gpu_w->w_qkv, qkv_w_count);
+
+  size_t qkv_b_count = (size_t)n_layers *
+                       ((size_t)head_dim * (size_t)n_attn_heads + (size_t)2 * (size_t)head_dim * (size_t)n_kv_heads);
+  copy_and_convert(cpu_w->b_qkv, &gpu_w->b_qkv, qkv_b_count);
+
+  size_t o_w_count = (size_t)n_layers * (size_t)head_dim * (size_t)n_attn_heads * (size_t)hidden_dim;
+  copy_and_convert(cpu_w->w_o, &gpu_w->w_o, o_w_count);
+
+  size_t o_b_count = (size_t)n_layers * (size_t)hidden_dim;
+  copy_and_convert(cpu_w->b_o, &gpu_w->b_o, o_b_count);
+
+  size_t attn_sinks_count = (size_t)n_layers * (size_t)n_attn_heads;
+  copy_and_convert(cpu_w->attn_sinks, &gpu_w->attn_sinks, attn_sinks_count);
+
+  size_t router_w_count = (size_t)n_layers * (size_t)hidden_dim * (size_t)n_experts;
+  copy_and_convert(cpu_w->w_router, &gpu_w->w_router, router_w_count);
+
+  size_t router_b_count = (size_t)n_layers * (size_t)n_experts;
+  copy_and_convert(cpu_w->b_router, &gpu_w->b_router, router_b_count);
+
+  size_t mlp1_w_count = (size_t)n_layers * (size_t)n_experts * (size_t)2 * (size_t)intermediate_dim * (size_t)hidden_dim;
+  copy_and_convert(cpu_w->w_mlp1, &gpu_w->w_mlp1, mlp1_w_count);
+
+  size_t mlp1_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)2 * (size_t)intermediate_dim;
+  copy_and_convert(cpu_w->b_mlp1, &gpu_w->b_mlp1, mlp1_b_count);
+
+  size_t mlp2_w_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim * (size_t)intermediate_dim;
+  copy_and_convert(cpu_w->w_mlp2, &gpu_w->w_mlp2, mlp2_w_count);
+
+  size_t mlp2_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim;
+  copy_and_convert(cpu_w->b_mlp2, &gpu_w->b_mlp2, mlp2_b_count);
+}
+
+void gpu_free_weights(GPUTransformerWeights *gpu_w) {
+  hipFree(gpu_w->token_embedding_table);
+  hipFree(gpu_w->out);
+  hipFree(gpu_w->rms_attn_w);
+  hipFree(gpu_w->rms_ffn_w);
+  hipFree(gpu_w->rms_out_w);
+  hipFree(gpu_w->w_qkv);
+  hipFree(gpu_w->b_qkv);
+  hipFree(gpu_w->w_o);
+  hipFree(gpu_w->b_o);
+  hipFree(gpu_w->attn_sinks);
+  hipFree(gpu_w->w_router);
+  hipFree(gpu_w->b_router);
+  hipFree(gpu_w->w_mlp1);
+  hipFree(gpu_w->b_mlp1);
+  hipFree(gpu_w->w_mlp2);
+  hipFree(gpu_w->b_mlp2);
+}
