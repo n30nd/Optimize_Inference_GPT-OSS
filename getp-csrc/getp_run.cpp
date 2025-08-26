@@ -765,8 +765,8 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipMalloc(gpu_data, bf16_size));
 
     auto toGB = [](size_t bytes){ return (double)bytes / GB; };
-    printf("BF16 SIZE: %.2f GB\n", toGB(bf16_size));
-    printf("FP32 SIZE: %.2f GB\n", toGB(count * sizeof(float)));
+    // printf("BF16 SIZE: %.2f GB\n", toGB(bf16_size));
+    // printf("FP32 SIZE: %.2f GB\n", toGB(count * sizeof(float)));
 
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
