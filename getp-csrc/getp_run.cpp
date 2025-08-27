@@ -18,6 +18,9 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 
 #ifndef GETP_RUN
 #define GETP_RUN
@@ -98,6 +101,38 @@ typedef struct {
 
 static std::vector<GPUContext> gpu_contexts;
 static thread_local GPUContext* t_ctx = nullptr;
+
+
+// ------------------------- Simple blocking MPMC queue -------------------------
+template <typename T>
+class MPMCQueue {
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::deque<T> q_;
+  bool closed_ = false;
+public:
+  void push(const T& v) {
+    std::unique_lock<std::mutex> lk(m_);
+    if (closed_) return;           // không nhận nữa nếu đã đóng
+    q_.push_back(v);
+    cv_.notify_one();
+  }
+  // pop() chờ đến khi có phần tử hoặc queue đóng & rỗng
+  bool pop(T& out) {
+    std::unique_lock<std::mutex> lk(m_);
+    cv_.wait(lk, [&]{ return closed_ || !q_.empty(); });
+    if (q_.empty()) return false;  // closed & empty
+    out = std::move(q_.front());
+    q_.pop_front();
+    return true;
+  }
+  void close() {
+    std::unique_lock<std::mutex> lk(m_);
+    closed_ = true;
+    cv_.notify_all();
+  }
+};
+
 
 // ------------------------- BF16 utils -------------------------
 
@@ -692,31 +727,55 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
   if (gpu_contexts.empty()) warm_up(transformer, tokenizer);
   const int num_devices = (int)gpu_contexts.size();
+  if (requests->num_reqs <= 0 || num_devices <= 0) return 0;
+
+  // 3.1. Chuẩn bị global job queue (chỉ lưu index request)
+  MPMCQueue<int> jobq;
+  #pragma omp parallel for
+  for (int i = 0; i < requests->num_reqs; ++i) jobq.push(i);
+  jobq.close(); // không còn producer nào khác → đóng để worker thoát khi hết việc
 
   std::atomic<long long> total_out{0};
   std::vector<std::thread> workers;
   workers.reserve(num_devices);
 
+  // 3.2. Mỗi GPU là một worker: rảnh thì pop job mới; bận thì tiếp tục job hiện tại
   for (int t = 0; t < num_devices; ++t) {
     workers.emplace_back([&, t]() {
       HIP_CHECK(hipSetDevice(gpu_contexts[t].device_id));
       t_ctx = &gpu_contexts[t];
+
+      // Sampler riêng cho từng thread/GPU (seed lệch để tránh tương quan RNG)
       Sampler local_sampler;
-      build_sampler(&local_sampler, sampler->vocab_size, sampler->temperature, sampler->topp, sampler->rng_state + t + 1);
+      build_sampler(&local_sampler,
+                    sampler->vocab_size,
+                    sampler->temperature,
+                    sampler->topp,
+                    sampler->rng_state + 0x9E3779B97f4A7C15ULL * (t + 1));
+
       long long local_out = 0;
-      for (int idx = t; idx < requests->num_reqs; idx += num_devices) {
+      int idx;
+      // Vòng lặp lấy việc đến khi queue rỗng & đóng
+      while (jobq.pop(idx)) {
         const char *input_seq = get_str_req_ptr(requests, idx);
         int *output_tokens    = get_tok_gen_ptr(requests, idx);
+
+        // Chạy tuần tự trên GPU này cho request 'idx'
         local_out += simple_getp_generate(transformer, tokenizer, &local_sampler,
-                                          input_seq, output_tokens, requests->max_seq_len, t_ctx);
+                                          input_seq, output_tokens,
+                                          requests->max_seq_len, t_ctx);
+        // Khi xong, vòng lặp quay lại pop việc mới → “work-stealing” tự nhiên
       }
+
       total_out.fetch_add(local_out, std::memory_order_relaxed);
       free_sampler(&local_sampler);
     });
   }
+
   for (auto &th : workers) th.join();
   return total_out.load(std::memory_order_relaxed);
 }
+
 
 #endif // GETP_RUN
 
