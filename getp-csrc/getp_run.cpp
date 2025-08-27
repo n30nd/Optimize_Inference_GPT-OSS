@@ -393,6 +393,78 @@ __global__ void matvec_wbf16_xfp32_outfp32(float *out, const float *x,
   }
 }
 
+// Find top-K (small K, e.g., 1..8) over BF16 scores on device and softmax them.
+// One block processes ONE vector of length n_experts.
+// Complexity: O(K * n_experts), OK for typical MoE sizes (<= 64~256).
+__global__ void router_topk_softmax_kernel_bf16(const hip_bfloat16 *router_bf16,
+                                                hip_bfloat16 *topk_v_bf16,
+                                                int *topk_i,
+                                                int n_experts, int K) {
+  extern __shared__ float shared[]; // shared buffer for reductions
+  float *scratch_val = shared;      // size blockDim.x
+  int   *scratch_idx = (int*)(shared + blockDim.x);
+
+  // Keep chosen indices in shared (K is small)
+  __shared__ int chosen_idx[16]; // assume K <= 16
+  __shared__ float chosen_val[16];
+
+  int tid = threadIdx.x;
+
+  // Helper: read value (float) at j, ignoring already-chosen indices
+  auto read_score = [&](int j)->float {
+    // reject if j already chosen
+    #pragma unroll
+    for (int t = 0; t < 16; ++t) {
+      if (t >= K) break;
+      if (j == chosen_idx[t]) return -INFINITY;
+    }
+    return float(router_bf16[j]);
+  };
+
+  for (int k = 0; k < K; ++k) {
+    float local_max = -INFINITY;
+    int   local_idx = -1;
+    for (int j = tid; j < n_experts; j += blockDim.x) {
+      float v = read_score(j);
+      if (v > local_max) { local_max = v; local_idx = j; }
+    }
+    scratch_val[tid] = local_max;
+    scratch_idx[tid] = local_idx;
+    __syncthreads();
+
+    // Reduce to global max
+    for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+      if (tid < offset) {
+        if (scratch_val[tid + offset] > scratch_val[tid]) {
+          scratch_val[tid] = scratch_val[tid + offset];
+          scratch_idx[tid] = scratch_idx[tid + offset];
+        }
+      }
+      __syncthreads();
+    }
+    if (tid == 0) {
+      chosen_val[k] = scratch_val[0];
+      chosen_idx[k] = scratch_idx[0] < 0 ? 0 : scratch_idx[0];
+    }
+    __syncthreads();
+  }
+
+  // Softmax on top-K (thread 0 is fine; K small)
+  if (tid == 0) {
+    float maxv = chosen_val[0];
+    for (int i = 1; i < K; ++i) if (chosen_val[i] > maxv) maxv = chosen_val[i];
+    float sum = 0.f;
+    for (int i = 0; i < K; ++i) { chosen_val[i] = expf(chosen_val[i] - maxv); sum += chosen_val[i]; }
+    float inv = 1.f / (sum + 1e-12f);
+    for (int i = 0; i < K; ++i) {
+      topk_i[i]       = chosen_idx[i];
+      topk_v_bf16[i]  = hip_bfloat16(chosen_val[i] * inv);
+    }
+  }
+}
+
+
+
 // ------------------------- CPU top-k -------------------------
 
 void topk_cpu(float *topk_values, int *topk_indices, const float *router_score, int num_experts, int experts_per_token) {
@@ -427,233 +499,7 @@ void gpu_free_weights(GPUTransformerWeights *gpu_w);
 
 // ------------------------- Forward -------------------------
 
-float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu_ctx) {
-  Config *p = &transformer->config;
 
-  int head_dim         = p->head_dim;
-  int hidden_dim       = p->hidden_dim;
-  int kv_dim           = p->head_dim * p->n_kv_heads;
-  int kv_mul           = p->n_attn_heads / p->n_kv_heads;
-  int intermediate_dim = p->intermediate_dim;
-  int n_experts        = p->n_experts;
-
-  dim3 block(256);
-  dim3 grid_hidden       = dim3((hidden_dim + block.x - 1) / block.x);
-  dim3 grid_vocab        = dim3((p->vocab_size + block.x - 1) / block.x);
-  dim3 grid_intermediate = dim3((intermediate_dim + block.x - 1) / block.x);
-  dim3 grid_experts      = dim3((n_experts + block.x - 1) / block.x);
-
-  // Token embedding
-  hip_bfloat16 *token_row = gpu_ctx->weights.token_embedding_table + (size_t)token * (size_t)hidden_dim;
-  HIP_CHECK(hipMemcpy(gpu_ctx->state.x, token_row, hidden_dim * sizeof(hip_bfloat16), hipMemcpyDeviceToDevice));
-
-  // Layers
-  for (int l = 0; l < p->n_layers; l++) {
-    // Attention RMSNorm
-    const hip_bfloat16 *rms_attn_w = gpu_ctx->weights.rms_attn_w + (size_t)l * (size_t)hidden_dim;
-    rmsnorm_kernel_bf16<<<grid_hidden, block>>>(gpu_ctx->state.t, gpu_ctx->state.x, rms_attn_w, hidden_dim);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    // QKV projection
-    int loff = l * p->seq_len * kv_dim;
-    const hip_bfloat16 *w_qkv = gpu_ctx->weights.w_qkv + (size_t)l * (size_t)hidden_dim *
-                                ((size_t)head_dim * (size_t)p->n_attn_heads + (size_t)2 * (size_t)head_dim * (size_t)p->n_kv_heads);
-    const hip_bfloat16 *b_qkv = gpu_ctx->weights.b_qkv + (size_t)l *
-                                ((size_t)head_dim * (size_t)p->n_attn_heads + (size_t)2 * (size_t)head_dim * (size_t)p->n_kv_heads);
-
-    int qkv_out_dim = (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
-    dim3 grid_qkv = dim3((qkv_out_dim + block.x - 1) / block.x);
-    matmul_kernel_bf16<<<grid_qkv, block>>>(gpu_ctx->state.qkv, gpu_ctx->state.t, w_qkv, hidden_dim, qkv_out_dim);
-    add_bias_kernel_bf16<<<grid_qkv, block>>>(gpu_ctx->state.qkv, b_qkv, qkv_out_dim);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    // Split Q, K, V
-    int q_size = head_dim * p->n_attn_heads;
-    int k_size = head_dim * p->n_kv_heads;
-    int v_size = head_dim * p->n_kv_heads;
-
-    HIP_CHECK(hipMemcpy(gpu_ctx->state.q, gpu_ctx->state.qkv,                 q_size * sizeof(hip_bfloat16), hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(gpu_ctx->state.k, gpu_ctx->state.qkv + q_size,        k_size * sizeof(hip_bfloat16), hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(gpu_ctx->state.v, gpu_ctx->state.qkv + q_size + k_size, v_size * sizeof(hip_bfloat16), hipMemcpyDeviceToDevice));
-
-    // Store K, V in cache
-    hip_bfloat16 *k_cache_pos = gpu_ctx->state.key_cache   + loff + pos * kv_dim;
-    hip_bfloat16 *v_cache_pos = gpu_ctx->state.value_cache + loff + pos * kv_dim;
-    HIP_CHECK(hipMemcpy(k_cache_pos, gpu_ctx->state.k, k_size * sizeof(hip_bfloat16), hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(v_cache_pos, gpu_ctx->state.v, v_size * sizeof(hip_bfloat16), hipMemcpyDeviceToDevice));
-
-    // RoPE
-    float ntk_beta  = 32.0f;
-    float ntk_alpha = 1.0f;
-    dim3 grid_rope = dim3(((head_dim / 2) + block.x - 1) / block.x);
-    compute_cos_sin_kernel_bf16<<<grid_rope, block>>>(gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, pos,
-                                                      p->rope_theta, head_dim, p->rope_scaling_factor,
-                                                      p->initial_context_length, ntk_beta, ntk_alpha);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    apply_rotary_emb_kernel_bf16<<<p->n_attn_heads, head_dim/2>>>(gpu_ctx->state.q, gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, p->n_attn_heads, head_dim);
-    apply_rotary_emb_kernel_bf16<<<p->n_kv_heads,   head_dim/2>>>(gpu_ctx->state.k, gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, p->n_kv_heads,   head_dim);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    // Update K cache after RoPE
-    HIP_CHECK(hipMemcpy(k_cache_pos, gpu_ctx->state.k, k_size * sizeof(hip_bfloat16), hipMemcpyDeviceToDevice));
-
-    // Multi-head attention
-    for (int h = 0; h < p->n_attn_heads; h++) {
-      hip_bfloat16 *q = gpu_ctx->state.q + (size_t)h * (size_t)head_dim;
-      hip_bfloat16 *att = gpu_ctx->state.att + (size_t)h * (size_t)p->seq_len;
-
-      // Scores
-      dim3 grid_att = dim3(((pos + 1) + block.x - 1) / block.x);
-      attention_scores_kernel_bf16<<<grid_att, block>>>(att, q, gpu_ctx->state.key_cache, head_dim, loff,
-                                                        kv_dim, kv_mul, h, pos, p->seq_len,
-                                                        (p->sliding_window > 0 && l % 2 == 0) ? gpu_ctx->state.mask : NULL);
-      HIP_CHECK(hipDeviceSynchronize());
-
-      // Attention sink: chỉ thêm nếu còn chỗ (tránh OOB)
-      int len_no_sink = pos + 1;    // t = 0..pos
-      bool can_add_sink = (pos + 1) < p->seq_len;
-      if (can_add_sink) {
-        hip_bfloat16 bf16_sink;
-        HIP_CHECK(hipMemcpy(&bf16_sink,
-                            gpu_ctx->weights.attn_sinks + (size_t)l * (size_t)p->n_attn_heads + (size_t)h,
-                            sizeof(hip_bfloat16), hipMemcpyDeviceToHost));
-        HIP_CHECK(hipMemcpy(att + pos + 1, &bf16_sink, sizeof(hip_bfloat16), hipMemcpyHostToDevice));
-        softmax_kernel_bf16<<<1, 1>>>(att, len_no_sink + 1);
-      } else {
-        softmax_kernel_bf16<<<1, 1>>>(att, len_no_sink);
-      }
-      HIP_CHECK(hipDeviceSynchronize());
-
-      // Weighted sum (chỉ 0..pos, không có v-sink)
-      dim3 grid_head_dim = dim3((head_dim + block.x - 1) / block.x);
-      attention_weighted_sum_kernel_bf16<<<grid_head_dim, block>>>(gpu_ctx->state.tb, att, gpu_ctx->state.value_cache,
-                                                                   head_dim, loff, kv_dim, kv_mul, h, pos);
-      HIP_CHECK(hipDeviceSynchronize());
-    }
-
-    // Output projection of attention
-    const hip_bfloat16 *w_o = gpu_ctx->weights.w_o + (size_t)l * (size_t)(head_dim * p->n_attn_heads) * (size_t)hidden_dim;
-    const hip_bfloat16 *b_o = gpu_ctx->weights.b_o + (size_t)l * (size_t)hidden_dim;
-    matmul_kernel_bf16<<<grid_hidden, block>>>(gpu_ctx->state.tb2, gpu_ctx->state.tb, w_o, head_dim * p->n_attn_heads, hidden_dim);
-    add_bias_kernel_bf16<<<grid_hidden, block>>>(gpu_ctx->state.tb2, b_o, hidden_dim);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    // Residual
-    residual_connection_kernel_bf16<<<grid_hidden, block>>>(gpu_ctx->state.x, gpu_ctx->state.tb2, hidden_dim);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    // -------- MoE --------
-    // FFN RMSNorm
-    const hip_bfloat16 *rms_ffn_w = gpu_ctx->weights.rms_ffn_w + (size_t)l * (size_t)hidden_dim;
-    rmsnorm_kernel_bf16<<<grid_hidden, block>>>(gpu_ctx->state.t, gpu_ctx->state.x, rms_ffn_w, hidden_dim);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    // Router
-    const hip_bfloat16 *w_router = gpu_ctx->weights.w_router + (size_t)l * (size_t)hidden_dim * (size_t)n_experts;
-    const hip_bfloat16 *b_router = gpu_ctx->weights.b_router + (size_t)l * (size_t)n_experts;
-    matmul_kernel_bf16<<<grid_experts, block>>>(gpu_ctx->state.router_score, gpu_ctx->state.t, w_router, hidden_dim, n_experts);
-    add_bias_kernel_bf16<<<grid_experts, block>>>(gpu_ctx->state.router_score, b_router, n_experts);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    // Router scores: BF16 -> FP32 (device) -> host
-    float *gpu_router_score_fp32 = nullptr;
-    HIP_CHECK(hipMalloc(&gpu_router_score_fp32, n_experts * sizeof(float)));
-    convert_bf16_to_fp32_kernel<<<grid_experts, block>>>(gpu_ctx->state.router_score, gpu_router_score_fp32, n_experts);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    std::vector<float> cpu_router_score(n_experts);
-    HIP_CHECK(hipMemcpy(cpu_router_score.data(), gpu_router_score_fp32, n_experts * sizeof(float), hipMemcpyDeviceToHost));
-
-    std::vector<float> cpu_topk_v(p->experts_per_token);
-    std::vector<int>   cpu_topk_i(p->experts_per_token);
-    topk_cpu(cpu_topk_v.data(), cpu_topk_i.data(), cpu_router_score.data(), n_experts, p->experts_per_token);
-
-    // Softmax top-k (host)
-    float sum = 0.0f;
-    float max_val = cpu_topk_v[0];
-    for (int i = 1; i < p->experts_per_token; i++) if (cpu_topk_v[i] > max_val) max_val = cpu_topk_v[i];
-    for (int i = 0; i < p->experts_per_token; i++) { cpu_topk_v[i] = expf(cpu_topk_v[i] - max_val); sum += cpu_topk_v[i]; }
-    for (int i = 0; i < p->experts_per_token; i++) cpu_topk_v[i] /= sum;
-
-    // Copy topk back to GPU (as BF16 for weights)
-    hip_bfloat16 *gpu_topk_v_bf16 = nullptr;
-    float *gpu_topk_v_fp32 = nullptr;
-    HIP_CHECK(hipMalloc(&gpu_topk_v_bf16, p->experts_per_token * sizeof(hip_bfloat16)));
-    HIP_CHECK(hipMalloc(&gpu_topk_v_fp32, p->experts_per_token * sizeof(float)));
-    HIP_CHECK(hipMemcpy(gpu_topk_v_fp32, cpu_topk_v.data(), p->experts_per_token * sizeof(float), hipMemcpyHostToDevice));
-
-    dim3 grid_topk = dim3((p->experts_per_token + block.x - 1) / block.x);
-    convert_fp32_to_bf16_kernel<<<grid_topk, block>>>(gpu_topk_v_fp32, gpu_topk_v_bf16, p->experts_per_token);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    HIP_CHECK(hipMemcpy(gpu_ctx->state.topk_v, gpu_topk_v_bf16, p->experts_per_token * sizeof(hip_bfloat16), hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(gpu_ctx->state.topk_i, cpu_topk_i.data(), p->experts_per_token * sizeof(int), hipMemcpyHostToDevice));
-
-    // Init aggregation
-    HIP_CHECK(hipMemset(gpu_ctx->state.e_agg, 0, hidden_dim * sizeof(hip_bfloat16)));
-
-    // Experts
-    for (int idx = 0; idx < p->experts_per_token; idx++) {
-      int e = cpu_topk_i[idx];
-      float expert_w = cpu_topk_v[idx];
-
-      const hip_bfloat16 *w_mlp1 = gpu_ctx->weights.w_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
-      const hip_bfloat16 *b_mlp1 = gpu_ctx->weights.b_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim);
-
-      dim3 grid_mlp1 = dim3(((2 * intermediate_dim) + block.x - 1) / block.x);
-      matmul_kernel_bf16<<<grid_mlp1, block>>>(gpu_ctx->state.mlp1_out, gpu_ctx->state.t, w_mlp1, hidden_dim, 2 * intermediate_dim);
-      add_bias_kernel_bf16<<<grid_mlp1, block>>>(gpu_ctx->state.mlp1_out, b_mlp1, 2 * intermediate_dim);
-      HIP_CHECK(hipDeviceSynchronize());
-
-      split_gate_up_kernel_bf16<<<grid_intermediate, block>>>(gpu_ctx->state.gate, gpu_ctx->state.up, gpu_ctx->state.mlp1_out, intermediate_dim);
-      HIP_CHECK(hipDeviceSynchronize());
-
-      swiglu_kernel_bf16<<<grid_intermediate, block>>>(gpu_ctx->state.gate_up, gpu_ctx->state.gate, gpu_ctx->state.up, intermediate_dim, p->swiglu_limit);
-      HIP_CHECK(hipDeviceSynchronize());
-
-      const hip_bfloat16 *w_mlp2 = gpu_ctx->weights.w_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim * (size_t)intermediate_dim;
-      const hip_bfloat16 *b_mlp2 = gpu_ctx->weights.b_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim;
-
-      matmul_kernel_bf16<<<grid_hidden, block>>>(gpu_ctx->state.tb2, gpu_ctx->state.gate_up, w_mlp2, intermediate_dim, hidden_dim);
-      add_bias_kernel_bf16<<<grid_hidden, block>>>(gpu_ctx->state.tb2, b_mlp2, hidden_dim);
-      HIP_CHECK(hipDeviceSynchronize());
-
-      weighted_sum_kernel_bf16<<<grid_hidden, block>>>(gpu_ctx->state.e_agg, gpu_ctx->state.tb2, expert_w, hidden_dim);
-      HIP_CHECK(hipDeviceSynchronize());
-    }
-
-    residual_connection_kernel_bf16<<<grid_hidden, block>>>(gpu_ctx->state.x, gpu_ctx->state.e_agg, hidden_dim);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    // Cleanup temporaries
-    HIP_CHECK(hipFree(gpu_router_score_fp32));
-    HIP_CHECK(hipFree(gpu_topk_v_bf16));
-    HIP_CHECK(hipFree(gpu_topk_v_fp32));
-  }
-
-  // Final RMSNorm
-  rmsnorm_kernel_bf16<<<grid_hidden, block>>>(gpu_ctx->state.x, gpu_ctx->state.x, gpu_ctx->weights.rms_out_w, hidden_dim);
-  HIP_CHECK(hipDeviceSynchronize());
-
-  // Convert x to FP32
-  convert_bf16_to_fp32_kernel<<<grid_hidden, block>>>(gpu_ctx->state.x, gpu_ctx->state.acc_buffer, hidden_dim);
-  HIP_CHECK(hipDeviceSynchronize());
-
-  // Output logits directly: W(BF16)*x(FP32)->logits(FP32)
-  dim3 grid_vocab2 = dim3((p->vocab_size + block.x - 1) / block.x);
-  matvec_wbf16_xfp32_outfp32<<<grid_vocab2, block>>>(gpu_ctx->state.logits_fp32, gpu_ctx->state.acc_buffer, gpu_ctx->weights.out,
-                                                     /*n=*/hidden_dim, /*d=*/p->vocab_size);
-  HIP_CHECK(hipDeviceSynchronize());
-
-  // Copy logits to CPU (thread-local buffer across calls)
-  thread_local float *cpu_logits = NULL;
-  if (cpu_logits == NULL) {
-    cpu_logits = (float*)malloc(p->vocab_size * sizeof(float));
-  }
-  HIP_CHECK(hipMemcpy(cpu_logits, gpu_ctx->state.logits_fp32, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
-  return cpu_logits;
-}
 
 
 float *gpu_forward_streamed(Transformer *transformer, int token, int pos,
@@ -756,15 +602,13 @@ float *gpu_forward_streamed(Transformer *transformer, int token, int pos,
       int len_no_sink = pos + 1;    // t = 0..pos
       bool can_add_sink = (pos + 1) < p->seq_len;
       if (can_add_sink) {
-        hip_bfloat16 bf16_sink;
-        // nhỏ lẻ: copy 1 phần tử qua host rồi lại về device (đơn giản hoá)
-        HIP_CHECK(hipMemcpyAsync(&bf16_sink,
+        HIP_CHECK(hipMemcpyAsync(
+          att + pos + 1,
           gpu_ctx->weights.attn_sinks + (size_t)l * (size_t)p->n_attn_heads + (size_t)h,
-          sizeof(hip_bfloat16), hipMemcpyDeviceToHost, stream));
-        HIP_CHECK(hipStreamSynchronize(stream));
-        HIP_CHECK(hipMemcpyAsync(att + pos + 1, &bf16_sink, sizeof(hip_bfloat16),
-                                 hipMemcpyHostToDevice, stream));
+          sizeof(hip_bfloat16),
+          hipMemcpyDeviceToDevice, stream /* hoặc bỏ 'stream' ở bản sync */));
         softmax_kernel_bf16<<<1, 1, 0, stream>>>(att, len_no_sink + 1);
+
       } else {
         softmax_kernel_bf16<<<1, 1, 0, stream>>>(att, len_no_sink);
       }
@@ -798,62 +642,51 @@ float *gpu_forward_streamed(Transformer *transformer, int token, int pos,
         gpu_ctx->weights.w_router + (size_t)l * (size_t)hidden_dim * (size_t)n_experts;
     const hip_bfloat16 *b_router =
         gpu_ctx->weights.b_router + (size_t)l * (size_t)n_experts;
+
     matmul_kernel_bf16<<<grid_experts, block, 0, stream>>>(s->router_score, s->t, w_router, hidden_dim, n_experts);
     add_bias_kernel_bf16<<<grid_experts, block, 0, stream>>>(s->router_score, b_router, n_experts);
 
-    // Router scores: BF16 -> FP32 (device) -> host (để top-k trên host như cũ)
-    float *gpu_router_score_fp32 = nullptr;
-    HIP_CHECK(hipMalloc(&gpu_router_score_fp32, n_experts * sizeof(float)));
-    convert_bf16_to_fp32_kernel<<<grid_experts, block, 0, stream>>>(s->router_score, gpu_router_score_fp32, n_experts);
+    // GPU top-k + softmax (no host sync)
+    {
+      const int K = ((Config*)(&transformer->config))->experts_per_token;
+      const int threads = 256;
+      size_t shmem = (size_t)threads * (sizeof(float) + sizeof(int));
+      router_topk_softmax_kernel_bf16<<<1, threads, shmem, stream>>>(
+          s->router_score, s->topk_v, s->topk_i, n_experts, K);
+    }
 
-    std::vector<float> cpu_router_score(n_experts);
-    HIP_CHECK(hipMemcpyAsync(cpu_router_score.data(), gpu_router_score_fp32,
-                             n_experts * sizeof(float), hipMemcpyDeviceToHost, stream));
+    // --- NEW: copy topk indices & weights về host để chọn expert và truyền expert_w ---
+    const int K = p->experts_per_token;
+    // chuyển BF16 -> FP32 trên device rồi mới copy host (an toàn, K nhỏ)
+    float *topk_v_fp32_dev = nullptr;
+    HIP_CHECK(hipMalloc(&topk_v_fp32_dev, K * sizeof(float)));
+    dim3 grid_topk = dim3((K + block.x - 1) / block.x);
+    convert_bf16_to_fp32_kernel<<<grid_topk, block, 0, stream>>>(s->topk_v, topk_v_fp32_dev, K);
+
+    std::vector<int>   h_topk_i(K);
+    std::vector<float> h_topk_v(K);
+    HIP_CHECK(hipMemcpyAsync(h_topk_i.data(), s->topk_i, K * sizeof(int),
+                            hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipMemcpyAsync(h_topk_v.data(), topk_v_fp32_dev, K * sizeof(float),
+                            hipMemcpyDeviceToHost, stream));
     HIP_CHECK(hipStreamSynchronize(stream));
+    HIP_CHECK(hipFree(topk_v_fp32_dev));
 
-    std::vector<float> cpu_topk_v(p->experts_per_token);
-    std::vector<int>   cpu_topk_i(p->experts_per_token);
-    topk_cpu(cpu_topk_v.data(), cpu_topk_i.data(), cpu_router_score.data(), n_experts, p->experts_per_token);
-
-    // Softmax top-k (host)
-    float sum = 0.0f;
-    float max_val = cpu_topk_v[0];
-    for (int i = 1; i < p->experts_per_token; i++) if (cpu_topk_v[i] > max_val) max_val = cpu_topk_v[i];
-    for (int i = 0; i < p->experts_per_token; i++) { cpu_topk_v[i] = expf(cpu_topk_v[i] - max_val); sum += cpu_topk_v[i]; }
-    for (int i = 0; i < p->experts_per_token; i++) cpu_topk_v[i] /= sum;
-
-    // Copy topk back to GPU
-    hip_bfloat16 *gpu_topk_v_bf16 = nullptr;
-    float *gpu_topk_v_fp32 = nullptr;
-    HIP_CHECK(hipMalloc(&gpu_topk_v_bf16, p->experts_per_token * sizeof(hip_bfloat16)));
-    HIP_CHECK(hipMalloc(&gpu_topk_v_fp32, p->experts_per_token * sizeof(float)));
-    HIP_CHECK(hipMemcpyAsync(gpu_topk_v_fp32, cpu_topk_v.data(),
-                             p->experts_per_token * sizeof(float), hipMemcpyHostToDevice, stream));
-
-    dim3 grid_topk = dim3((p->experts_per_token + block.x - 1) / block.x);
-    convert_fp32_to_bf16_kernel<<<grid_topk, block, 0, stream>>>(
-        gpu_topk_v_fp32, gpu_topk_v_bf16, p->experts_per_token);
-
-    HIP_CHECK(hipMemcpyAsync(s->topk_v, gpu_topk_v_bf16,
-                             p->experts_per_token * sizeof(hip_bfloat16),
-                             hipMemcpyDeviceToDevice, stream));
-    HIP_CHECK(hipMemcpyAsync(s->topk_i, cpu_topk_i.data(),
-                             p->experts_per_token * sizeof(int),
-                             hipMemcpyHostToDevice, stream));
 
     // Init aggregation
     HIP_CHECK(hipMemsetAsync(s->e_agg, 0, hidden_dim * sizeof(hip_bfloat16), stream));
-
+    
     // Experts
     for (int idx = 0; idx < p->experts_per_token; idx++) {
-      int e = cpu_topk_i[idx];
+      const int   e         = h_topk_i[idx];
+      const float expert_w  = h_topk_v[idx];
 
       const hip_bfloat16 *w_mlp1 =
           gpu_ctx->weights.w_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) *
-                                     (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
+                                    (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
       const hip_bfloat16 *b_mlp1 =
           gpu_ctx->weights.b_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) *
-                                     (size_t)(2 * intermediate_dim);
+                                    (size_t)(2 * intermediate_dim);
 
       dim3 grid_mlp1 = dim3(((2 * intermediate_dim) + block.x - 1) / block.x);
       matmul_kernel_bf16<<<grid_mlp1, block, 0, stream>>>(
@@ -869,10 +702,10 @@ float *gpu_forward_streamed(Transformer *transformer, int token, int pos,
 
       const hip_bfloat16 *w_mlp2 =
           gpu_ctx->weights.w_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) *
-                                     (size_t)hidden_dim * (size_t)intermediate_dim;
+                                    (size_t)hidden_dim * (size_t)intermediate_dim;
       const hip_bfloat16 *b_mlp2 =
           gpu_ctx->weights.b_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) *
-                                     (size_t)hidden_dim;
+                                    (size_t)hidden_dim;
 
       matmul_kernel_bf16<<<grid_hidden, block, 0, stream>>>(
           s->tb2, s->gate_up, w_mlp2, intermediate_dim, hidden_dim);
@@ -880,16 +713,17 @@ float *gpu_forward_streamed(Transformer *transformer, int token, int pos,
           s->tb2, b_mlp2, hidden_dim);
 
       weighted_sum_kernel_bf16<<<grid_hidden, block, 0, stream>>>(
-          s->e_agg, s->tb2, cpu_topk_v[idx], hidden_dim);
+          s->e_agg, s->tb2, expert_w, hidden_dim);
     }
+
 
     residual_connection_kernel_bf16<<<grid_hidden, block, 0, stream>>>(
         s->x, s->e_agg, hidden_dim);
 
     // Cleanup temporaries (GPU)
-    HIP_CHECK(hipFree(gpu_router_score_fp32));
-    HIP_CHECK(hipFree(gpu_topk_v_bf16));
-    HIP_CHECK(hipFree(gpu_topk_v_fp32));
+    // HIP_CHECK(hipFree(gpu_router_score_fp32));
+    // HIP_CHECK(hipFree(gpu_topk_v_bf16));
+    // HIP_CHECK(hipFree(gpu_topk_v_fp32));
   }
 
   // Final RMSNorm
@@ -979,47 +813,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 
 
 // ------------------------- Driver (generate & inference) -------------------------
-
-long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
-                               Sampler *sampler, const char *input_seq,
-                               int *output_tokens, int steps, GPUContext *gpu_ctx) {
-  const char *empty_prompt = "";
-  if (input_seq == NULL) input_seq = empty_prompt;
-
-  int num_prompt_tokens = 0;
-  int *prompt_tokens = (int *)malloc((strlen(input_seq) + 3) * sizeof(int)); // +3 for '\0', ?BOS, ?EOS
-  encode(tokenizer, input_seq, -1, -1, prompt_tokens, &num_prompt_tokens,
-         transformer->config.initial_context_length);
-  if (num_prompt_tokens < 1) {
-    fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
-    exit(EXIT_FAILURE);
-  }
-
-  int next;
-  int token = prompt_tokens[0];
-  int pos = 0;
-  const int max_ctx = transformer->config.seq_len;
-  const int max_steps = std::min(steps, max_ctx); // bound pos to seq_len
-
-  while (pos < max_steps) {
-    float *logits = gpu_forward(transformer, token, pos, gpu_ctx);
-
-    pos++;
-    if (pos < num_prompt_tokens) {
-      next = prompt_tokens[pos];
-    } else {
-      next = sample(sampler, logits);
-      output_tokens[pos - num_prompt_tokens] = next;
-    }
-    if (next == 199999 || next == 200002) break;
-    if (pos >= max_ctx) break; // guard against OOB in caches/att
-    token = next;
-  }
-
-  output_tokens[pos - num_prompt_tokens + 1] = -1;
-  free(prompt_tokens);
-  return pos - num_prompt_tokens + 1;
-}
 
 
 
