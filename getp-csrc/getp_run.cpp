@@ -42,6 +42,8 @@
     } \
   } while(0)
 
+
+
 // ------------------------- GPU weights & run state -------------------------
 
 typedef struct {
@@ -92,12 +94,37 @@ typedef struct {
   float *logits_fp32;        // final logits
 } GPURunState;
 
-// Per-GPU device context
+#ifndef MAX_SLOTS
+#define MAX_SLOTS 8
+#endif
+
+// Trạng thái 1 slot trên 1 GPU
+enum SlotStage { SLOT_EMPTY=0, SLOT_PREFILL, SLOT_PREFILL_WAIT, SLOT_DECODE, SLOT_DONE };
+
+struct Slot {
+  bool occupied = false;
+  int  req_idx  = -1;
+  std::vector<int> prompt;   // prompt tokens (host)
+  int pos = 0;               // vị trí toàn trình (0..seq_len-1)
+  int token = 0;             // token hiện tại ở vị trí pos
+  int num_prompt_tokens = 0; // số token của prompt
+  int gen_written = 0;       // đã ghi ra bao nhiêu token sinh
+  SlotStage stage = SLOT_EMPTY;
+};
+
 typedef struct {
   int device_id;
   GPUTransformerWeights weights;
-  GPURunState state;
+  GPURunState state; // (legacy) vẫn giữ để tương thích, nhưng scheduler mới không dùng
+  // ---- mới ----
+  int num_slots = 0;
+  hipStream_t stream_decode = nullptr; // ưu tiên cao
+  hipStream_t stream_prefill = nullptr;// ưu tiên thấp
+  std::vector<GPURunState> slot_states;    // mỗi slot 1 runstate riêng
+  std::vector<hipEvent_t>  prefill_done;   // event báo prefill xong cho mỗi slot
 } GPUContext;
+float *gpu_forward_streamed(Transformer *transformer, int token, int pos,
+                            GPUContext *gpu_ctx, GPURunState *s, hipStream_t stream);
 
 static std::vector<GPUContext> gpu_contexts;
 static thread_local GPUContext* t_ctx = nullptr;
@@ -628,6 +655,266 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
   return cpu_logits;
 }
 
+
+float *gpu_forward_streamed(Transformer *transformer, int token, int pos,
+                            GPUContext *gpu_ctx, GPURunState *s, hipStream_t stream) {
+  Config *p = &transformer->config;
+
+  int head_dim         = p->head_dim;
+  int hidden_dim       = p->hidden_dim;
+  int kv_dim           = p->head_dim * p->n_kv_heads;
+  int kv_mul           = p->n_attn_heads / p->n_kv_heads;
+  int intermediate_dim = p->intermediate_dim;
+  int n_experts        = p->n_experts;
+
+  dim3 block(256);
+  dim3 grid_hidden       = dim3((hidden_dim + block.x - 1) / block.x);
+  dim3 grid_vocab        = dim3((p->vocab_size + block.x - 1) / block.x);
+  dim3 grid_intermediate = dim3((intermediate_dim + block.x - 1) / block.x);
+  dim3 grid_experts      = dim3((n_experts + block.x - 1) / block.x);
+
+  // Token embedding
+  hip_bfloat16 *token_row =
+      gpu_ctx->weights.token_embedding_table + (size_t)token * (size_t)hidden_dim;
+  HIP_CHECK(hipMemcpyAsync(s->x, token_row, hidden_dim * sizeof(hip_bfloat16),
+                           hipMemcpyDeviceToDevice, stream));
+
+  // Layers
+  for (int l = 0; l < p->n_layers; l++) {
+    // Attention RMSNorm
+    const hip_bfloat16 *rms_attn_w =
+        gpu_ctx->weights.rms_attn_w + (size_t)l * (size_t)hidden_dim;
+    rmsnorm_kernel_bf16<<<grid_hidden, block, 0, stream>>>(s->t, s->x, rms_attn_w, hidden_dim);
+
+    // QKV projection
+    int loff = l * p->seq_len * kv_dim;
+    const hip_bfloat16 *w_qkv =
+        gpu_ctx->weights.w_qkv +
+        (size_t)l * (size_t)hidden_dim *
+            ((size_t)head_dim * (size_t)p->n_attn_heads +
+             (size_t)2 * (size_t)head_dim * (size_t)p->n_kv_heads);
+    const hip_bfloat16 *b_qkv =
+        gpu_ctx->weights.b_qkv +
+        (size_t)l * ((size_t)head_dim * (size_t)p->n_attn_heads +
+                     (size_t)2 * (size_t)head_dim * (size_t)p->n_kv_heads);
+
+    int qkv_out_dim = (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
+    dim3 grid_qkv = dim3((qkv_out_dim + block.x - 1) / block.x);
+    matmul_kernel_bf16<<<grid_qkv, block, 0, stream>>>(s->qkv, s->t, w_qkv, hidden_dim, qkv_out_dim);
+    add_bias_kernel_bf16<<<grid_qkv, block, 0, stream>>>(s->qkv, b_qkv, qkv_out_dim);
+
+    // Split Q, K, V
+    int q_size = head_dim * p->n_attn_heads;
+    int k_size = head_dim * p->n_kv_heads;
+    int v_size = head_dim * p->n_kv_heads;
+
+    HIP_CHECK(hipMemcpyAsync(s->q, s->qkv, q_size * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(s->k, s->qkv + q_size, k_size * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(s->v, s->qkv + q_size + k_size, v_size * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
+
+    // Store K, V in cache
+    hip_bfloat16 *k_cache_pos = s->key_cache + loff + pos * kv_dim;
+    hip_bfloat16 *v_cache_pos = s->value_cache + loff + pos * kv_dim;
+    HIP_CHECK(hipMemcpyAsync(k_cache_pos, s->k, k_size * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(v_cache_pos, s->v, v_size * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
+
+    // RoPE
+    float ntk_beta  = 32.0f;
+    float ntk_alpha = 1.0f;
+    dim3 grid_rope = dim3(((head_dim / 2) + block.x - 1) / block.x);
+    compute_cos_sin_kernel_bf16<<<grid_rope, block, 0, stream>>>(
+        s->cos_vals, s->sin_vals, pos, p->rope_theta, head_dim,
+        p->rope_scaling_factor, p->initial_context_length, ntk_beta, ntk_alpha);
+
+    apply_rotary_emb_kernel_bf16<<<p->n_attn_heads, head_dim/2, 0, stream>>>(
+        s->q, s->cos_vals, s->sin_vals, p->n_attn_heads, head_dim);
+    apply_rotary_emb_kernel_bf16<<<p->n_kv_heads, head_dim/2, 0, stream>>>(
+        s->k, s->cos_vals, s->sin_vals, p->n_kv_heads, head_dim);
+
+    // Update K cache sau RoPE
+    HIP_CHECK(hipMemcpyAsync(k_cache_pos, s->k, k_size * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
+
+    // Multi-head attention
+    for (int h = 0; h < p->n_attn_heads; h++) {
+      hip_bfloat16 *q   = s->q + (size_t)h * (size_t)head_dim;
+      hip_bfloat16 *att = s->att + (size_t)h * (size_t)p->seq_len;
+
+      // Scores
+      dim3 grid_att = dim3(((pos + 1) + block.x - 1) / block.x);
+      attention_scores_kernel_bf16<<<grid_att, block, 0, stream>>>(
+          att, q, s->key_cache, head_dim, loff, kv_dim, kv_mul, h, pos,
+          p->seq_len,
+          (p->sliding_window > 0 && l % 2 == 0) ? s->mask : NULL);
+
+      // Attention sink an toàn (giới hạn)
+      int len_no_sink = pos + 1;    // t = 0..pos
+      bool can_add_sink = (pos + 1) < p->seq_len;
+      if (can_add_sink) {
+        hip_bfloat16 bf16_sink;
+        // nhỏ lẻ: copy 1 phần tử qua host rồi lại về device (đơn giản hoá)
+        HIP_CHECK(hipMemcpyAsync(&bf16_sink,
+          gpu_ctx->weights.attn_sinks + (size_t)l * (size_t)p->n_attn_heads + (size_t)h,
+          sizeof(hip_bfloat16), hipMemcpyDeviceToHost, stream));
+        HIP_CHECK(hipStreamSynchronize(stream));
+        HIP_CHECK(hipMemcpyAsync(att + pos + 1, &bf16_sink, sizeof(hip_bfloat16),
+                                 hipMemcpyHostToDevice, stream));
+        softmax_kernel_bf16<<<1, 1, 0, stream>>>(att, len_no_sink + 1);
+      } else {
+        softmax_kernel_bf16<<<1, 1, 0, stream>>>(att, len_no_sink);
+      }
+
+      // Weighted sum (0..pos)
+      dim3 grid_head_dim = dim3((head_dim + block.x - 1) / block.x);
+      attention_weighted_sum_kernel_bf16<<<grid_head_dim, block, 0, stream>>>(
+          s->tb, att, s->value_cache, head_dim, loff, kv_dim, kv_mul, h, pos);
+    }
+
+    // Output projection of attention
+    const hip_bfloat16 *w_o =
+        gpu_ctx->weights.w_o + (size_t)l * (size_t)(head_dim * p->n_attn_heads) * (size_t)hidden_dim;
+    const hip_bfloat16 *b_o =
+        gpu_ctx->weights.b_o + (size_t)l * (size_t)hidden_dim;
+    matmul_kernel_bf16<<<grid_hidden, block, 0, stream>>>(s->tb2, s->tb, w_o,
+                                                          head_dim * p->n_attn_heads, hidden_dim);
+    add_bias_kernel_bf16<<<grid_hidden, block, 0, stream>>>(s->tb2, b_o, hidden_dim);
+
+    // Residual
+    residual_connection_kernel_bf16<<<grid_hidden, block, 0, stream>>>(s->x, s->tb2, hidden_dim);
+
+    // -------- MoE --------
+    // FFN RMSNorm
+    const hip_bfloat16 *rms_ffn_w =
+        gpu_ctx->weights.rms_ffn_w + (size_t)l * (size_t)hidden_dim;
+    rmsnorm_kernel_bf16<<<grid_hidden, block, 0, stream>>>(s->t, s->x, rms_ffn_w, hidden_dim);
+
+    // Router
+    const hip_bfloat16 *w_router =
+        gpu_ctx->weights.w_router + (size_t)l * (size_t)hidden_dim * (size_t)n_experts;
+    const hip_bfloat16 *b_router =
+        gpu_ctx->weights.b_router + (size_t)l * (size_t)n_experts;
+    matmul_kernel_bf16<<<grid_experts, block, 0, stream>>>(s->router_score, s->t, w_router, hidden_dim, n_experts);
+    add_bias_kernel_bf16<<<grid_experts, block, 0, stream>>>(s->router_score, b_router, n_experts);
+
+    // Router scores: BF16 -> FP32 (device) -> host (để top-k trên host như cũ)
+    float *gpu_router_score_fp32 = nullptr;
+    HIP_CHECK(hipMalloc(&gpu_router_score_fp32, n_experts * sizeof(float)));
+    convert_bf16_to_fp32_kernel<<<grid_experts, block, 0, stream>>>(s->router_score, gpu_router_score_fp32, n_experts);
+
+    std::vector<float> cpu_router_score(n_experts);
+    HIP_CHECK(hipMemcpyAsync(cpu_router_score.data(), gpu_router_score_fp32,
+                             n_experts * sizeof(float), hipMemcpyDeviceToHost, stream));
+    HIP_CHECK(hipStreamSynchronize(stream));
+
+    std::vector<float> cpu_topk_v(p->experts_per_token);
+    std::vector<int>   cpu_topk_i(p->experts_per_token);
+    topk_cpu(cpu_topk_v.data(), cpu_topk_i.data(), cpu_router_score.data(), n_experts, p->experts_per_token);
+
+    // Softmax top-k (host)
+    float sum = 0.0f;
+    float max_val = cpu_topk_v[0];
+    for (int i = 1; i < p->experts_per_token; i++) if (cpu_topk_v[i] > max_val) max_val = cpu_topk_v[i];
+    for (int i = 0; i < p->experts_per_token; i++) { cpu_topk_v[i] = expf(cpu_topk_v[i] - max_val); sum += cpu_topk_v[i]; }
+    for (int i = 0; i < p->experts_per_token; i++) cpu_topk_v[i] /= sum;
+
+    // Copy topk back to GPU
+    hip_bfloat16 *gpu_topk_v_bf16 = nullptr;
+    float *gpu_topk_v_fp32 = nullptr;
+    HIP_CHECK(hipMalloc(&gpu_topk_v_bf16, p->experts_per_token * sizeof(hip_bfloat16)));
+    HIP_CHECK(hipMalloc(&gpu_topk_v_fp32, p->experts_per_token * sizeof(float)));
+    HIP_CHECK(hipMemcpyAsync(gpu_topk_v_fp32, cpu_topk_v.data(),
+                             p->experts_per_token * sizeof(float), hipMemcpyHostToDevice, stream));
+
+    dim3 grid_topk = dim3((p->experts_per_token + block.x - 1) / block.x);
+    convert_fp32_to_bf16_kernel<<<grid_topk, block, 0, stream>>>(
+        gpu_topk_v_fp32, gpu_topk_v_bf16, p->experts_per_token);
+
+    HIP_CHECK(hipMemcpyAsync(s->topk_v, gpu_topk_v_bf16,
+                             p->experts_per_token * sizeof(hip_bfloat16),
+                             hipMemcpyDeviceToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(s->topk_i, cpu_topk_i.data(),
+                             p->experts_per_token * sizeof(int),
+                             hipMemcpyHostToDevice, stream));
+
+    // Init aggregation
+    HIP_CHECK(hipMemsetAsync(s->e_agg, 0, hidden_dim * sizeof(hip_bfloat16), stream));
+
+    // Experts
+    for (int idx = 0; idx < p->experts_per_token; idx++) {
+      int e = cpu_topk_i[idx];
+
+      const hip_bfloat16 *w_mlp1 =
+          gpu_ctx->weights.w_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) *
+                                     (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
+      const hip_bfloat16 *b_mlp1 =
+          gpu_ctx->weights.b_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) *
+                                     (size_t)(2 * intermediate_dim);
+
+      dim3 grid_mlp1 = dim3(((2 * intermediate_dim) + block.x - 1) / block.x);
+      matmul_kernel_bf16<<<grid_mlp1, block, 0, stream>>>(
+          s->mlp1_out, s->t, w_mlp1, hidden_dim, 2 * intermediate_dim);
+      add_bias_kernel_bf16<<<grid_mlp1, block, 0, stream>>>(
+          s->mlp1_out, b_mlp1, 2 * intermediate_dim);
+
+      split_gate_up_kernel_bf16<<<grid_intermediate, block, 0, stream>>>(
+          s->gate, s->up, s->mlp1_out, intermediate_dim);
+
+      swiglu_kernel_bf16<<<grid_intermediate, block, 0, stream>>>(
+          s->gate_up, s->gate, s->up, intermediate_dim, p->swiglu_limit);
+
+      const hip_bfloat16 *w_mlp2 =
+          gpu_ctx->weights.w_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) *
+                                     (size_t)hidden_dim * (size_t)intermediate_dim;
+      const hip_bfloat16 *b_mlp2 =
+          gpu_ctx->weights.b_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) *
+                                     (size_t)hidden_dim;
+
+      matmul_kernel_bf16<<<grid_hidden, block, 0, stream>>>(
+          s->tb2, s->gate_up, w_mlp2, intermediate_dim, hidden_dim);
+      add_bias_kernel_bf16<<<grid_hidden, block, 0, stream>>>(
+          s->tb2, b_mlp2, hidden_dim);
+
+      weighted_sum_kernel_bf16<<<grid_hidden, block, 0, stream>>>(
+          s->e_agg, s->tb2, cpu_topk_v[idx], hidden_dim);
+    }
+
+    residual_connection_kernel_bf16<<<grid_hidden, block, 0, stream>>>(
+        s->x, s->e_agg, hidden_dim);
+
+    // Cleanup temporaries (GPU)
+    HIP_CHECK(hipFree(gpu_router_score_fp32));
+    HIP_CHECK(hipFree(gpu_topk_v_bf16));
+    HIP_CHECK(hipFree(gpu_topk_v_fp32));
+  }
+
+  // Final RMSNorm
+  rmsnorm_kernel_bf16<<<grid_hidden, block, 0, stream>>>(
+      s->x, s->x, gpu_ctx->weights.rms_out_w, hidden_dim);
+
+  // Convert x to FP32
+  convert_bf16_to_fp32_kernel<<<grid_hidden, block, 0, stream>>>(
+      s->x, s->acc_buffer, hidden_dim);
+
+  // Output logits: W(BF16) * x(FP32) -> logits (FP32)
+  dim3 grid_vocab2 = dim3((p->vocab_size + block.x - 1) / block.x);
+  matvec_wbf16_xfp32_outfp32<<<grid_vocab2, block, 0, stream>>>(
+      s->logits_fp32, s->acc_buffer, gpu_ctx->weights.out, /*n=*/hidden_dim, /*d=*/p->vocab_size);
+
+  // Copy logits về host (đồng bộ 1 lần trước khi return)
+  thread_local float *cpu_logits = NULL;
+  if (cpu_logits == NULL) cpu_logits = (float*)malloc(p->vocab_size * sizeof(float));
+  HIP_CHECK(hipMemcpyAsync(cpu_logits, s->logits_fp32,
+                           p->vocab_size * sizeof(float),
+                           hipMemcpyDeviceToHost, stream));
+  HIP_CHECK(hipStreamSynchronize(stream));
+  return cpu_logits;
+}
+
 // ------------------------- Warm-up & Finish -------------------------
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
@@ -670,15 +957,26 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   printf("[GPU] Warm-up done on %d device(s). BF16 weights loaded to VRAM.\n", max_devices);
 }
 
+
+
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
   for (auto &gpu_ctx : gpu_contexts) {
     HIP_CHECK(hipSetDevice(gpu_ctx.device_id));
+    // dọn streams/events/slot_states nếu còn
+    if (gpu_ctx.stream_decode) hipStreamDestroy(gpu_ctx.stream_decode);
+    if (gpu_ctx.stream_prefill) hipStreamDestroy(gpu_ctx.stream_prefill);
+    for (auto &s : gpu_ctx.slot_states) gpu_free_run_state(&s);
+    for (auto &ev : gpu_ctx.prefill_done) if (ev) hipEventDestroy(ev);
+    gpu_ctx.slot_states.clear();
+    gpu_ctx.prefill_done.clear();
+
     gpu_free_weights(&gpu_ctx.weights);
-    gpu_free_run_state(&gpu_ctx.state);
+    gpu_free_run_state(&gpu_ctx.state); // legacy
   }
   gpu_contexts.clear();
   printf("[GPU] Cleanup done.\n");
 }
+
 
 // ------------------------- Driver (generate & inference) -------------------------
 
@@ -723,51 +1021,169 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   return pos - num_prompt_tokens + 1;
 }
 
+
+
+
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
   if (gpu_contexts.empty()) warm_up(transformer, tokenizer);
   const int num_devices = (int)gpu_contexts.size();
   if (requests->num_reqs <= 0 || num_devices <= 0) return 0;
 
-  // 3.1. Chuẩn bị global job queue (chỉ lưu index request)
+  // Global job queue
   MPMCQueue<int> jobq;
   #pragma omp parallel for
   for (int i = 0; i < requests->num_reqs; ++i) jobq.push(i);
-  jobq.close(); // không còn producer nào khác → đóng để worker thoát khi hết việc
+  jobq.close();
 
   std::atomic<long long> total_out{0};
   std::vector<std::thread> workers;
   workers.reserve(num_devices);
 
-  // 3.2. Mỗi GPU là một worker: rảnh thì pop job mới; bận thì tiếp tục job hiện tại
+  // Tham số slot/gpu (có thể cho vào config hay flag)
+  const int SLOTS = std::min((int)MAX_SLOTS,  4);
+
   for (int t = 0; t < num_devices; ++t) {
     workers.emplace_back([&, t]() {
       HIP_CHECK(hipSetDevice(gpu_contexts[t].device_id));
-      t_ctx = &gpu_contexts[t];
+      GPUContext *ctx = &gpu_contexts[t];
+      t_ctx = ctx; // thread-local
 
-      // Sampler riêng cho từng thread/GPU (seed lệch để tránh tương quan RNG)
+      // Tạo 2 stream với độ ưu tiên
+      int leastPri = 0, greatestPri = 0;
+      hipDeviceGetStreamPriorityRange(&leastPri, &greatestPri);
+      // HIP: số nhỏ hơn thường là ưu tiên cao hơn; ở đây mình dùng greatestPri cho decode:
+      HIP_CHECK(hipStreamCreateWithPriority(&ctx->stream_decode, hipStreamDefault, greatestPri));
+      HIP_CHECK(hipStreamCreateWithPriority(&ctx->stream_prefill, hipStreamDefault, leastPri));
+
+      ctx->num_slots = SLOTS;
+      ctx->slot_states.resize(SLOTS);
+      ctx->prefill_done.resize(SLOTS);
+
+      for (int s = 0; s < SLOTS; ++s) {
+        gpu_malloc_run_state(&ctx->slot_states[s], &transformer->config);
+        HIP_CHECK(hipEventCreateWithFlags(&ctx->prefill_done[s], hipEventDisableTiming));
+      }
+
       Sampler local_sampler;
-      build_sampler(&local_sampler,
-                    sampler->vocab_size,
-                    sampler->temperature,
-                    sampler->topp,
-                    sampler->rng_state + 0x9E3779B97f4A7C15ULL * (t + 1));
+      build_sampler(&local_sampler, sampler->vocab_size, sampler->temperature,
+                    sampler->topp, sampler->rng_state + 0x9E3779B97f4A7C15ULL * (t + 1));
+
+      std::vector<Slot> slots(SLOTS);
+      auto has_active = [&](){
+        for (auto &s: slots) if (s.occupied && s.stage != SLOT_DONE) return true;
+        return false;
+      };
 
       long long local_out = 0;
-      int idx;
-      // Vòng lặp lấy việc đến khi queue rỗng & đóng
-      while (jobq.pop(idx)) {
-        const char *input_seq = get_str_req_ptr(requests, idx);
-        int *output_tokens    = get_tok_gen_ptr(requests, idx);
+      bool jobq_exhausted = false;
 
-        // Chạy tuần tự trên GPU này cho request 'idx'
-        local_out += simple_getp_generate(transformer, tokenizer, &local_sampler,
-                                          input_seq, output_tokens,
-                                          requests->max_seq_len, t_ctx);
-        // Khi xong, vòng lặp quay lại pop việc mới → “work-stealing” tự nhiên
+      while (true) {
+        // Nạp job mới vào các slot trống
+        for (int s = 0; s < SLOTS; ++s) {
+          if (!slots[s].occupied) {
+            int idx;
+            if (jobq.pop(idx)) {
+              Slot &sl = slots[s];
+              sl = Slot{}; // reset
+              sl.occupied = true;
+              sl.req_idx  = idx;
+
+              const char *input_seq = get_str_req_ptr(requests, idx);
+              // Encode prompt
+              int num_prompt_tokens = 0;
+              std::vector<int> prompt_buf(strlen(input_seq) + 3);
+              encode(tokenizer, input_seq, -1, -1, prompt_buf.data(), &num_prompt_tokens,
+                     transformer->config.initial_context_length);
+              prompt_buf.resize(num_prompt_tokens);
+              sl.prompt = std::move(prompt_buf);
+              sl.num_prompt_tokens = num_prompt_tokens;
+              sl.pos   = 0;
+              sl.token = sl.prompt[0];
+              sl.stage = SLOT_PREFILL;
+            } else {
+              jobq_exhausted = true;
+            }
+          }
+        }
+
+        // Điều kiện thoát: hết job và không còn slot active
+        if (jobq_exhausted && !has_active()) break;
+
+        // 1) PREFILL: mỗi slot đang PREFILL đẩy đúng 1 token/lần vào stream_prefill
+        for (int s = 0; s < SLOTS; ++s) {
+          Slot &sl = slots[s];
+          if (!sl.occupied || sl.stage != SLOT_PREFILL) continue;
+
+          // Nếu đã nạp hết prompt -> ghi event và chuyển sang PREFILL_WAIT
+          if (sl.pos + 1 >= sl.num_prompt_tokens) {
+            HIP_CHECK(hipEventRecord(ctx->prefill_done[s], ctx->stream_prefill));
+            sl.stage = SLOT_PREFILL_WAIT;
+            continue;
+          }
+
+          // Chạy 1 bước forward trên stream_prefill (không cần đọc logits, không sample)
+          (void)gpu_forward_streamed(transformer, sl.token, sl.pos, ctx,
+                                     &ctx->slot_states[s], ctx->stream_prefill);
+
+          sl.pos  += 1;
+          sl.token = sl.prompt[sl.pos]; // dùng token kế tiếp trong prompt
+        }
+
+        // 2) Chuyển slot đã prefill xong sang decode (đảm bảo chờ event ở stream_decode)
+        for (int s = 0; s < SLOTS; ++s) {
+          Slot &sl = slots[s];
+          if (!sl.occupied || sl.stage != SLOT_PREFILL_WAIT) continue;
+          HIP_CHECK(hipStreamWaitEvent(ctx->stream_decode, ctx->prefill_done[s], 0));
+          sl.stage = SLOT_DECODE;
+        }
+
+        // 3) DECODE: mỗi slot active decode 1 token/lần (round-robin đơn giản)
+        for (int s = 0; s < SLOTS; ++s) {
+          Slot &sl = slots[s];
+          if (!sl.occupied || sl.stage != SLOT_DECODE) continue;
+
+          float *logits = gpu_forward_streamed(transformer, sl.token, sl.pos, ctx,
+                                               &ctx->slot_states[s], ctx->stream_decode);
+          int next;
+          if (sl.pos + 1 < sl.num_prompt_tokens) {
+            // (Trường hợp hiếm: prompt rất dài vẫn còn—nhưng slot đã qua PREFILL_WAIT, nên
+            // về logic bình thường sẽ không vào nhánh này)
+            next = sl.prompt[sl.pos + 1];
+          } else {
+            next = sample(&local_sampler, logits);
+            int *out_tokens = get_tok_gen_ptr(requests, sl.req_idx);
+            out_tokens[sl.gen_written++] = next;
+          }
+
+          sl.pos  += 1;
+          sl.token = next;
+
+          // EOS hoặc đạt giới hạn
+          if (next == 199999 || next == 200002 ||
+              sl.pos >= transformer->config.seq_len ||
+              sl.gen_written >= requests->max_seq_len) {
+            int *out_tokens = get_tok_gen_ptr(requests, sl.req_idx);
+            out_tokens[sl.gen_written] = -1;
+            local_out += (long long)sl.gen_written;
+            sl.stage = SLOT_DONE;
+            sl.occupied = false; // giải phóng slot ngay để nạp job mới ở vòng sau
+          }
+        }
       }
 
       total_out.fetch_add(local_out, std::memory_order_relaxed);
+
+      // Cleanup per-GPU
+      for (int s = 0; s < SLOTS; ++s) {
+        gpu_free_run_state(&ctx->slot_states[s]);
+        HIP_CHECK(hipEventDestroy(ctx->prefill_done[s]));
+      }
+      ctx->slot_states.clear();
+      ctx->prefill_done.clear();
+      HIP_CHECK(hipStreamDestroy(ctx->stream_decode));
+      HIP_CHECK(hipStreamDestroy(ctx->stream_prefill));
+
       free_sampler(&local_sampler);
     });
   }
