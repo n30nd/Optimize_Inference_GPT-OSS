@@ -8,6 +8,7 @@
 //   batched kernels for RMSNorm/MatVec/AddBias/Final matvec; attention kept per-slot (safer).
 // - Keeps function signatures: warm_up, inference, finish.
 
+
 #include "getp_eval.cpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
