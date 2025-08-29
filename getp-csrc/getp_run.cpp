@@ -94,6 +94,7 @@ struct GPURunState {
   // FP32 buffers for accumulation and precision-sensitive ops
   float *acc_buffer;         // x in FP32 for output matvec
   float *logits_fp32;        // final logits
+  int *next_token;           // argmax result for greedy sampling
 };
 
 #ifndef MAX_SLOTS
@@ -131,6 +132,7 @@ struct GPUContext {
   hip_bfloat16 **d_router_list=nullptr, **d_mlp1_out_list=nullptr, **d_gate_list=nullptr, **d_up_list=nullptr, **d_gate_up_list=nullptr, **d_e_agg_list=nullptr;
   hip_bfloat16 **d_att_list=nullptr, **d_cos_list=nullptr, **d_sin_list=nullptr;
   float        **d_acc_list=nullptr, **d_logitsfp32_list=nullptr;
+  int          **d_nexttok_list=nullptr;     // [B] -> int* for argmax results
 
   // top-k per-slot pointer lists (for batched MOE)
   int           **d_topk_i_list=nullptr;       // [B] -> int*
@@ -149,6 +151,8 @@ struct GPUContext {
   // host staging for top-k per-slot
   std::vector<int*>           h_topk_i_list;
   std::vector<hip_bfloat16*>  h_topk_v_list;
+  // host staging for next_token argmax results
+  std::vector<int*>           h_nexttok_list;
   // host staging for MOE weight/bias pointers (optional, we build on device but keep vectors for size)
   std::vector<hip_bfloat16*>  h_w1_list, h_w2_list;
   std::vector<hip_bfloat16*>  h_b1_list, h_b2_list;
@@ -463,6 +467,55 @@ __global__ void matvec_wbf16_xfp32_outfp32(float *out, const float *x,
     out[i] = sum;
   }
 }
+// ------------------------- Argmax kernel for greedy sampling -------------------------
+
+extern "C" __global__
+void argmax_kernel_fp32(float **logits_list, int **next_tok_list, int vocab_size) {
+  int b = blockIdx.y;
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
+  
+  float *logits = logits_list[b];
+  int *next_token = next_tok_list[b];
+  
+  // Use shared memory for reduction
+  extern __shared__ float sdata[];
+  int *sidx = (int*)&sdata[nthreads];
+  
+  float max_val = -INFINITY;
+  int max_idx = -1;
+  
+  // Each thread finds local max in its assigned portion
+  for (int i = tid; i < vocab_size; i += nthreads) {
+    if (logits[i] > max_val) {
+      max_val = logits[i];
+      max_idx = i;
+    }
+  }
+  
+  sdata[tid] = max_val;
+  sidx[tid] = max_idx;
+  __syncthreads();
+  
+  // Reduction to find global max
+  for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      if (sdata[tid] < sdata[tid + stride]) {
+        sdata[tid] = sdata[tid + stride];
+        sidx[tid] = sidx[tid + stride];
+      }
+    }
+    __syncthreads();
+  }
+  
+  // Thread 0 writes the result
+  if (tid == 0) {
+    next_token[0] = sidx[0];
+  }
+}
+
+// ------------------------- Kernels (batched via pointer lists) -------------------------
+
 
 // ------------------------- Kernels (batched via pointer lists) -------------------------
 
@@ -939,6 +992,8 @@ static int build_ptr_lists_decode(GPUContext *ctx, const std::vector<int> &activ
     // top-k pointers
     ctx->h_topk_i_list[bi]  = st.topk_i;
     ctx->h_topk_v_list[bi]  = st.topk_v;
+    // next_token argmax result pointer
+    ctx->h_nexttok_list[bi] = st.next_token;
   }
   size_t Bp   = sizeof(hip_bfloat16*) * B;
   size_t Bpf  = sizeof(float*) * B;
@@ -965,6 +1020,8 @@ static int build_ptr_lists_decode(GPUContext *ctx, const std::vector<int> &activ
   // top-k pointer lists
   HIP_CHECK(hipMemcpyAsync(ctx->d_topk_i_list, ctx->h_topk_i_list.data(), B * sizeof(int*), hipMemcpyHostToDevice, ctx->stream_decode));
   HIP_CHECK(hipMemcpyAsync(ctx->d_topk_v_list, ctx->h_topk_v_list.data(), B * sizeof(hip_bfloat16*), hipMemcpyHostToDevice, ctx->stream_decode));
+  // next_token pointer list
+  HIP_CHECK(hipMemcpyAsync(ctx->d_nexttok_list, ctx->h_nexttok_list.data(), B * sizeof(int*), hipMemcpyHostToDevice, ctx->stream_decode));
   return B;
 }
 
@@ -1118,6 +1175,13 @@ static void decode(Transformer *tr, GPUContext *ctx,
 
   // logits (batched FP32)
   matvec_wbf16_xfp32_outfp32_ptrs<<<grid_vocabB, block, 0, ctx->stream_decode>>>(ctx->d_logitsfp32_list, ctx->d_acc_list, ctx->weights.out, p->hidden_dim, p->vocab_size);
+
+  // GPU argmax for greedy sampling (temperature = 0)
+  const int argmax_threads = 256;
+  size_t shmem_size = argmax_threads * (sizeof(float) + sizeof(int));
+  dim3 grid_argmax(1, B);  // 1 block per batch item
+  argmax_kernel_fp32<<<grid_argmax, argmax_threads, shmem_size, ctx->stream_decode>>>(
+    ctx->d_logitsfp32_list, ctx->d_nexttok_list, p->vocab_size);
 }
 
 // ------------------------- Warm-up & Finish -------------------------
@@ -1181,6 +1245,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     if (gpu_ctx.d_sin_list)      HIP_CHECK(hipFree(gpu_ctx.d_sin_list));
     if (gpu_ctx.d_topk_i_list)   HIP_CHECK(hipFree(gpu_ctx.d_topk_i_list));
     if (gpu_ctx.d_topk_v_list)   HIP_CHECK(hipFree(gpu_ctx.d_topk_v_list));
+    if (gpu_ctx.d_nexttok_list)  HIP_CHECK(hipFree(gpu_ctx.d_nexttok_list));
     if (gpu_ctx.d_w1_list)       HIP_CHECK(hipFree(gpu_ctx.d_w1_list));
     if (gpu_ctx.d_w2_list)       HIP_CHECK(hipFree(gpu_ctx.d_w2_list));
     if (gpu_ctx.d_b1_list)       HIP_CHECK(hipFree(gpu_ctx.d_b1_list));
@@ -1243,6 +1308,8 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       // top-k pointer lists
       HIP_CHECK(hipMalloc((void**)&ctx->d_topk_i_list, sizeof(int*) * SLOTS));
       HIP_CHECK(hipMalloc((void**)&ctx->d_topk_v_list, sizeof(hip_bfloat16*) * SLOTS));
+      // next_token pointer list
+      HIP_CHECK(hipMalloc((void**)&ctx->d_nexttok_list, sizeof(int*) * SLOTS));
       // MOE per-slot weight/bias pointer lists
       HIP_CHECK(hipMalloc((void**)&ctx->d_w1_list, sizeof(hip_bfloat16*) * SLOTS));
       HIP_CHECK(hipMalloc((void**)&ctx->d_w2_list, sizeof(hip_bfloat16*) * SLOTS));
@@ -1266,6 +1333,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       ctx->h_w1_list.resize(SLOTS); ctx->h_w2_list.resize(SLOTS);
       ctx->h_b1_list.resize(SLOTS); ctx->h_b2_list.resize(SLOTS);
       ctx->h_acc_list.resize(SLOTS);    ctx->h_logitsfp32_list.resize(SLOTS);
+      ctx->h_nexttok_list.resize(SLOTS);  // Add resize for next_token list
 
       Sampler local_sampler; build_sampler(&local_sampler, sampler->vocab_size, sampler->temperature, sampler->topp, sampler->rng_state + 0x9E3779B97f4A7C15ULL * (t + 1));
 
@@ -1311,20 +1379,34 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
         }
         if (!active.empty()) {
           decode(transformer, ctx, active, tokens, poses);
-          HIP_CHECK(hipStreamSynchronize(ctx->stream_decode));
-
-          for (int i=0;i<(int)active.size();++i) {
-            int s = active[i]; Slot &sl = slots[s]; auto &st = ctx->slot_states[s];
-            std::vector<float> h_logits(transformer->config.vocab_size);
-            HIP_CHECK(hipMemcpy(h_logits.data(), st.logits_fp32, h_logits.size()*sizeof(float), hipMemcpyDeviceToHost));
-
+          
+          // Copy argmax results from GPU to host (much smaller than full logits)
+          for (int i = 0; i < (int)active.size(); ++i) {
+            int s = active[i];
+            Slot &sl = slots[s];
+            auto &st = ctx->slot_states[s];
+            
+            // Copy just the argmax result (1 int) instead of full logits
+            int next_from_gpu;
+            HIP_CHECK(hipMemcpy(&next_from_gpu, st.next_token, sizeof(int), hipMemcpyDeviceToHost));
+            
             int next;
-            if (sl.pos + 1 < sl.num_prompt_tokens) next = sl.prompt[sl.pos + 1];
-            else { next = sample(&local_sampler, h_logits.data()); int *out_tokens = get_tok_gen_ptr(requests, sl.req_idx); out_tokens[sl.gen_written++] = next; }
+            if (sl.pos + 1 < sl.num_prompt_tokens) {
+              next = sl.prompt[sl.pos + 1];  // Still in prompt phase
+            } else {
+              next = next_from_gpu;  // Use GPU argmax result for generation
+              int *out_tokens = get_tok_gen_ptr(requests, sl.req_idx);
+              out_tokens[sl.gen_written++] = next;
+            }
 
-            sl.pos += 1; sl.token = next;
+            sl.pos += 1;
+            sl.token = next;
             if (next == 199999 || next == 200002 || sl.pos >= transformer->config.seq_len || sl.gen_written >= requests->max_seq_len) {
-              int *out_tokens = get_tok_gen_ptr(requests, sl.req_idx); out_tokens[sl.gen_written] = -1; local_out += (long long)sl.gen_written; sl.stage = SLOT_DONE; sl.occupied = false;
+              int *out_tokens = get_tok_gen_ptr(requests, sl.req_idx);
+              out_tokens[sl.gen_written] = -1;
+              local_out += (long long)sl.gen_written;
+              sl.stage = SLOT_DONE;
+              sl.occupied = false;
             }
           }
         }
@@ -1380,6 +1462,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p) {
 
   HIP_CHECK(hipMalloc(&s->acc_buffer,  p->hidden_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->logits_fp32, p->vocab_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->next_token,  1 * sizeof(int)));  // Only need 1 int for argmax result
 }
 
 void gpu_free_run_state(GPURunState *s) {
@@ -1397,6 +1480,7 @@ void gpu_free_run_state(GPURunState *s) {
   if (s->mask) HIP_CHECK(hipFree(s->mask));
   HIP_CHECK(hipFree(s->cos_vals));    HIP_CHECK(hipFree(s->sin_vals));
   HIP_CHECK(hipFree(s->acc_buffer));  HIP_CHECK(hipFree(s->logits_fp32));
+  HIP_CHECK(hipFree(s->next_token));
 }
 
 // ------------------------- Weights copy/free (chunked FP32->BF16) -------------------------
@@ -1511,3 +1595,4 @@ void gpu_free_weights(GPUTransformerWeights *gpu_w) {
   HIP_CHECK(hipFree(gpu_w->w_mlp1));   HIP_CHECK(hipFree(gpu_w->b_mlp1));
   HIP_CHECK(hipFree(gpu_w->w_mlp2));   HIP_CHECK(hipFree(gpu_w->b_mlp2));
 }
+
