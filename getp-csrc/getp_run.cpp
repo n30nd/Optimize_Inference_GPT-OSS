@@ -132,12 +132,26 @@ struct GPUContext {
   hip_bfloat16 **d_att_list=nullptr, **d_cos_list=nullptr, **d_sin_list=nullptr;
   float        **d_acc_list=nullptr, **d_logitsfp32_list=nullptr;
 
+  // top-k per-slot pointer lists (for batched MOE)
+  int           **d_topk_i_list=nullptr;       // [B] -> int*
+  hip_bfloat16  **d_topk_v_list=nullptr;       // [B] -> bf16*
+
+  // MOE weight/bias pointer lists per-slot (built per K)
+  hip_bfloat16 **d_w1_list=nullptr, **d_w2_list=nullptr;
+  hip_bfloat16 **d_b1_list=nullptr, **d_b2_list=nullptr;
+
   // host staging (reused per step)
   std::vector<hip_bfloat16*> h_x_list, h_t_list, h_tb_list, h_tb2_list;
   std::vector<hip_bfloat16*> h_qkv_list, h_q_list, h_k_list, h_v_list;
   std::vector<hip_bfloat16*> h_router_list, h_mlp1_out_list, h_gate_list, h_up_list, h_gate_up_list, h_e_agg_list;
   std::vector<hip_bfloat16*> h_att_list, h_cos_list, h_sin_list;
   std::vector<float*>         h_acc_list, h_logitsfp32_list;
+  // host staging for top-k per-slot
+  std::vector<int*>           h_topk_i_list;
+  std::vector<hip_bfloat16*>  h_topk_v_list;
+  // host staging for MOE weight/bias pointers (optional, we build on device but keep vectors for size)
+  std::vector<hip_bfloat16*>  h_w1_list, h_w2_list;
+  std::vector<hip_bfloat16*>  h_b1_list, h_b2_list;
 };
 
 void prefill(Transformer *transformer, int token, int pos,
@@ -452,6 +466,131 @@ __global__ void matvec_wbf16_xfp32_outfp32(float *out, const float *x,
 
 // ------------------------- Kernels (batched via pointer lists) -------------------------
 
+// ------------------------- MOE (device-only) -------------------------
+// Single-slot MOE forward: reads topk indices/weights on device and computes e_agg in-place (BF16)
+__global__ void moe_forward_single_kernel_bf16(
+    hip_bfloat16 *e_agg,
+    const hip_bfloat16 *t,
+    const hip_bfloat16 *w_mlp1, const hip_bfloat16 *b_mlp1,
+    const hip_bfloat16 *w_mlp2, const hip_bfloat16 *b_mlp2,
+    const int *topk_i, const hip_bfloat16 *topk_v, int K,
+    int hidden_dim, int intermediate_dim, int n_experts, int layer_idx,
+    hip_bfloat16 *gate_up, hip_bfloat16 *tb2,
+    float swiglu_limit) {
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
+  // Loop over top-K experts
+  for (int idx = 0; idx < K; ++idx) {
+    int e = topk_i[idx];
+    float ew = bfloat16_to_float(topk_v[idx]);
+    // Offsets
+    size_t base_mlp1 = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
+    size_t base_b1   = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim);
+    size_t base_mlp2 = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim * (size_t)intermediate_dim;
+    size_t base_b2   = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim;
+
+    // Compute gate_up[j] for j in [0, intermediate_dim)
+    for (int j = tid; j < intermediate_dim; j += nthreads) {
+      // rows 2*j and 2*j+1
+      const hip_bfloat16 *row_gate = w_mlp1 + base_mlp1 + (size_t)(2 * j) * (size_t)hidden_dim;
+      const hip_bfloat16 *row_up   = w_mlp1 + base_mlp1 + (size_t)(2 * j + 1) * (size_t)hidden_dim;
+      float sg = 0.0f, su = 0.0f;
+      for (int k = 0; k < hidden_dim; ++k) {
+        sg += bfloat16_to_float(row_gate[k]) * bfloat16_to_float(t[k]);
+        su += bfloat16_to_float(row_up[k])   * bfloat16_to_float(t[k]);
+      }
+      sg += bfloat16_to_float(b_mlp1[base_b1 + 2 * (size_t)j]);
+      su += bfloat16_to_float(b_mlp1[base_b1 + 2 * (size_t)j + 1]);
+      if (sg   >  swiglu_limit) sg   =  swiglu_limit; // match CPU logic
+      if (su   >  swiglu_limit) su   =  swiglu_limit;
+      if (su   < -swiglu_limit) su   = -swiglu_limit;
+      const float alpha = 1.702f;
+      sg *= (1.0f / (1.0f + expf(-alpha * sg)));
+      float gu = sg * (su + 1.0f);
+      gate_up[j] = float_to_bfloat16(gu);
+    }
+    __syncthreads();
+
+    // Compute tb2[i] = W2 * gate_up + b2, then accumulate into e_agg with weight ew
+    for (int i = tid; i < hidden_dim; i += nthreads) {
+      const hip_bfloat16 *row2 = w_mlp2 + base_mlp2 + (size_t)i * (size_t)intermediate_dim;
+      float sum = 0.0f;
+      for (int j = 0; j < intermediate_dim; ++j) {
+        sum += bfloat16_to_float(row2[j]) * bfloat16_to_float(gate_up[j]);
+      }
+      sum += bfloat16_to_float(b_mlp2[base_b2 + (size_t)i]);
+      tb2[i] = float_to_bfloat16(sum);
+      float cur = bfloat16_to_float(e_agg[i]);
+      e_agg[i] = float_to_bfloat16(cur + sum * ew);
+    }
+    __syncthreads();
+  }
+}
+
+// Batched MOE: one block per batch item (grid.y = B), no host-device copies of top-k
+extern "C" __global__
+void moe_forward_bf16_ptrs(
+    hip_bfloat16 **e_agg_list, hip_bfloat16 **t_list,
+    const hip_bfloat16 *w_mlp1, const hip_bfloat16 *b_mlp1,
+    const hip_bfloat16 *w_mlp2, const hip_bfloat16 *b_mlp2,
+    int **topk_i_list, hip_bfloat16 **topk_v_list, int K,
+    int hidden_dim, int intermediate_dim, int n_experts, int layer_idx,
+    hip_bfloat16 **gate_up_list, hip_bfloat16 **tb2_list,
+    float swiglu_limit) {
+  int b = blockIdx.y; int tid = threadIdx.x; int nthreads = blockDim.x;
+  hip_bfloat16 *e_agg = e_agg_list[b];
+  const hip_bfloat16 *t = t_list[b];
+  int *topk_i = topk_i_list[b];
+  hip_bfloat16 *topk_v = topk_v_list[b];
+  hip_bfloat16 *gate_up = gate_up_list[b];
+  hip_bfloat16 *tb2 = tb2_list[b];
+
+  // Loop over top-K experts
+  for (int idx = 0; idx < K; ++idx) {
+    int e = topk_i[idx];
+    float ew = bfloat16_to_float(topk_v[idx]);
+    size_t base_mlp1 = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
+    size_t base_b1   = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim);
+    size_t base_mlp2 = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim * (size_t)intermediate_dim;
+    size_t base_b2   = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim;
+
+    // gate_up
+    for (int j = tid; j < intermediate_dim; j += nthreads) {
+      const hip_bfloat16 *row_gate = w_mlp1 + base_mlp1 + (size_t)(2 * j) * (size_t)hidden_dim;
+      const hip_bfloat16 *row_up   = w_mlp1 + base_mlp1 + (size_t)(2 * j + 1) * (size_t)hidden_dim;
+      float sg = 0.0f, su = 0.0f;
+      for (int k = 0; k < hidden_dim; ++k) {
+        sg += bfloat16_to_float(row_gate[k]) * bfloat16_to_float(t[k]);
+        su += bfloat16_to_float(row_up[k])   * bfloat16_to_float(t[k]);
+      }
+      sg += bfloat16_to_float(b_mlp1[base_b1 + 2 * (size_t)j]);
+      su += bfloat16_to_float(b_mlp1[base_b1 + 2 * (size_t)j + 1]);
+      if (sg   >  swiglu_limit) sg   =  swiglu_limit;
+      if (su   >  swiglu_limit) su   =  swiglu_limit;
+      if (su   < -swiglu_limit) su   = -swiglu_limit;
+      const float alpha = 1.702f;
+      sg *= (1.0f / (1.0f + expf(-alpha * sg)));
+      float gu = sg * (su + 1.0f);
+      gate_up[j] = float_to_bfloat16(gu);
+    }
+    __syncthreads();
+
+    // tb2 and accumulate
+    for (int i = tid; i < hidden_dim; i += nthreads) {
+      const hip_bfloat16 *row2 = w_mlp2 + base_mlp2 + (size_t)i * (size_t)intermediate_dim;
+      float sum = 0.0f;
+      for (int j = 0; j < intermediate_dim; ++j) {
+        sum += bfloat16_to_float(row2[j]) * bfloat16_to_float(gate_up[j]);
+      }
+      sum += bfloat16_to_float(b_mlp2[base_b2 + (size_t)i]);
+      tb2[i] = float_to_bfloat16(sum);
+      float cur = bfloat16_to_float(e_agg[i]);
+      e_agg[i] = float_to_bfloat16(cur + sum * ew);
+    }
+    __syncthreads();
+  }
+}
+
 extern "C" __global__
 void rmsnorm_kernel_bf16_ptrs(hip_bfloat16 **o_list, hip_bfloat16 **x_list,
                               const hip_bfloat16 *weight, int size) {
@@ -476,6 +615,14 @@ void add_bias_kernel_bf16_ptrs(hip_bfloat16 **out_list, const hip_bfloat16 *bias
   if (tid < size) out[tid] = hip_bfloat16(float(out[tid]) + float(bias[tid]));
 }
 
+// Variant: bias per-slot (pointer list)
+extern "C" __global__
+void add_bias_kernel_bf16_ptrs_varbias(hip_bfloat16 **out_list, hip_bfloat16 **bias_list, int size){
+  int tid = blockIdx.x * blockDim.x + threadIdx.x; int b = blockIdx.y;
+  hip_bfloat16 *out = out_list[b]; const hip_bfloat16 *bias = bias_list[b];
+  if (tid < size) out[tid] = hip_bfloat16(float(out[tid]) + float(bias[tid]));
+}
+
 extern "C" __global__
 void matmul_kernel_bf16_ptrs(hip_bfloat16 **xout_list, hip_bfloat16 **x_list,
                              const hip_bfloat16 *w, int n, int d) {
@@ -484,11 +631,122 @@ void matmul_kernel_bf16_ptrs(hip_bfloat16 **xout_list, hip_bfloat16 **x_list,
   if (row < d) { float val = 0.f; for (int j=0;j<n;j++) val += float(w[row*n + j]) * float(x[j]); xout[row] = hip_bfloat16(val); }
 }
 
+// Variant: per-slot weight pointer list
+extern "C" __global__
+void matmul_kernel_bf16_ptrs_w(hip_bfloat16 **xout_list, hip_bfloat16 **x_list,
+                               const hip_bfloat16 **w_list, int n, int d) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x; int b = blockIdx.y;
+  hip_bfloat16 *xout = xout_list[b]; hip_bfloat16 *x = x_list[b]; const hip_bfloat16 *w = w_list[b];
+  if (row < d) { float val = 0.f; for (int j=0;j<n;j++) val += float(w[row*n + j]) * float(x[j]); xout[row] = hip_bfloat16(val); }
+}
+
 extern "C" __global__
 void matvec_wbf16_xfp32_outfp32_ptrs(float **out_list, float **x_list,
                                      const hip_bfloat16 *w, int n, int d) {
   int i = blockIdx.x * blockDim.x + threadIdx.x; int b = blockIdx.y;
   if (i < d) { float sum=0.f; float *x = x_list[b]; for (int j=0;j<n;++j) sum += (float)w[i*n+j]*x[j]; out_list[b][i]=sum; }
+}
+
+// Batched split gate/up
+extern "C" __global__
+void split_gate_up_kernel_bf16_ptrs(hip_bfloat16 **gate_list, hip_bfloat16 **up_list, hip_bfloat16 **mlp1_out_list, int intermediate_dim) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x; int b = blockIdx.y;
+  if (tid < intermediate_dim) { hip_bfloat16 *mlp1 = mlp1_out_list[b]; hip_bfloat16 *gate = gate_list[b]; hip_bfloat16 *up = up_list[b]; gate[tid] = mlp1[2*tid]; up[tid] = mlp1[2*tid + 1]; }
+}
+
+// Batched swiglu
+extern "C" __global__
+void swiglu_kernel_bf16_ptrs(hip_bfloat16 **gate_up_list, hip_bfloat16 **gate_list, hip_bfloat16 **up_list,
+                             int intermediate_dim, float swiglu_limit) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x; int b = blockIdx.y;
+  hip_bfloat16 *gate_up = gate_up_list[b]; const hip_bfloat16 *gate = gate_list[b]; const hip_bfloat16 *up = up_list[b];
+  if (tid < intermediate_dim) {
+    float val = float(gate[tid]); float upval = float(up[tid]);
+    if (val   >  swiglu_limit) val   =  swiglu_limit;
+    if (upval >  swiglu_limit) upval =  swiglu_limit;
+    if (upval < -swiglu_limit) upval = -swiglu_limit;
+    const float alpha = 1.702f;
+    val *= (1.0f / (1.0f + expf(-alpha * val)));
+    val *= (upval + 1.0f);
+    gate_up[tid] = hip_bfloat16(val);
+  }
+}
+
+// Build per-slot pointers to selected MOE expert weights/biases for k_idx
+extern "C" __global__
+void build_moe_ptrs_kernel(
+    const hip_bfloat16 *w_mlp1, const hip_bfloat16 *b_mlp1,
+    const hip_bfloat16 *w_mlp2, const hip_bfloat16 *b_mlp2,
+    int **topk_i_list, int k_idx, int layer_idx,
+    int hidden_dim, int intermediate_dim, int n_experts,
+    hip_bfloat16 **w1_out, hip_bfloat16 **b1_out,
+    hip_bfloat16 **w2_out, hip_bfloat16 **b2_out) {
+  int b = blockIdx.x;
+  int e = topk_i_list[b][k_idx];
+  size_t base_mlp1 = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
+  size_t base_b1   = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim);
+  size_t base_mlp2 = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim * (size_t)intermediate_dim;
+  size_t base_b2   = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim;
+  w1_out[b] = (hip_bfloat16*)(w_mlp1 + base_mlp1);
+  b1_out[b] = (hip_bfloat16*)(b_mlp1 + base_b1);
+  w2_out[b] = (hip_bfloat16*)(w_mlp2 + base_mlp2);
+  b2_out[b] = (hip_bfloat16*)(b_mlp2 + base_b2);
+}
+
+// Weighted sum per-slot with expert weight read from topk_v_list[b][k_idx]
+extern "C" __global__
+void weighted_sum_kernel_bf16_ptrs(hip_bfloat16 **e_agg_list, hip_bfloat16 **tb2_list,
+                                   hip_bfloat16 **topk_v_list, int k_idx, int hidden_dim) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x; int b = blockIdx.y;
+  if (tid < hidden_dim) {
+    hip_bfloat16 *e_agg = e_agg_list[b]; const hip_bfloat16 *tb2 = tb2_list[b];
+    float ew = float(topk_v_list[b][k_idx]);
+    float agg = float(e_agg[tid]); float add = float(tb2[tid]);
+    e_agg[tid] = hip_bfloat16(agg + add * ew);
+  }
+}
+
+// ------------------------- MOE (single-slot, row-parallel) -------------------------
+__global__ void moe_mlp1_single_kernel(hip_bfloat16 *mlp1_out, const hip_bfloat16 *t,
+                                       const hip_bfloat16 *w_mlp1, const hip_bfloat16 *b_mlp1,
+                                       const int *topk_i, int k_idx,
+                                       int hidden_dim, int intermediate_dim, int n_experts, int layer_idx) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  int out_dim = 2 * intermediate_dim;
+  if (row < out_dim) {
+    int e = topk_i[k_idx];
+    size_t base_mlp1 = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)out_dim * (size_t)hidden_dim;
+    size_t base_b1   = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)out_dim;
+    const hip_bfloat16 *row_w = w_mlp1 + base_mlp1 + (size_t)row * (size_t)hidden_dim;
+    float sum = 0.f; for (int j=0;j<hidden_dim;++j) sum += float(row_w[j]) * float(t[j]);
+    sum += float(b_mlp1[base_b1 + (size_t)row]);
+    mlp1_out[row] = hip_bfloat16(sum);
+  }
+}
+
+__global__ void moe_mlp2_single_kernel(hip_bfloat16 *tb2, const hip_bfloat16 *gate_up,
+                                       const hip_bfloat16 *w_mlp2, const hip_bfloat16 *b_mlp2,
+                                       const int *topk_i, int k_idx,
+                                       int hidden_dim, int intermediate_dim, int n_experts, int layer_idx) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row < hidden_dim) {
+    int e = topk_i[k_idx];
+    size_t base_mlp2 = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim * (size_t)intermediate_dim;
+    size_t base_b2   = ((size_t)layer_idx * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim;
+    const hip_bfloat16 *row_w = w_mlp2 + base_mlp2 + (size_t)row * (size_t)intermediate_dim;
+    float sum = 0.f; for (int j=0;j<intermediate_dim;++j) sum += float(row_w[j]) * float(gate_up[j]);
+    sum += float(b_mlp2[base_b2 + (size_t)row]);
+    tb2[row] = hip_bfloat16(sum);
+  }
+}
+
+__global__ void weighted_sum_kernel_bf16_single_ptrw(hip_bfloat16 *e_agg, const hip_bfloat16 *tb2,
+                                                     const hip_bfloat16 *topk_v, int k_idx, int hidden_dim) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < hidden_dim) {
+    float ew = float(topk_v[k_idx]); float agg = float(e_agg[tid]); float add = float(tb2[tid]);
+    e_agg[tid] = hip_bfloat16(agg + add * ew);
+  }
 }
 
 // ------------------------- CPU top-k -------------------------
@@ -629,39 +887,26 @@ void prefill(Transformer *transformer, int token, int pos,
       router_topk_softmax_kernel_bf16<<<1, threads, shmem, stream>>>(s->router_score, s->topk_v, s->topk_i, n_experts, K);
     }
 
-    // Init aggregation
+    // Init aggregation and run MOE fully on device (no D2H), row-parallel
     HIP_CHECK(hipMemsetAsync(s->e_agg, 0, hidden_dim * sizeof(hip_bfloat16), stream));
-
-    // Experts (per-slot)
     int K = p->experts_per_token;
-    std::vector<int>   h_topk_i(K);
-    std::vector<hip_bfloat16> h_topk_v_bf16(K);
-    HIP_CHECK(hipMemcpyAsync(h_topk_i.data(), s->topk_i, K*sizeof(int), hipMemcpyDeviceToHost, stream));
-    HIP_CHECK(hipMemcpyAsync(h_topk_v_bf16.data(), s->topk_v, K*sizeof(hip_bfloat16), hipMemcpyDeviceToHost, stream));
-    HIP_CHECK(hipStreamSynchronize(stream));
-    std::vector<float> h_topk_v(K); for (int i=0;i<K;i++) h_topk_v[i]=float(h_topk_v_bf16[i]);
-
-    for (int idx = 0; idx < p->experts_per_token; idx++) {
-      const int   e         = h_topk_i[idx];
-      const float expert_w  = h_topk_v[idx];
-
-      const hip_bfloat16 *w_mlp1 = gpu_ctx->weights.w_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
-      const hip_bfloat16 *b_mlp1 = gpu_ctx->weights.b_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim);
-
-      dim3 grid_mlp1 = dim3(((2 * intermediate_dim) + block.x - 1) / block.x);
-      matmul_kernel_bf16<<<grid_mlp1, block, 0, stream>>>(s->mlp1_out, s->t, w_mlp1, hidden_dim, 2 * intermediate_dim);
-      add_bias_kernel_bf16<<<grid_mlp1, block, 0, stream>>>(s->mlp1_out, b_mlp1, 2 * intermediate_dim);
-
+    for (int ki = 0; ki < K; ++ki) {
+      dim3 grid_m1((2*intermediate_dim + block.x - 1)/block.x);
+      moe_mlp1_single_kernel<<<grid_m1, block, 0, stream>>>(s->mlp1_out, s->t,
+          gpu_ctx->weights.w_mlp1, gpu_ctx->weights.b_mlp1,
+          s->topk_i, ki,
+          hidden_dim, intermediate_dim, n_experts, l);
+      // split + swiglu
       split_gate_up_kernel_bf16<<<grid_intermediate, block, 0, stream>>>(s->gate, s->up, s->mlp1_out, intermediate_dim);
       swiglu_kernel_bf16<<<grid_intermediate, block, 0, stream>>>(s->gate_up, s->gate, s->up, intermediate_dim, p->swiglu_limit);
-
-      const hip_bfloat16 *w_mlp2 = gpu_ctx->weights.w_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim * (size_t)intermediate_dim;
-      const hip_bfloat16 *b_mlp2 = gpu_ctx->weights.b_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim;
-
-      matmul_kernel_bf16<<<grid_hidden, block, 0, stream>>>(s->tb2, s->gate_up, w_mlp2, intermediate_dim, hidden_dim);
-      add_bias_kernel_bf16<<<grid_hidden, block, 0, stream>>>(s->tb2, b_mlp2, hidden_dim);
-
-      weighted_sum_kernel_bf16<<<grid_hidden, block, 0, stream>>>(s->e_agg, s->tb2, expert_w, hidden_dim);
+      // mlp2
+      dim3 grid_hid((hidden_dim + block.x - 1)/block.x);
+      moe_mlp2_single_kernel<<<grid_hid, block, 0, stream>>>(s->tb2, s->gate_up,
+          gpu_ctx->weights.w_mlp2, gpu_ctx->weights.b_mlp2,
+          s->topk_i, ki,
+          hidden_dim, intermediate_dim, n_experts, l);
+      // aggregate with per-slot weight stored on device
+      weighted_sum_kernel_bf16_single_ptrw<<<grid_hid, block, 0, stream>>>(s->e_agg, s->tb2, s->topk_v, ki, hidden_dim);
     }
 
     residual_connection_kernel_bf16<<<grid_hidden, block, 0, stream>>>(s->x, s->e_agg, hidden_dim);
@@ -691,6 +936,9 @@ static int build_ptr_lists_decode(GPUContext *ctx, const std::vector<int> &activ
     ctx->h_sin_list[bi]     = st.sin_vals;
     ctx->h_acc_list[bi]     = st.acc_buffer;
     ctx->h_logitsfp32_list[bi] = st.logits_fp32;
+    // top-k pointers
+    ctx->h_topk_i_list[bi]  = st.topk_i;
+    ctx->h_topk_v_list[bi]  = st.topk_v;
   }
   size_t Bp   = sizeof(hip_bfloat16*) * B;
   size_t Bpf  = sizeof(float*) * B;
@@ -714,6 +962,9 @@ static int build_ptr_lists_decode(GPUContext *ctx, const std::vector<int> &activ
   HIP_CHECK(hipMemcpyAsync(ctx->d_sin_list,     ctx->h_sin_list.data(),     Bp, hipMemcpyHostToDevice, ctx->stream_decode));
   HIP_CHECK(hipMemcpyAsync(ctx->d_acc_list,        ctx->h_acc_list.data(),        Bpf, hipMemcpyHostToDevice, ctx->stream_decode));
   HIP_CHECK(hipMemcpyAsync(ctx->d_logitsfp32_list, ctx->h_logitsfp32_list.data(), Bpf, hipMemcpyHostToDevice, ctx->stream_decode));
+  // top-k pointer lists
+  HIP_CHECK(hipMemcpyAsync(ctx->d_topk_i_list, ctx->h_topk_i_list.data(), B * sizeof(int*), hipMemcpyHostToDevice, ctx->stream_decode));
+  HIP_CHECK(hipMemcpyAsync(ctx->d_topk_v_list, ctx->h_topk_v_list.data(), B * sizeof(hip_bfloat16*), hipMemcpyHostToDevice, ctx->stream_decode));
   return B;
 }
 
@@ -812,40 +1063,46 @@ static void decode(Transformer *tr, GPUContext *ctx,
     matmul_kernel_bf16_ptrs<<<grid_exB, block, 0, ctx->stream_decode>>>(ctx->d_router_list, ctx->d_t_list, w_router, p->hidden_dim, p->n_experts);
     add_bias_kernel_bf16_ptrs<<<grid_exB, block, 0, ctx->stream_decode>>>(ctx->d_router_list, b_router, p->n_experts);
 
-    // top-k per-slot (đơn giản, an toàn)
+    // top-k per-slot (device-only) and zero aggregations
     for (int bi=0; bi<B; ++bi) {
       auto &st = ctx->slot_states[ active_slots[bi] ]; const int threads=256; size_t shmem = (size_t)threads*(sizeof(float)+sizeof(int));
       router_topk_softmax_kernel_bf16<<<1, threads, shmem, ctx->stream_decode>>>(st.router_score, st.topk_v, st.topk_i, p->n_experts, p->experts_per_token);
       HIP_CHECK(hipMemsetAsync(st.e_agg, 0, p->hidden_dim * sizeof(hip_bfloat16), ctx->stream_decode));
     }
 
-    // Experts per-slot
-    for (int bi=0; bi<B; ++bi) {
-      auto &st = ctx->slot_states[ active_slots[bi] ]; int K=p->experts_per_token;
-      std::vector<int> h_topk_i(K); std::vector<hip_bfloat16> h_topk_v_bf16(K);
-      HIP_CHECK(hipMemcpyAsync(h_topk_i.data(), st.topk_i, K*sizeof(int), hipMemcpyDeviceToHost, ctx->stream_decode));
-      HIP_CHECK(hipMemcpyAsync(h_topk_v_bf16.data(), st.topk_v, K*sizeof(hip_bfloat16), hipMemcpyDeviceToHost, ctx->stream_decode));
-      HIP_CHECK(hipStreamSynchronize(ctx->stream_decode));
-      std::vector<float> h_topk_v(K); for (int i=0;i<K;i++) h_topk_v[i]=float(h_topk_v_bf16[i]);
+    // MOE forward (batched, device-only) using per-slot weight/bias pointers and big grids
+    for (int k = 0; k < p->experts_per_token; ++k) {
+      // build expert pointers per-slot on device
+      build_moe_ptrs_kernel<<<B, 1, 0, ctx->stream_decode>>>(
+        ctx->weights.w_mlp1, ctx->weights.b_mlp1,
+        ctx->weights.w_mlp2, ctx->weights.b_mlp2,
+        ctx->d_topk_i_list, k, l,
+        p->hidden_dim, p->intermediate_dim, p->n_experts,
+        ctx->d_w1_list, ctx->d_b1_list,
+        ctx->d_w2_list, ctx->d_b2_list);
 
-      for (int idx=0; idx<K; ++idx) {
-        int e = h_topk_i[idx]; float ew = h_topk_v[idx];
-        const hip_bfloat16 *w_mlp1 = ctx->weights.w_mlp1 + ((size_t)l*(size_t)p->n_experts + (size_t)e) * (size_t)(2*p->intermediate_dim) * (size_t)p->hidden_dim;
-        const hip_bfloat16 *b_mlp1 = ctx->weights.b_mlp1 + ((size_t)l*(size_t)p->n_experts + (size_t)e) * (size_t)(2*p->intermediate_dim);
-        dim3 grid_m1((2*p->intermediate_dim + block.x - 1)/block.x);
-        matmul_kernel_bf16<<<grid_m1, block, 0, ctx->stream_decode>>>(st.mlp1_out, st.t, w_mlp1, p->hidden_dim, 2*p->intermediate_dim);
-        add_bias_kernel_bf16<<<grid_m1, block, 0, ctx->stream_decode>>>(st.mlp1_out, b_mlp1, 2*p->intermediate_dim);
-        dim3 grid_int((p->intermediate_dim + block.x - 1)/block.x);
-        split_gate_up_kernel_bf16<<<grid_int, block, 0, ctx->stream_decode>>>(st.gate, st.up, st.mlp1_out, p->intermediate_dim);
-        swiglu_kernel_bf16<<<grid_int, block, 0, ctx->stream_decode>>>(st.gate_up, st.gate, st.up, p->intermediate_dim, p->swiglu_limit);
-        const hip_bfloat16 *w_mlp2 = ctx->weights.w_mlp2 + ((size_t)l*(size_t)p->n_experts + (size_t)e) * (size_t)p->hidden_dim * (size_t)p->intermediate_dim;
-        const hip_bfloat16 *b_mlp2 = ctx->weights.b_mlp2 + ((size_t)l*(size_t)p->n_experts + (size_t)e) * (size_t)p->hidden_dim;
-        dim3 grid_h((p->hidden_dim + block.x - 1)/block.x);
-        matmul_kernel_bf16<<<grid_h, block, 0, ctx->stream_decode>>>(st.tb2, st.gate_up, w_mlp2, p->intermediate_dim, p->hidden_dim);
-        add_bias_kernel_bf16<<<grid_h, block, 0, ctx->stream_decode>>>(st.tb2, b_mlp2, p->hidden_dim);
-        weighted_sum_kernel_bf16<<<grid_h, block, 0, ctx->stream_decode>>>(st.e_agg, st.tb2, ew, p->hidden_dim);
-      }
-      dim3 grid_h2((p->hidden_dim + block.x - 1)/block.x);
+      // mlp1: (2*intermediate_dim, hidden_dim) @ t -> mlp1_out
+      dim3 grid_m1((2*p->intermediate_dim + block.x - 1)/block.x, B);
+      matmul_kernel_bf16_ptrs_w<<<grid_m1, block, 0, ctx->stream_decode>>>(ctx->d_mlp1_out_list, ctx->d_t_list, (const hip_bfloat16**)ctx->d_w1_list, p->hidden_dim, 2*p->intermediate_dim);
+      add_bias_kernel_bf16_ptrs_varbias<<<grid_m1, block, 0, ctx->stream_decode>>>(ctx->d_mlp1_out_list, ctx->d_b1_list, 2*p->intermediate_dim);
+
+      // split + swiglu
+      dim3 grid_int((p->intermediate_dim + block.x - 1)/block.x, B);
+      split_gate_up_kernel_bf16_ptrs<<<grid_int, block, 0, ctx->stream_decode>>>(ctx->d_gate_list, ctx->d_up_list, ctx->d_mlp1_out_list, p->intermediate_dim);
+      swiglu_kernel_bf16_ptrs<<<grid_int, block, 0, ctx->stream_decode>>>(ctx->d_gate_up_list, ctx->d_gate_list, ctx->d_up_list, p->intermediate_dim, p->swiglu_limit);
+
+      // mlp2: (hidden_dim, intermediate_dim) @ gate_up -> tb2
+      dim3 grid_h((p->hidden_dim + block.x - 1)/block.x, B);
+      matmul_kernel_bf16_ptrs_w<<<grid_h, block, 0, ctx->stream_decode>>>(ctx->d_tb2_list, ctx->d_gate_up_list, (const hip_bfloat16**)ctx->d_w2_list, p->intermediate_dim, p->hidden_dim);
+      add_bias_kernel_bf16_ptrs_varbias<<<grid_h, block, 0, ctx->stream_decode>>>(ctx->d_tb2_list, ctx->d_b2_list, p->hidden_dim);
+
+      // aggregate with per-slot expert weight
+      weighted_sum_kernel_bf16_ptrs<<<grid_h, block, 0, ctx->stream_decode>>>(ctx->d_e_agg_list, ctx->d_tb2_list, ctx->d_topk_v_list, k, p->hidden_dim);
+    }
+
+    // Residual add per-slot
+    for (int bi=0; bi<B; ++bi) {
+      auto &st = ctx->slot_states[ active_slots[bi] ]; dim3 grid_h2((p->hidden_dim + block.x - 1)/block.x);
       residual_connection_kernel_bf16<<<grid_h2, block, 0, ctx->stream_decode>>>(st.x, st.e_agg, p->hidden_dim);
     }
   }
@@ -922,6 +1179,12 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     if (gpu_ctx.d_att_list)      HIP_CHECK(hipFree(gpu_ctx.d_att_list));
     if (gpu_ctx.d_cos_list)      HIP_CHECK(hipFree(gpu_ctx.d_cos_list));
     if (gpu_ctx.d_sin_list)      HIP_CHECK(hipFree(gpu_ctx.d_sin_list));
+    if (gpu_ctx.d_topk_i_list)   HIP_CHECK(hipFree(gpu_ctx.d_topk_i_list));
+    if (gpu_ctx.d_topk_v_list)   HIP_CHECK(hipFree(gpu_ctx.d_topk_v_list));
+    if (gpu_ctx.d_w1_list)       HIP_CHECK(hipFree(gpu_ctx.d_w1_list));
+    if (gpu_ctx.d_w2_list)       HIP_CHECK(hipFree(gpu_ctx.d_w2_list));
+    if (gpu_ctx.d_b1_list)       HIP_CHECK(hipFree(gpu_ctx.d_b1_list));
+    if (gpu_ctx.d_b2_list)       HIP_CHECK(hipFree(gpu_ctx.d_b2_list));
     if (gpu_ctx.d_acc_list)      HIP_CHECK(hipFree(gpu_ctx.d_acc_list));
     if (gpu_ctx.d_logitsfp32_list) HIP_CHECK(hipFree(gpu_ctx.d_logitsfp32_list));
 
@@ -977,6 +1240,14 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       alloc_ptr_list(&ctx->d_gate_up_list);alloc_ptr_list(&ctx->d_e_agg_list);
       alloc_ptr_list(&ctx->d_att_list);    alloc_ptr_list(&ctx->d_cos_list);
       alloc_ptr_list(&ctx->d_sin_list);
+      // top-k pointer lists
+      HIP_CHECK(hipMalloc((void**)&ctx->d_topk_i_list, sizeof(int*) * SLOTS));
+      HIP_CHECK(hipMalloc((void**)&ctx->d_topk_v_list, sizeof(hip_bfloat16*) * SLOTS));
+      // MOE per-slot weight/bias pointer lists
+      HIP_CHECK(hipMalloc((void**)&ctx->d_w1_list, sizeof(hip_bfloat16*) * SLOTS));
+      HIP_CHECK(hipMalloc((void**)&ctx->d_w2_list, sizeof(hip_bfloat16*) * SLOTS));
+      HIP_CHECK(hipMalloc((void**)&ctx->d_b1_list, sizeof(hip_bfloat16*) * SLOTS));
+      HIP_CHECK(hipMalloc((void**)&ctx->d_b2_list, sizeof(hip_bfloat16*) * SLOTS));
       HIP_CHECK(hipMalloc((void**)&ctx->d_acc_list,        sizeof(float*) * SLOTS));
       HIP_CHECK(hipMalloc((void**)&ctx->d_logitsfp32_list, sizeof(float*) * SLOTS));
 
@@ -990,6 +1261,10 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       ctx->h_gate_up_list.resize(SLOTS);ctx->h_e_agg_list.resize(SLOTS);
       ctx->h_att_list.resize(SLOTS);    ctx->h_cos_list.resize(SLOTS);
       ctx->h_sin_list.resize(SLOTS);
+      ctx->h_topk_i_list.resize(SLOTS);
+      ctx->h_topk_v_list.resize(SLOTS);
+      ctx->h_w1_list.resize(SLOTS); ctx->h_w2_list.resize(SLOTS);
+      ctx->h_b1_list.resize(SLOTS); ctx->h_b2_list.resize(SLOTS);
       ctx->h_acc_list.resize(SLOTS);    ctx->h_logitsfp32_list.resize(SLOTS);
 
       Sampler local_sampler; build_sampler(&local_sampler, sampler->vocab_size, sampler->temperature, sampler->topp, sampler->rng_state + 0x9E3779B97f4A7C15ULL * (t + 1));
