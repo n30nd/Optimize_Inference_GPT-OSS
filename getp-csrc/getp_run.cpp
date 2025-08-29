@@ -48,7 +48,7 @@
 
 // ------------------------- GPU weights & run state -------------------------
 
-typedef struct {
+struct GPUTransformerWeights {
   hip_bfloat16 *token_embedding_table;
   hip_bfloat16 *out;
   hip_bfloat16 *rms_attn_w;
@@ -65,9 +65,9 @@ typedef struct {
   hip_bfloat16 *w_mlp2;
   hip_bfloat16 *b_mlp1;
   hip_bfloat16 *b_mlp2;
-} GPUTransformerWeights;
+};
 
-typedef struct {
+struct GPURunState {
   hip_bfloat16 *x;
   hip_bfloat16 *t;
   hip_bfloat16 *tb;
@@ -94,7 +94,7 @@ typedef struct {
   // FP32 buffers for accumulation and precision-sensitive ops
   float *acc_buffer;         // x in FP32 for output matvec
   float *logits_fp32;        // final logits
-} GPURunState;
+};
 
 #ifndef MAX_SLOTS
 #define MAX_SLOTS 8
@@ -114,7 +114,7 @@ struct Slot {
   SlotStage stage = SLOT_EMPTY;
 };
 
-typedef struct {
+struct GPUContext {
   int device_id;
   GPUTransformerWeights weights;
   GPURunState state; // (legacy) vẫn giữ để tương thích
@@ -138,10 +138,10 @@ typedef struct {
   std::vector<hip_bfloat16*> h_router_list, h_mlp1_out_list, h_gate_list, h_up_list, h_gate_up_list, h_e_agg_list;
   std::vector<hip_bfloat16*> h_att_list, h_cos_list, h_sin_list;
   std::vector<float*>         h_acc_list, h_logitsfp32_list;
-} GPUContext;
+};
 
-float *gpu_forward_streamed(Transformer *transformer, int token, int pos,
-                            GPUContext *gpu_ctx, GPURunState *s, hipStream_t stream);
+void prefill(Transformer *transformer, int token, int pos,
+             GPUContext *gpu_ctx, GPURunState *s, hipStream_t stream);
 
 static std::vector<GPUContext> gpu_contexts;
 static thread_local GPUContext* t_ctx = nullptr;
@@ -514,10 +514,10 @@ void gpu_free_run_state(GPURunState *s);
 void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p);
 void gpu_free_weights(GPUTransformerWeights *gpu_w);
 
-// ------------------------- Forward (single-slot, used by PREFILL) -------------------------
+// ------------------------- Prefill (single-slot) -------------------------
 
-float *gpu_forward_streamed(Transformer *transformer, int token, int pos,
-                            GPUContext *gpu_ctx, GPURunState *s, hipStream_t stream) {
+void prefill(Transformer *transformer, int token, int pos,
+             GPUContext *gpu_ctx, GPURunState *s, hipStream_t stream) {
   Config *p = &transformer->config;
   int head_dim         = p->head_dim;
   int hidden_dim       = p->hidden_dim;
@@ -670,22 +670,10 @@ float *gpu_forward_streamed(Transformer *transformer, int token, int pos,
   // Final RMSNorm
   dim3 blockH(256), gridH((p->hidden_dim + 255)/256);
   rmsnorm_kernel_bf16<<<gridH, blockH, 0, stream>>>(s->x, s->x, gpu_ctx->weights.rms_out_w, p->hidden_dim);
-
-  // Convert x to FP32
-  convert_bf16_to_fp32_kernel<<<gridH, blockH, 0, stream>>>(s->x, s->acc_buffer, p->hidden_dim);
-
-  // Output logits
-  dim3 gridV((p->vocab_size + 255) / 256);
-  matvec_wbf16_xfp32_outfp32<<<gridV, blockH, 0, stream>>>(s->logits_fp32, s->acc_buffer, gpu_ctx->weights.out, p->hidden_dim, p->vocab_size);
-
-  // Copy logits về host (đồng bộ 1 lần trước khi return)
-  thread_local float *cpu_logits = NULL; if (cpu_logits == NULL) cpu_logits = (float*)malloc(p->vocab_size * sizeof(float));
-  HIP_CHECK(hipMemcpyAsync(cpu_logits, s->logits_fp32, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost, stream));
-  HIP_CHECK(hipStreamSynchronize(stream));
-  return cpu_logits;
 }
 
-// ------------------------- Forward (DECODE batched helper) -------------------------
+
+// ------------------------- Decode (batched) -------------------------
 
 static int build_ptr_lists_decode(GPUContext *ctx, const std::vector<int> &active) {
   int B = (int)active.size();
@@ -729,10 +717,10 @@ static int build_ptr_lists_decode(GPUContext *ctx, const std::vector<int> &activ
   return B;
 }
 
-static void gpu_forward_decode_batched(Transformer *tr, GPUContext *ctx,
-                                       const std::vector<int> &active_slots,
-                                       const std::vector<int> &tokens,
-                                       const std::vector<int> &poses) {
+static void decode(Transformer *tr, GPUContext *ctx,
+                   const std::vector<int> &active_slots,
+                   const std::vector<int> &tokens,
+                   const std::vector<int> &poses) {
   Config *p = &tr->config;
   const int B = build_ptr_lists_decode(ctx, active_slots);
   if (B == 0) return;
@@ -905,33 +893,39 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
   for (auto &gpu_ctx : gpu_contexts) {
     HIP_CHECK(hipSetDevice(gpu_ctx.device_id));
-    if (gpu_ctx.stream_decode) hipStreamDestroy(gpu_ctx.stream_decode);
-    if (gpu_ctx.stream_prefill) hipStreamDestroy(gpu_ctx.stream_prefill);
+    
+    // Cleanup streams
+    if (gpu_ctx.stream_decode) HIP_CHECK(hipStreamDestroy(gpu_ctx.stream_decode));
+    if (gpu_ctx.stream_prefill) HIP_CHECK(hipStreamDestroy(gpu_ctx.stream_prefill));
+    
+    // Cleanup slot states and events
     for (auto &s : gpu_ctx.slot_states) gpu_free_run_state(&s);
-    for (auto &ev : gpu_ctx.prefill_done) if (ev) hipEventDestroy(ev);
-    gpu_ctx.slot_states.clear(); gpu_ctx.prefill_done.clear();
+    for (auto &ev : gpu_ctx.prefill_done) if (ev) HIP_CHECK(hipEventDestroy(ev));
+    gpu_ctx.slot_states.clear(); 
+    gpu_ctx.prefill_done.clear();
 
-    // free device pointer lists if any left (safety)
-    if (gpu_ctx.d_x_list)        hipFree(gpu_ctx.d_x_list);
-    if (gpu_ctx.d_t_list)        hipFree(gpu_ctx.d_t_list);
-    if (gpu_ctx.d_tb_list)       hipFree(gpu_ctx.d_tb_list);
-    if (gpu_ctx.d_tb2_list)      hipFree(gpu_ctx.d_tb2_list);
-    if (gpu_ctx.d_qkv_list)      hipFree(gpu_ctx.d_qkv_list);
-    if (gpu_ctx.d_q_list)        hipFree(gpu_ctx.d_q_list);
-    if (gpu_ctx.d_k_list)        hipFree(gpu_ctx.d_k_list);
-    if (gpu_ctx.d_v_list)        hipFree(gpu_ctx.d_v_list);
-    if (gpu_ctx.d_router_list)   hipFree(gpu_ctx.d_router_list);
-    if (gpu_ctx.d_mlp1_out_list) hipFree(gpu_ctx.d_mlp1_out_list);
-    if (gpu_ctx.d_gate_list)     hipFree(gpu_ctx.d_gate_list);
-    if (gpu_ctx.d_up_list)       hipFree(gpu_ctx.d_up_list);
-    if (gpu_ctx.d_gate_up_list)  hipFree(gpu_ctx.d_gate_up_list);
-    if (gpu_ctx.d_e_agg_list)    hipFree(gpu_ctx.d_e_agg_list);
-    if (gpu_ctx.d_att_list)      hipFree(gpu_ctx.d_att_list);
-    if (gpu_ctx.d_cos_list)      hipFree(gpu_ctx.d_cos_list);
-    if (gpu_ctx.d_sin_list)      hipFree(gpu_ctx.d_sin_list);
-    if (gpu_ctx.d_acc_list)      hipFree(gpu_ctx.d_acc_list);
-    if (gpu_ctx.d_logitsfp32_list) hipFree(gpu_ctx.d_logitsfp32_list);
+    // Cleanup device pointer lists
+    if (gpu_ctx.d_x_list)        HIP_CHECK(hipFree(gpu_ctx.d_x_list));
+    if (gpu_ctx.d_t_list)        HIP_CHECK(hipFree(gpu_ctx.d_t_list));
+    if (gpu_ctx.d_tb_list)       HIP_CHECK(hipFree(gpu_ctx.d_tb_list));
+    if (gpu_ctx.d_tb2_list)      HIP_CHECK(hipFree(gpu_ctx.d_tb2_list));
+    if (gpu_ctx.d_qkv_list)      HIP_CHECK(hipFree(gpu_ctx.d_qkv_list));
+    if (gpu_ctx.d_q_list)        HIP_CHECK(hipFree(gpu_ctx.d_q_list));
+    if (gpu_ctx.d_k_list)        HIP_CHECK(hipFree(gpu_ctx.d_k_list));
+    if (gpu_ctx.d_v_list)        HIP_CHECK(hipFree(gpu_ctx.d_v_list));
+    if (gpu_ctx.d_router_list)   HIP_CHECK(hipFree(gpu_ctx.d_router_list));
+    if (gpu_ctx.d_mlp1_out_list) HIP_CHECK(hipFree(gpu_ctx.d_mlp1_out_list));
+    if (gpu_ctx.d_gate_list)     HIP_CHECK(hipFree(gpu_ctx.d_gate_list));
+    if (gpu_ctx.d_up_list)       HIP_CHECK(hipFree(gpu_ctx.d_up_list));
+    if (gpu_ctx.d_gate_up_list)  HIP_CHECK(hipFree(gpu_ctx.d_gate_up_list));
+    if (gpu_ctx.d_e_agg_list)    HIP_CHECK(hipFree(gpu_ctx.d_e_agg_list));
+    if (gpu_ctx.d_att_list)      HIP_CHECK(hipFree(gpu_ctx.d_att_list));
+    if (gpu_ctx.d_cos_list)      HIP_CHECK(hipFree(gpu_ctx.d_cos_list));
+    if (gpu_ctx.d_sin_list)      HIP_CHECK(hipFree(gpu_ctx.d_sin_list));
+    if (gpu_ctx.d_acc_list)      HIP_CHECK(hipFree(gpu_ctx.d_acc_list));
+    if (gpu_ctx.d_logitsfp32_list) HIP_CHECK(hipFree(gpu_ctx.d_logitsfp32_list));
 
+    // Cleanup weights and legacy state
     gpu_free_weights(&gpu_ctx.weights);
     gpu_free_run_state(&gpu_ctx.state);
   }
@@ -964,7 +958,8 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       GPUContext *ctx = &gpu_contexts[t]; t_ctx = ctx;
 
       // Streams with priorities
-      int leastPri = 0, greatestPri = 0; hipDeviceGetStreamPriorityRange(&leastPri, &greatestPri);
+      int leastPri = 0, greatestPri = 0; 
+      HIP_CHECK(hipDeviceGetStreamPriorityRange(&leastPri, &greatestPri));
       HIP_CHECK(hipStreamCreateWithPriority(&ctx->stream_decode, hipStreamDefault, greatestPri));
       HIP_CHECK(hipStreamCreateWithPriority(&ctx->stream_prefill, hipStreamDefault, leastPri));
 
@@ -1020,11 +1015,11 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
         }
         if (jobq_exhausted && !has_active()) break;
 
-        // 1) PREFILL: mỗi slot đang PREFILL push 1 token
+        // 1) PREFILL: mỗi slot đang prefill push 1 token
         for (int s = 0; s < SLOTS; ++s) {
           Slot &sl = slots[s]; if (!sl.occupied || sl.stage != SLOT_PREFILL) continue;
           if (sl.pos + 1 >= sl.num_prompt_tokens) { HIP_CHECK(hipEventRecord(ctx->prefill_done[s], ctx->stream_prefill)); sl.stage = SLOT_PREFILL_WAIT; continue; }
-          (void)gpu_forward_streamed(transformer, sl.token, sl.pos, ctx, &ctx->slot_states[s], ctx->stream_prefill);
+          prefill(transformer, sl.token, sl.pos, ctx, &ctx->slot_states[s], ctx->stream_prefill);
           sl.pos += 1; sl.token = sl.prompt[sl.pos];
         }
 
@@ -1034,13 +1029,13 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
           HIP_CHECK(hipStreamWaitEvent(ctx->stream_decode, ctx->prefill_done[s], 0)); sl.stage = SLOT_DECODE;
         }
 
-        // 3) DECODE (batched)
+        // 3) DECODE (batched decode)
         std::vector<int> active, tokens, poses; active.reserve(SLOTS); tokens.reserve(SLOTS); poses.reserve(SLOTS);
         for (int s = 0; s < SLOTS; ++s) {
           Slot &sl = slots[s]; if (!sl.occupied || sl.stage != SLOT_DECODE) continue; active.push_back(s); tokens.push_back(sl.token); poses.push_back(sl.pos);
         }
         if (!active.empty()) {
-          gpu_forward_decode_batched(transformer, ctx, active, tokens, poses);
+          decode(transformer, ctx, active, tokens, poses);
           HIP_CHECK(hipStreamSynchronize(ctx->stream_decode));
 
           for (int i=0;i<(int)active.size();++i) {
@@ -1061,31 +1056,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       }
 
       total_out.fetch_add(local_out, std::memory_order_relaxed);
-
-      // Cleanup per-GPU worker
-      for (int s = 0; s < SLOTS; ++s) { gpu_free_run_state(&ctx->slot_states[s]); HIP_CHECK(hipEventDestroy(ctx->prefill_done[s])); }
-      ctx->slot_states.clear(); ctx->prefill_done.clear();
-      if (ctx->stream_decode) HIP_CHECK(hipStreamDestroy(ctx->stream_decode));
-      if (ctx->stream_prefill) HIP_CHECK(hipStreamDestroy(ctx->stream_prefill));
-      if (ctx->d_x_list)        hipFree(ctx->d_x_list);
-      if (ctx->d_t_list)        hipFree(ctx->d_t_list);
-      if (ctx->d_tb_list)       hipFree(ctx->d_tb_list);
-      if (ctx->d_tb2_list)      hipFree(ctx->d_tb2_list);
-      if (ctx->d_qkv_list)      hipFree(ctx->d_qkv_list);
-      if (ctx->d_q_list)        hipFree(ctx->d_q_list);
-      if (ctx->d_k_list)        hipFree(ctx->d_k_list);
-      if (ctx->d_v_list)        hipFree(ctx->d_v_list);
-      if (ctx->d_router_list)   hipFree(ctx->d_router_list);
-      if (ctx->d_mlp1_out_list) hipFree(ctx->d_mlp1_out_list);
-      if (ctx->d_gate_list)     hipFree(ctx->d_gate_list);
-      if (ctx->d_up_list)       hipFree(ctx->d_up_list);
-      if (ctx->d_gate_up_list)  hipFree(ctx->d_gate_up_list);
-      if (ctx->d_e_agg_list)    hipFree(ctx->d_e_agg_list);
-      if (ctx->d_att_list)      hipFree(ctx->d_att_list);
-      if (ctx->d_cos_list)      hipFree(ctx->d_cos_list);
-      if (ctx->d_sin_list)      hipFree(ctx->d_sin_list);
-      if (ctx->d_acc_list)      hipFree(ctx->d_acc_list);
-      if (ctx->d_logitsfp32_list) hipFree(ctx->d_logitsfp32_list);
 
       free_sampler(&local_sampler);
     });
