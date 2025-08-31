@@ -42,6 +42,10 @@
     } \
   } while(0)
 
+#ifndef MAX_EXPERT_STREAMS
+#define MAX_EXPERT_STREAMS 4
+#endif
+
 // ------------------------- GPU weights & run state -------------------------
 
 typedef struct {
@@ -90,6 +94,12 @@ typedef struct {
   // FP32 buffers for accumulation and precision-sensitive ops
   float *acc_buffer;         // x in FP32 for output matvec
   float *logits_fp32;        // final logits
+  // Per-stream scratch buffers for expert parallelization
+  float *mlp1_out_s;   // [MAX_EXPERT_STREAMS][2 * intermediate_dim]
+  float *gate_s;       // [MAX_EXPERT_STREAMS][intermediate_dim]
+  float *up_s;         // [MAX_EXPERT_STREAMS][intermediate_dim]
+  float *gate_up_s;    // [MAX_EXPERT_STREAMS][intermediate_dim]
+  float *tb2_s;        // [MAX_EXPERT_STREAMS][hidden_dim]
 } GPURunState;
 
 // Per-GPU device context
@@ -97,6 +107,8 @@ typedef struct {
   int device_id;
   GPUTransformerWeights weights;
   GPURunState state;
+  hipStream_t expert_streams[MAX_EXPERT_STREAMS];
+  int num_expert_streams;
 } GPUContext;
 
 static std::vector<GPUContext> gpu_contexts;
@@ -593,6 +605,15 @@ __global__ void weighted_sum_kernel_float(float *e_agg, const float *tb2, float 
   }
 }
 
+// Atomic variant for parallel accumulation across experts/streams
+__global__ void weighted_sum_atomic_kernel_float(float *e_agg, const float *tb2, float expert_w, int hidden_dim) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < hidden_dim) {
+    float add = tb2[tid] * expert_w;
+    atomicAdd(&e_agg[tid], add);
+  }
+}
+
 __global__ void residual_connection_kernel_float(float *x, const float *residual, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < size) {
@@ -866,34 +887,53 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
     // Init aggregation
     HIP_CHECK(hipMemset(gpu_ctx->state.e_agg, 0, hidden_dim * sizeof(float)));
 
-    // Experts
-    for (int idx = 0; idx < p->experts_per_token; idx++) {
-      int e = cpu_topk_i[idx];
-      float expert_w = cpu_topk_v[idx];
-
-      const hip_bfloat16 *w_mlp1 = gpu_ctx->weights.w_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
-      const hip_bfloat16 *b_mlp1 = gpu_ctx->weights.b_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim);
-
+    // Expert parallelization: launch per-expert work on multiple streams (up to 4)
+    {
+      const int num_sel = p->experts_per_token;
+      const int max_S = gpu_ctx->num_expert_streams;
+      const int stride_mlp1 = 2 * intermediate_dim;
+      const int stride_mid  = intermediate_dim;
+      const int stride_out  = hidden_dim;
       dim3 grid_mlp1 = dim3(((2 * intermediate_dim) + block.x - 1) / block.x);
-      matmul_kernel_float<<<grid_mlp1, block>>>(gpu_ctx->state.mlp1_out, gpu_ctx->state.t, w_mlp1, hidden_dim, 2 * intermediate_dim);
-      add_bias_kernel_float<<<grid_mlp1, block>>>(gpu_ctx->state.mlp1_out, b_mlp1, 2 * intermediate_dim);
-      HIP_CHECK(hipDeviceSynchronize());
 
-      split_gate_up_kernel_float<<<grid_intermediate, block>>>(gpu_ctx->state.gate, gpu_ctx->state.up, gpu_ctx->state.mlp1_out, intermediate_dim);
-      HIP_CHECK(hipDeviceSynchronize());
+      for (int start = 0; start < num_sel; start += max_S) {
+        int group = std::min(max_S, num_sel - start);
+        for (int g = 0; g < group; ++g) {
+          int sel_idx = start + g;
+          int e = cpu_topk_i[sel_idx];
+          float expert_w = cpu_topk_v[sel_idx];
 
-      swiglu_kernel_float<<<grid_intermediate, block>>>(gpu_ctx->state.gate_up, gpu_ctx->state.gate, gpu_ctx->state.up, intermediate_dim, p->swiglu_limit);
-      HIP_CHECK(hipDeviceSynchronize());
+          hipStream_t stream = gpu_ctx->expert_streams[g];
 
-      const hip_bfloat16 *w_mlp2 = gpu_ctx->weights.w_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim * (size_t)intermediate_dim;
-      const hip_bfloat16 *b_mlp2 = gpu_ctx->weights.b_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim;
+          const hip_bfloat16 *w_mlp1 = gpu_ctx->weights.w_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
+          const hip_bfloat16 *b_mlp1 = gpu_ctx->weights.b_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim);
 
-      matmul_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.tb2, gpu_ctx->state.gate_up, w_mlp2, intermediate_dim, hidden_dim);
-      add_bias_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.tb2, b_mlp2, hidden_dim);
-      HIP_CHECK(hipDeviceSynchronize());
+          float *mlp1_out_s = gpu_ctx->state.mlp1_out_s + (size_t)g * (size_t)stride_mlp1;
+          float *gate_s     = gpu_ctx->state.gate_s     + (size_t)g * (size_t)stride_mid;
+          float *up_s       = gpu_ctx->state.up_s       + (size_t)g * (size_t)stride_mid;
+          float *gate_up_s  = gpu_ctx->state.gate_up_s  + (size_t)g * (size_t)stride_mid;
+          float *tb2_s      = gpu_ctx->state.tb2_s      + (size_t)g * (size_t)stride_out;
 
-      weighted_sum_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.e_agg, gpu_ctx->state.tb2, expert_w, hidden_dim);
-      HIP_CHECK(hipDeviceSynchronize());
+          // MLP1
+          matmul_kernel_float<<<grid_mlp1, block, 0, stream>>>(mlp1_out_s, gpu_ctx->state.t, w_mlp1, hidden_dim, 2 * intermediate_dim);
+          add_bias_kernel_float<<<grid_mlp1, block, 0, stream>>>(mlp1_out_s, b_mlp1, 2 * intermediate_dim);
+
+          // Split + SwiGLU
+          split_gate_up_kernel_float<<<grid_intermediate, block, 0, stream>>>(gate_s, up_s, mlp1_out_s, intermediate_dim);
+          swiglu_kernel_float<<<grid_intermediate, block, 0, stream>>>(gate_up_s, gate_s, up_s, intermediate_dim, p->swiglu_limit);
+
+          // MLP2
+          const hip_bfloat16 *w_mlp2 = gpu_ctx->weights.w_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim * (size_t)intermediate_dim;
+          const hip_bfloat16 *b_mlp2 = gpu_ctx->weights.b_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim;
+          matmul_kernel_float<<<grid_hidden, block, 0, stream>>>(tb2_s, gate_up_s, w_mlp2, intermediate_dim, hidden_dim);
+          add_bias_kernel_float<<<grid_hidden, block, 0, stream>>>(tb2_s, b_mlp2, hidden_dim);
+
+          // Accumulate with atomics
+          weighted_sum_atomic_kernel_float<<<grid_hidden, block, 0, stream>>>(gpu_ctx->state.e_agg, tb2_s, expert_w, hidden_dim);
+        }
+        // Wait for the group to complete before reusing per-stream buffers
+        HIP_CHECK(hipDeviceSynchronize());
+      }
     }
 
     residual_connection_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.x, gpu_ctx->state.e_agg, hidden_dim);
@@ -937,6 +977,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     gpu_contexts[d].device_id = d;
     gpu_copy_weights(&gpu_contexts[d].weights, &transformer->weights, &transformer->config);
     gpu_malloc_run_state(&gpu_contexts[d].state, &transformer->config);
+    // Create expert streams (up to MAX_EXPERT_STREAMS)
+    gpu_contexts[d].num_expert_streams = MAX_EXPERT_STREAMS;
+    for (int s = 0; s < gpu_contexts[d].num_expert_streams; ++s) {
+      HIP_CHECK(hipStreamCreate(&gpu_contexts[d].expert_streams[s]));
+    }
 
     if (transformer->config.sliding_window > 0 && gpu_contexts[d].state.mask != NULL) {
       int S = transformer->config.seq_len;
@@ -956,6 +1001,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
   for (auto &gpu_ctx : gpu_contexts) {
     HIP_CHECK(hipSetDevice(gpu_ctx.device_id));
+    for (int s = 0; s < gpu_ctx.num_expert_streams; ++s) {
+      if (gpu_ctx.expert_streams[s] != nullptr) HIP_CHECK(hipStreamDestroy(gpu_ctx.expert_streams[s]));
+    }
     gpu_free_weights(&gpu_ctx.weights);
     gpu_free_run_state(&gpu_ctx.state);
   }
@@ -1105,6 +1153,13 @@ void gpu_malloc_run_state(GPURunState *s, Config *p) {
   // Note: acc_buffer no longer needed since we use float state directly
   s->acc_buffer = nullptr;
   HIP_CHECK(hipMalloc(&s->logits_fp32, p->vocab_size * sizeof(float)));
+
+  // Per-stream expert scratch buffers
+  HIP_CHECK(hipMalloc(&s->mlp1_out_s, MAX_EXPERT_STREAMS * 2 * p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_s,     MAX_EXPERT_STREAMS * p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->up_s,       MAX_EXPERT_STREAMS * p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up_s,  MAX_EXPERT_STREAMS * p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->tb2_s,      MAX_EXPERT_STREAMS * p->hidden_dim * sizeof(float)));
 }
 
 
@@ -1134,6 +1189,11 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->sin_vals));
   if (s->acc_buffer) HIP_CHECK(hipFree(s->acc_buffer));  // acc_buffer may be nullptr
   HIP_CHECK(hipFree(s->logits_fp32));
+  HIP_CHECK(hipFree(s->mlp1_out_s));
+  HIP_CHECK(hipFree(s->gate_s));
+  HIP_CHECK(hipFree(s->up_s));
+  HIP_CHECK(hipFree(s->gate_up_s));
+  HIP_CHECK(hipFree(s->tb2_s));
 }
 
 void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
