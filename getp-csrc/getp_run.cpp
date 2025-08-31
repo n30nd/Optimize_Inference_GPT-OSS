@@ -684,20 +684,20 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
     add_bias_kernel_float<<<grid_qkv, block>>>(gpu_ctx->state.qkv, b_qkv, qkv_out_dim);
     HIP_CHECK(hipDeviceSynchronize());
 
-    // Split Q, K, V
+    // Q/K/V aliases: tránh D2D copy bằng cách dùng pointer offsets
     int q_size = head_dim * p->n_attn_heads;
     int k_size = head_dim * p->n_kv_heads;
     int v_size = head_dim * p->n_kv_heads;
 
-    HIP_CHECK(hipMemcpy(gpu_ctx->state.q, gpu_ctx->state.qkv,                 q_size * sizeof(float), hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(gpu_ctx->state.k, gpu_ctx->state.qkv + q_size,        k_size * sizeof(float), hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(gpu_ctx->state.v, gpu_ctx->state.qkv + q_size + k_size, v_size * sizeof(float), hipMemcpyDeviceToDevice));
+    float *q = gpu_ctx->state.qkv;                    // Q starts at beginning
+    float *k = gpu_ctx->state.qkv + q_size;           // K starts after Q
+    float *v = gpu_ctx->state.qkv + q_size + k_size;  // V starts after Q+K
 
-    // Store K, V in cache
+    // Store K, V in cache trực tiếp từ qkv buffer (before RoPE)
     float *k_cache_pos = gpu_ctx->state.key_cache   + loff + pos * kv_dim;
     float *v_cache_pos = gpu_ctx->state.value_cache + loff + pos * kv_dim;
-    HIP_CHECK(hipMemcpy(k_cache_pos, gpu_ctx->state.k, k_size * sizeof(float), hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(v_cache_pos, gpu_ctx->state.v, v_size * sizeof(float), hipMemcpyDeviceToDevice));
+    HIP_CHECK(hipMemcpy(k_cache_pos, k, k_size * sizeof(float), hipMemcpyDeviceToDevice));
+    HIP_CHECK(hipMemcpy(v_cache_pos, v, v_size * sizeof(float), hipMemcpyDeviceToDevice));
 
     // RoPE
     float ntk_beta  = 32.0f;
@@ -708,21 +708,21 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
                                                       p->initial_context_length, ntk_beta, ntk_alpha);
     HIP_CHECK(hipDeviceSynchronize());
 
-    apply_rotary_emb_kernel_float<<<p->n_attn_heads, head_dim/2>>>(gpu_ctx->state.q, gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, p->n_attn_heads, head_dim);
-    apply_rotary_emb_kernel_float<<<p->n_kv_heads,   head_dim/2>>>(gpu_ctx->state.k, gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, p->n_kv_heads,   head_dim);
+    apply_rotary_emb_kernel_float<<<p->n_attn_heads, head_dim/2>>>(q, gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, p->n_attn_heads, head_dim);
+    apply_rotary_emb_kernel_float<<<p->n_kv_heads,   head_dim/2>>>(k, gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, p->n_kv_heads,   head_dim);
     HIP_CHECK(hipDeviceSynchronize());
 
     // Update K cache after RoPE
-    HIP_CHECK(hipMemcpy(k_cache_pos, gpu_ctx->state.k, k_size * sizeof(float), hipMemcpyDeviceToDevice));
+    HIP_CHECK(hipMemcpy(k_cache_pos, k, k_size * sizeof(float), hipMemcpyDeviceToDevice));
 
     // Multi-head attention
     for (int h = 0; h < p->n_attn_heads; h++) {
-      float *q = gpu_ctx->state.q + (size_t)h * (size_t)head_dim;
+      float *q_head = q + (size_t)h * (size_t)head_dim;
       float *att = gpu_ctx->state.att + (size_t)h * (size_t)p->seq_len;
 
       // Scores
       dim3 grid_att = dim3(((pos + 1) + block.x - 1) / block.x);
-      attention_scores_kernel_float<<<grid_att, block>>>(att, q, gpu_ctx->state.key_cache, head_dim, loff,
+      attention_scores_kernel_float<<<grid_att, block>>>(att, q_head, gpu_ctx->state.key_cache, head_dim, loff,
                                                         kv_dim, kv_mul, h, pos, p->seq_len,
                                                         (p->sliding_window > 0 && l % 2 == 0) ? gpu_ctx->state.mask : NULL);
       HIP_CHECK(hipDeviceSynchronize());
