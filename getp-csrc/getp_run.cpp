@@ -115,36 +115,6 @@ static std::vector<GPUContext> gpu_contexts;
 static thread_local GPUContext* t_ctx = nullptr;
 
 
-// ------------------------- Simple blocking MPMC queue -------------------------
-template <typename T>
-class MPMCQueue {
-  std::mutex m_;
-  std::condition_variable cv_;
-  std::deque<T> q_;
-  bool closed_ = false;
-public:
-  void push(const T& v) {
-    std::unique_lock<std::mutex> lk(m_);
-    if (closed_) return;           // không nhận nữa nếu đã đóng
-    q_.push_back(v);
-    cv_.notify_one();
-  }
-  // pop() chờ đến khi có phần tử hoặc queue đóng & rỗng
-  bool pop(T& out) {
-    std::unique_lock<std::mutex> lk(m_);
-    cv_.wait(lk, [&]{ return closed_ || !q_.empty(); });
-    if (q_.empty()) return false;  // closed & empty
-    out = std::move(q_.front());
-    q_.pop_front();
-    return true;
-  }
-  void close() {
-    std::unique_lock<std::mutex> lk(m_);
-    closed_ = true;
-    cv_.notify_all();
-  }
-};
-
 
 // ------------------------- BF16 utils -------------------------
 
@@ -1060,17 +1030,19 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   const int num_devices = (int)gpu_contexts.size();
   if (requests->num_reqs <= 0 || num_devices <= 0) return 0;
 
-  // 3.1. Chuẩn bị global job queue (chỉ lưu index request)
-  MPMCQueue<int> jobq;
-  #pragma omp parallel for
-  for (int i = 0; i < requests->num_reqs; ++i) jobq.push(i);
-  jobq.close(); // không còn producer nào khác → đóng để worker thoát khi hết việc
+  // // 3.1. Chuẩn bị global job queue (chỉ lưu index request)
+  // MPMCQueue<int> jobq;
+  // #pragma omp parallel for
+  // for (int i = 0; i < requests->num_reqs; ++i) jobq.push(i);
+  // jobq.close(); // không còn producer nào khác → đóng để worker thoát khi hết việc
+// 3.1. Với tập request cố định: dùng chỉ số toàn cục lock-free thay vì queue
+  std::atomic<int> next_idx{0};
 
   std::atomic<long long> total_out{0};
   std::vector<std::thread> workers;
   workers.reserve(num_devices);
 
-  // 3.2. Mỗi GPU là một worker: rảnh thì pop job mới; bận thì tiếp tục job hiện tại
+  // 3.2. Mỗi GPU là một worker: lấy chỉ số tiếp theo bằng fetch_add (work-stealing đơn giản)
   for (int t = 0; t < num_devices; ++t) {
     workers.emplace_back([&, t]() {
       HIP_CHECK(hipSetDevice(gpu_contexts[t].device_id));
@@ -1085,9 +1057,13 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     sampler->rng_state + 0x9E3779B97f4A7C15ULL * (t + 1));
 
       long long local_out = 0;
-      int idx;
-      // Vòng lặp lấy việc đến khi queue rỗng & đóng
-      while (jobq.pop(idx)) {
+
+
+      // Vòng lặp lấy việc cho đến khi hết request
+      while (true) {
+        int idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+        if (idx >= requests->num_reqs) break;
+
         const char *input_seq = get_str_req_ptr(requests, idx);
         int *output_tokens    = get_tok_gen_ptr(requests, idx);
 
