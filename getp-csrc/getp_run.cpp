@@ -550,6 +550,16 @@ __global__ void attention_weighted_sum_kernel_float(float *tb, const float *att,
   }
 }
 
+// Write attention sink value directly on device: reads BF16 sink and writes float
+__global__ void add_attn_sink_from_bf16_kernel_float(float *att, int write_index,
+                                                     const hip_bfloat16 *attn_sinks,
+                                                     int layer, int n_attn_heads, int head) {
+  if (threadIdx.x == 0) {
+    size_t sink_idx = (size_t)layer * (size_t)n_attn_heads + (size_t)head;
+    att[write_index] = bfloat16_to_float(attn_sinks[sink_idx]);
+  }
+}
+
 __global__ void swiglu_kernel_float(float *gate_up, const float *gate, const float *up,
                                    int intermediate_dim, float swiglu_limit) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -717,16 +727,13 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
                                                         (p->sliding_window > 0 && l % 2 == 0) ? gpu_ctx->state.mask : NULL);
       HIP_CHECK(hipDeviceSynchronize());
 
-      // Attention sink: chỉ thêm nếu còn chỗ (tránh OOB)
+      // Attention sink: chỉ thêm nếu còn chỗ (tránh OOB). No D2H/H2D.
       int len_no_sink = pos + 1;    // t = 0..pos
       bool can_add_sink = (pos + 1) < p->seq_len;
       if (can_add_sink) {
-        hip_bfloat16 bf16_sink;
-        HIP_CHECK(hipMemcpy(&bf16_sink,
-                            gpu_ctx->weights.attn_sinks + (size_t)l * (size_t)p->n_attn_heads + (size_t)h,
-                            sizeof(hip_bfloat16), hipMemcpyDeviceToHost));
-        float float_sink = bfloat16_to_float(bf16_sink);
-        HIP_CHECK(hipMemcpy(att + pos + 1, &float_sink, sizeof(float), hipMemcpyHostToDevice));
+        add_attn_sink_from_bf16_kernel_float<<<1, 1>>>(att, pos + 1,
+                                                       gpu_ctx->weights.attn_sinks,
+                                                       l, p->n_attn_heads, h);
         softmax_kernel_float<<<1, 1>>>(att, len_no_sink + 1);
       } else {
         softmax_kernel_float<<<1, 1>>>(att, len_no_sink);
