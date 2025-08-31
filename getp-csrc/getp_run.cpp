@@ -439,6 +439,35 @@ __global__ void softmax_kernel_float(float *x, int size) {
   }
 }
 
+// Serial top-k selection on device for a single vector of length n.
+// Keeps K best (value, index) pairs in descending order.
+__global__ void topk_kernel_float(const float *scores, int n, int k, float *topv, int *topi) {
+  if (threadIdx.x != 0) return;
+  // Initialize outputs
+  for (int i = 0; i < k; ++i) {
+    topv[i] = -INFINITY;
+    topi[i] = -1;
+  }
+  // One-pass insertion into top-k buffers
+  for (int j = 0; j < n; ++j) {
+    float v = scores[j];
+    // find position where v should be inserted among current topk
+    int pos = -1;
+    for (int t = 0; t < k; ++t) {
+      if (v > topv[t]) { pos = t; break; }
+    }
+    if (pos >= 0) {
+      // shift down [pos..k-2] -> [pos+1..k-1]
+      for (int t = k - 1; t > pos; --t) {
+        topv[t] = topv[t - 1];
+        topi[t] = topi[t - 1];
+      }
+      topv[pos] = v;
+      topi[pos] = j;
+    }
+  }
+}
+
 __global__ void compute_cos_sin_kernel_float(float *cos_out, float *sin_out, int pos,
                                             float base, int head_dim, float scaling_factor,
                                             float initial_context_length, float ntk_beta, float ntk_alpha) {
@@ -735,24 +764,18 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
     add_bias_kernel_float<<<grid_experts, block>>>(gpu_ctx->state.router_score, b_router, n_experts);
     HIP_CHECK(hipDeviceSynchronize());
 
-    // Router scores: already in float format, copy directly to host
-    std::vector<float> cpu_router_score(n_experts);
-    HIP_CHECK(hipMemcpy(cpu_router_score.data(), gpu_ctx->state.router_score, n_experts * sizeof(float), hipMemcpyDeviceToHost));
+    // GPU Router top-k: find top-k over router_score on device
+    topk_kernel_float<<<1, 1>>>(gpu_ctx->state.router_score, n_experts, p->experts_per_token,
+                                gpu_ctx->state.topk_v, gpu_ctx->state.topk_i);
+    // Softmax the selected top-k (device)
+    softmax_kernel_float<<<1, 1>>>(gpu_ctx->state.topk_v, p->experts_per_token);
+    HIP_CHECK(hipDeviceSynchronize());
 
+    // Fetch only K results to host for control flow (no H2D copy back)
     std::vector<float> cpu_topk_v(p->experts_per_token);
     std::vector<int>   cpu_topk_i(p->experts_per_token);
-    topk_cpu(cpu_topk_v.data(), cpu_topk_i.data(), cpu_router_score.data(), n_experts, p->experts_per_token);
-
-    // Softmax top-k (host)
-    float sum = 0.0f;
-    float max_val = cpu_topk_v[0];
-    for (int i = 1; i < p->experts_per_token; i++) if (cpu_topk_v[i] > max_val) max_val = cpu_topk_v[i];
-    for (int i = 0; i < p->experts_per_token; i++) { cpu_topk_v[i] = expf(cpu_topk_v[i] - max_val); sum += cpu_topk_v[i]; }
-    for (int i = 0; i < p->experts_per_token; i++) cpu_topk_v[i] /= sum;
-
-    // Copy topk back to GPU as float
-    HIP_CHECK(hipMemcpy(gpu_ctx->state.topk_v, cpu_topk_v.data(), p->experts_per_token * sizeof(float), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(gpu_ctx->state.topk_i, cpu_topk_i.data(), p->experts_per_token * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(cpu_topk_v.data(), gpu_ctx->state.topk_v, p->experts_per_token * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(cpu_topk_i.data(), gpu_ctx->state.topk_i, p->experts_per_token * sizeof(int),   hipMemcpyDeviceToHost));
 
     // Init aggregation
     HIP_CHECK(hipMemset(gpu_ctx->state.e_agg, 0, hidden_dim * sizeof(float)));
