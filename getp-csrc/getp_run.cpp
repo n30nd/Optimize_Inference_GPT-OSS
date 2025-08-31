@@ -609,6 +609,97 @@ __global__ void bf16_to_float_kernel(float *out, const hip_bfloat16 *in, int siz
   }
 }
 
+// Fused Multi-Head Attention Kernel: xử lý tất cả heads song song
+__global__ void fused_multihead_attention_kernel(
+    const float *all_q,           // Q cho tất cả heads [n_heads * head_dim] 
+    const float *key_cache,       // K cache [layers * seq_len * kv_dim]
+    const float *value_cache,     // V cache [layers * seq_len * kv_dim]
+    const hip_bfloat16 *attn_sinks, // Attention sinks [layers * n_heads]
+    float *all_att,               // Attention scores buffer [n_heads * seq_len]
+    float *all_output,            // Output [n_heads * head_dim]
+    const float *mask,            // Sliding window mask (optional)
+    int head_dim, int loff, int kv_dim, int kv_mul,
+    int n_heads, int pos, int seq_len, int layer,
+    bool can_add_sink) {
+  
+  int h = blockIdx.y;  // Head index
+  if (h >= n_heads) return;
+  
+  const float *q_head = all_q + h * head_dim;
+  float *att = all_att + h * seq_len;
+  float *output = all_output + h * head_dim;
+  
+  // Phase 1: Compute attention scores (parallel across time steps)
+  int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t <= pos) {
+    const float *k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
+    float score = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+      score += q_head[i] * k[i];
+    }
+    score /= sqrtf((float)head_dim);
+    
+    // Apply sliding window mask if enabled
+    if (mask != NULL) {
+      score += mask[pos * seq_len + t];
+    }
+    att[t] = score;
+  }
+  
+  // Sync within each head's block before proceeding
+  __syncthreads();
+  
+  // Phase 2: Add attention sink (only first thread of first block for each head)
+  if (threadIdx.x == 0 && blockIdx.x == 0 && can_add_sink) {
+    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
+    att[pos + 1] = bfloat16_to_float(attn_sinks[sink_idx]);
+  }
+  
+  // Global sync: wait for all blocks to finish scores + sink
+  __syncthreads();
+  
+  // Phase 3: Softmax (only first thread of first block for each head)
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    int len = can_add_sink ? (pos + 2) : (pos + 1);
+    if (len <= 0) return;
+    
+    // Find max
+    float max_val = att[0];
+    for (int i = 1; i < len; i++) {
+      if (att[i] > max_val) max_val = att[i];
+    }
+    
+    // Exp and sum
+    float sum_val = 0.0f;
+    for (int i = 0; i < len; i++) {
+      float v = expf(att[i] - max_val);
+      att[i] = v;
+      sum_val += v;
+    }
+    
+    // Normalize
+    float inv = 1.0f / sum_val;
+    for (int i = 0; i < len; i++) {
+      att[i] *= inv;
+    }
+  }
+  
+  // Global sync: wait for softmax to complete
+  __syncthreads();
+  
+  // Phase 4: Weighted sum with values
+  // Each thread handles one output dimension
+  if (blockIdx.x == 0 && threadIdx.x < head_dim) {
+    int i = threadIdx.x;
+    float sum = 0.0f;
+    for (int t = 0; t <= pos; t++) {
+      const float *v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
+      sum += att[t] * v[i];
+    }
+    output[i] = sum;
+  }
+}
+
 // ------------------------- CPU top-k -------------------------
 
 void topk_cpu(float *topk_values, int *topk_indices, const float *router_score, int num_experts, int experts_per_token) {
@@ -716,37 +807,24 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
     // Update K cache after RoPE
     HIP_CHECK(hipMemcpy(k_cache_pos, k, k_size * sizeof(float), hipMemcpyDeviceToDevice));
 
-    // Multi-head attention
-    for (int h = 0; h < p->n_attn_heads; h++) {
-      float *q_head = q + (size_t)h * (size_t)head_dim;
-      float *att = gpu_ctx->state.att + (size_t)h * (size_t)p->seq_len;
-
-      // Scores
-      dim3 grid_att = dim3(((pos + 1) + block.x - 1) / block.x);
-      attention_scores_kernel_float<<<grid_att, block>>>(att, q_head, gpu_ctx->state.key_cache, head_dim, loff,
-                                                        kv_dim, kv_mul, h, pos, p->seq_len,
-                                                        (p->sliding_window > 0 && l % 2 == 0) ? gpu_ctx->state.mask : NULL);
-      HIP_CHECK(hipDeviceSynchronize());
-
-      // Attention sink: chỉ thêm nếu còn chỗ (tránh OOB). No D2H/H2D.
-      int len_no_sink = pos + 1;    // t = 0..pos
-      bool can_add_sink = (pos + 1) < p->seq_len;
-      if (can_add_sink) {
-        add_attn_sink_from_bf16_kernel_float<<<1, 1>>>(att, pos + 1,
-                                                       gpu_ctx->weights.attn_sinks,
-                                                       l, p->n_attn_heads, h);
-        softmax_kernel_float<<<1, 1>>>(att, len_no_sink + 1);
-      } else {
-        softmax_kernel_float<<<1, 1>>>(att, len_no_sink);
-      }
-      HIP_CHECK(hipDeviceSynchronize());
-
-      // Weighted sum (chỉ 0..pos, không có v-sink)
-      dim3 grid_head_dim = dim3((head_dim + block.x - 1) / block.x);
-      attention_weighted_sum_kernel_float<<<grid_head_dim, block>>>(gpu_ctx->state.tb, att, gpu_ctx->state.value_cache,
-                                                                   head_dim, loff, kv_dim, kv_mul, h, pos);
-      HIP_CHECK(hipDeviceSynchronize());
-    }
+    // Fused Multi-head attention: xử lý tất cả heads song song
+    bool can_add_sink = (pos + 1) < p->seq_len;
+    const float *mask = (p->sliding_window > 0 && l % 2 == 0) ? gpu_ctx->state.mask : NULL;
+    
+    // Launch fused kernel với grid 2D: [time_steps, heads]
+    dim3 grid_fused(((pos + 1) + block.x - 1) / block.x, p->n_attn_heads);
+    fused_multihead_attention_kernel<<<grid_fused, block>>>(
+        q,                           // All Q heads
+        gpu_ctx->state.key_cache,    // K cache
+        gpu_ctx->state.value_cache,  // V cache  
+        gpu_ctx->weights.attn_sinks, // Attention sinks
+        gpu_ctx->state.att,          // Attention scores buffer
+        gpu_ctx->state.tb,           // Output buffer
+        mask,                        // Sliding window mask
+        head_dim, loff, kv_dim, kv_mul,
+        p->n_attn_heads, pos, p->seq_len, l,
+        can_add_sink);
+    HIP_CHECK(hipDeviceSynchronize());
 
     // Output projection of attention
     const hip_bfloat16 *w_o = gpu_ctx->weights.w_o + (size_t)l * (size_t)(head_dim * p->n_attn_heads) * (size_t)hidden_dim;
