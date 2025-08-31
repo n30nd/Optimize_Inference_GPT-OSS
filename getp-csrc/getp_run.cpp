@@ -664,6 +664,15 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
   bf16_to_float_kernel<<<grid_hidden, block>>>(gpu_ctx->state.x, token_row, hidden_dim);
   HIP_CHECK(hipDeviceSynchronize());
 
+  // RoPE precomputation: tính cos/sin một lần cho tất cả layers (chỉ phụ thuộc pos và head_dim)
+  float ntk_beta  = 32.0f;
+  float ntk_alpha = 1.0f;
+  dim3 grid_rope = dim3(((head_dim / 2) + block.x - 1) / block.x);
+  compute_cos_sin_kernel_float<<<grid_rope, block>>>(gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, pos,
+                                                    p->rope_theta, head_dim, p->rope_scaling_factor,
+                                                    p->initial_context_length, ntk_beta, ntk_alpha);
+  HIP_CHECK(hipDeviceSynchronize());
+
   // Layers
   for (int l = 0; l < p->n_layers; l++) {
     // Attention RMSNorm
@@ -700,14 +709,6 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
     HIP_CHECK(hipMemcpy(v_cache_pos, v, v_size * sizeof(float), hipMemcpyDeviceToDevice));
 
     // RoPE
-    float ntk_beta  = 32.0f;
-    float ntk_alpha = 1.0f;
-    dim3 grid_rope = dim3(((head_dim / 2) + block.x - 1) / block.x);
-    compute_cos_sin_kernel_float<<<grid_rope, block>>>(gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, pos,
-                                                      p->rope_theta, head_dim, p->rope_scaling_factor,
-                                                      p->initial_context_length, ntk_beta, ntk_alpha);
-    HIP_CHECK(hipDeviceSynchronize());
-
     apply_rotary_emb_kernel_float<<<p->n_attn_heads, head_dim/2>>>(q, gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, p->n_attn_heads, head_dim);
     apply_rotary_emb_kernel_float<<<p->n_kv_heads,   head_dim/2>>>(k, gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, p->n_kv_heads,   head_dim);
     HIP_CHECK(hipDeviceSynchronize());
