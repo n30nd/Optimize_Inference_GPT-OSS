@@ -109,6 +109,8 @@ typedef struct {
   GPURunState state;
   hipStream_t expert_streams[MAX_EXPERT_STREAMS];
   int num_expert_streams;
+  int max_batch; // number of concurrent slots per GPU for continuous batching
+  std::vector<hipStream_t> slot_streams; // persistent stream per slot
 } GPUContext;
 
 static std::vector<GPUContext> gpu_contexts;
@@ -384,12 +386,43 @@ __global__ void matmul_kernel_float(float *xout, const float *x, const hip_bfloa
   }
 }
 
+// Batched variant: same weights across batch, different inputs/outputs
+__global__ void matmul_kernel_float_batched(float *xout, const float *x,
+                                            const hip_bfloat16 *w, int n, int d,
+                                            int batch, int out_stride, int in_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; // row
+  int b = blockIdx.y; // batch index
+  if (i < d && b < batch) {
+    float val = 0.0f;
+    const float *x_b = x + (size_t)b * (size_t)in_stride;
+    for (int j = 0; j < n; j++) {
+      float wv = bfloat16_to_float(w[i * n + j]);
+      float xv = x_b[j];
+      val += wv * xv;
+    }
+    float *out_b = xout + (size_t)b * (size_t)out_stride;
+    out_b[i] = val;
+  }
+}
+
 __global__ void add_bias_kernel_float(float *output, const hip_bfloat16 *bias, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < size) {
     float ov = output[tid];
     float bv = bfloat16_to_float(bias[tid]);
     output[tid] = ov + bv;
+  }
+}
+
+__global__ void add_bias_kernel_float_batched(float *output, const hip_bfloat16 *bias,
+                                              int size, int batch, int out_stride) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = blockIdx.y;
+  if (tid < size && b < batch) {
+    float *out_b = output + (size_t)b * (size_t)out_stride;
+    float ov = out_b[tid];
+    float bv = bfloat16_to_float(bias[tid]);
+    out_b[tid] = ov + bv;
   }
 }
 
@@ -492,6 +525,28 @@ __global__ void apply_rotary_emb_kernel_float(float *x, const float *cos, const 
     float o2 = x2 * c + x1 * s;
     x[h * head_dim + i]           = o1;
     x[h * head_dim + half + i]    = o2;
+  }
+}
+
+// Batched RoPE: x is [B, n_heads*head_dim], cos/sin per batch
+__global__ void apply_rotary_emb_kernel_float_batched(float *x, const float *cos, const float *sin,
+                                                     int n_heads, int head_dim, int batch, int x_stride, int cs_stride) {
+  int h = blockIdx.x;
+  int i = threadIdx.x;
+  int b = blockIdx.y;
+  int half = head_dim / 2;
+  if (b < batch && h < n_heads && i < half) {
+    float *x_b = x + (size_t)b * (size_t)x_stride;
+    const float *cos_b = cos + (size_t)b * (size_t)cs_stride;
+    const float *sin_b = sin + (size_t)b * (size_t)cs_stride;
+    float x1 = x_b[h * head_dim + i];
+    float x2 = x_b[h * head_dim + half + i];
+    float c  = cos_b[i];
+    float s  = sin_b[i];
+    float o1 = x1 * c - x2 * s;
+    float o2 = x2 * c + x1 * s;
+    x_b[h * head_dim + i]           = o1;
+    x_b[h * head_dim + half + i]    = o2;
   }
 }
 
@@ -691,6 +746,81 @@ __global__ void fused_multihead_attention_kernel(
   }
 }
 
+// Batched fused attention: process [batch, heads] where each batch has its own pos
+__global__ void fused_multihead_attention_kernel_batched(
+    const float *all_q,           // [B, n_heads*head_dim]
+    const float *key_cache,       // [B, layers*seq_len*kv_dim]
+    const float *value_cache,     // [B, layers*seq_len*kv_dim]
+    const hip_bfloat16 *attn_sinks, // [layers * n_heads]
+    float *all_att,               // [B, n_heads*seq_len]
+    float *all_output,            // [B, n_heads*head_dim]
+    const float *mask,            // Sliding window mask (optional)
+    int head_dim, int loff, int kv_dim, int kv_mul,
+    int n_heads, int seq_len, int layer,
+    const int *pos_list,          // [B]
+    bool can_add_sink,            // same rule per slot
+    int batch,
+    int q_stride,
+    int kv_block_size,
+    int att_block_size) {
+
+  int h = blockIdx.y;   // head index
+  int b = blockIdx.z;   // batch index
+  if (h >= n_heads || b >= batch) return;
+
+  int pos = pos_list[b];
+  const float *q_head = all_q + (size_t)b * (size_t)q_stride + (size_t)h * (size_t)head_dim;
+  float *att = all_att + (size_t)b * (size_t)att_block_size + (size_t)h * (size_t)seq_len;
+  float *output = all_output + (size_t)b * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
+
+  const float *key_cache_base   = key_cache   + (size_t)b * (size_t)kv_block_size;
+  const float *value_cache_base = value_cache + (size_t)b * (size_t)kv_block_size;
+
+  int t = blockIdx.x * blockDim.x + threadIdx.x;
+  if (t <= pos) {
+    const float *k = key_cache_base + loff + t * kv_dim + (h / kv_mul) * head_dim;
+    float score = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+      score += q_head[i] * k[i];
+    }
+    score /= sqrtf((float)head_dim);
+    if (mask != NULL) {
+      score += mask[pos * seq_len + t];
+    }
+    att[t] = score;
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0 && blockIdx.x == 0 && can_add_sink) {
+    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
+    att[pos + 1] = bfloat16_to_float(attn_sinks[sink_idx]);
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    int len = can_add_sink ? (pos + 2) : (pos + 1);
+    if (len > 0) {
+      float max_val = att[0];
+      for (int i = 1; i < len; i++) max_val = fmaxf(max_val, att[i]);
+      float sum_val = 0.0f;
+      for (int i = 0; i < len; i++) { float v = expf(att[i] - max_val); att[i] = v; sum_val += v; }
+      float inv = 1.0f / sum_val;
+      for (int i = 0; i < len; i++) att[i] *= inv;
+    }
+  }
+  __syncthreads();
+
+  if (blockIdx.x == 0 && threadIdx.x < head_dim) {
+    int i = threadIdx.x;
+    float sum = 0.0f;
+    for (int t2 = 0; t2 <= pos; t2++) {
+      const float *v = value_cache_base + loff + t2 * kv_dim + (h / kv_mul) * head_dim;
+      sum += att[t2] * v[i];
+    }
+    output[i] = sum;
+  }
+}
+
 // ------------------------- CPU top-k -------------------------
 
 void topk_cpu(float *topk_values, int *topk_indices, const float *router_score, int num_experts, int experts_per_token) {
@@ -713,7 +843,7 @@ void topk_cpu(float *topk_values, int *topk_indices, const float *router_score, 
 }
 
 // ------------------------- Alloc/Free run state -------------------------
-void gpu_malloc_run_state(GPURunState *s, Config *p);
+void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch);
 void gpu_free_run_state(GPURunState *s);
 
 
@@ -725,7 +855,8 @@ void gpu_free_weights(GPUTransformerWeights *gpu_w);
 
 // ------------------------- Forward -------------------------
 
-float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu_ctx) {
+// slot: which per-GPU slot (0..max_batch-1) this sequence uses for KV-cache/att buffers
+float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu_ctx, int slot, hipStream_t stream) {
   Config *p = &transformer->config;
 
   int head_dim         = p->head_dim;
@@ -741,26 +872,50 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
   dim3 grid_intermediate = dim3((intermediate_dim + block.x - 1) / block.x);
   dim3 grid_experts      = dim3((n_experts + block.x - 1) / block.x);
 
+  // Per-slot activation base pointers
+  float *x_slot   = gpu_ctx->state.x   + (size_t)slot * (size_t)hidden_dim;
+  float *t_slot   = gpu_ctx->state.t   + (size_t)slot * (size_t)hidden_dim;
+  float *tb_slot  = gpu_ctx->state.tb  + (size_t)slot * (size_t)(head_dim * p->n_attn_heads);
+  float *tb2_slot = gpu_ctx->state.tb2 + (size_t)slot * (size_t)hidden_dim;
+
+  float *router_score_slot = gpu_ctx->state.router_score + (size_t)slot * (size_t)n_experts;
+  float *topk_v_slot       = gpu_ctx->state.topk_v       + (size_t)slot * (size_t)p->experts_per_token;
+  int   *topk_i_slot       = gpu_ctx->state.topk_i       + (size_t)slot * (size_t)p->experts_per_token;
+
+  float *mlp1_out_slot = gpu_ctx->state.mlp1_out + (size_t)slot * (size_t)(2 * intermediate_dim);
+  float *gate_slot     = gpu_ctx->state.gate     + (size_t)slot * (size_t)intermediate_dim;
+  float *up_slot       = gpu_ctx->state.up       + (size_t)slot * (size_t)intermediate_dim;
+  float *gate_up_slot  = gpu_ctx->state.gate_up  + (size_t)slot * (size_t)intermediate_dim;
+  float *e_agg_slot    = gpu_ctx->state.e_agg    + (size_t)slot * (size_t)hidden_dim;
+
+  float *qkv_slot = gpu_ctx->state.qkv + (size_t)slot * (size_t)(head_dim * (p->n_attn_heads + 2 * p->n_kv_heads));
+
   // Token embedding: convert BF16 weights to float state
   hip_bfloat16 *token_row = gpu_ctx->weights.token_embedding_table + (size_t)token * (size_t)hidden_dim;
-  bf16_to_float_kernel<<<grid_hidden, block>>>(gpu_ctx->state.x, token_row, hidden_dim);
-  HIP_CHECK(hipDeviceSynchronize());
+  bf16_to_float_kernel<<<grid_hidden, block, 0, stream>>>(x_slot, token_row, hidden_dim);
 
   // RoPE precomputation: tính cos/sin một lần cho tất cả layers (chỉ phụ thuộc pos và head_dim)
   float ntk_beta  = 32.0f;
   float ntk_alpha = 1.0f;
   dim3 grid_rope = dim3(((head_dim / 2) + block.x - 1) / block.x);
-  compute_cos_sin_kernel_float<<<grid_rope, block>>>(gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, pos,
+  float *cos_slot = gpu_ctx->state.cos_vals + (size_t)slot * (size_t)(head_dim/2);
+  float *sin_slot = gpu_ctx->state.sin_vals + (size_t)slot * (size_t)(head_dim/2);
+  compute_cos_sin_kernel_float<<<grid_rope, block, 0, stream>>>(cos_slot, sin_slot, pos,
                                                     p->rope_theta, head_dim, p->rope_scaling_factor,
                                                     p->initial_context_length, ntk_beta, ntk_alpha);
-  HIP_CHECK(hipDeviceSynchronize());
+
+  // Compute base offsets for this slot
+  const size_t kv_block_size  = (size_t)p->n_layers * (size_t)p->seq_len * (size_t)kv_dim;
+  const size_t att_block_size = (size_t)p->n_attn_heads * (size_t)p->seq_len;
+  float *key_cache_base   = gpu_ctx->state.key_cache   + (size_t)slot * kv_block_size;
+  float *value_cache_base = gpu_ctx->state.value_cache + (size_t)slot * kv_block_size;
+  float *att_base         = gpu_ctx->state.att         + (size_t)slot * att_block_size;
 
   // Layers
   for (int l = 0; l < p->n_layers; l++) {
     // Attention RMSNorm
     const hip_bfloat16 *rms_attn_w = gpu_ctx->weights.rms_attn_w + (size_t)l * (size_t)hidden_dim;
-    rmsnorm_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.t, gpu_ctx->state.x, rms_attn_w, hidden_dim);
-    HIP_CHECK(hipDeviceSynchronize());
+    rmsnorm_kernel_float<<<grid_hidden, block, 0, stream>>>(t_slot, x_slot, rms_attn_w, hidden_dim);
 
     // QKV projection
     int loff = l * p->seq_len * kv_dim;
@@ -771,32 +926,30 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
 
     int qkv_out_dim = (p->n_attn_heads + 2 * p->n_kv_heads) * head_dim;
     dim3 grid_qkv = dim3((qkv_out_dim + block.x - 1) / block.x);
-    matmul_kernel_float<<<grid_qkv, block>>>(gpu_ctx->state.qkv, gpu_ctx->state.t, w_qkv, hidden_dim, qkv_out_dim);
-    add_bias_kernel_float<<<grid_qkv, block>>>(gpu_ctx->state.qkv, b_qkv, qkv_out_dim);
-    HIP_CHECK(hipDeviceSynchronize());
+    matmul_kernel_float<<<grid_qkv, block, 0, stream>>>(qkv_slot, t_slot, w_qkv, hidden_dim, qkv_out_dim);
+    add_bias_kernel_float<<<grid_qkv, block, 0, stream>>>(qkv_slot, b_qkv, qkv_out_dim);
 
     // Q/K/V aliases: tránh D2D copy bằng cách dùng pointer offsets
     int q_size = head_dim * p->n_attn_heads;
     int k_size = head_dim * p->n_kv_heads;
     int v_size = head_dim * p->n_kv_heads;
 
-    float *q = gpu_ctx->state.qkv;                    // Q starts at beginning
-    float *k = gpu_ctx->state.qkv + q_size;           // K starts after Q
-    float *v = gpu_ctx->state.qkv + q_size + k_size;  // V starts after Q+K
+    float *q = qkv_slot;                    // Q starts at beginning
+    float *k = qkv_slot + q_size;           // K starts after Q
+    float *v = qkv_slot + q_size + k_size;  // V starts after Q+K
 
     // Store K, V in cache trực tiếp từ qkv buffer (before RoPE)
-    float *k_cache_pos = gpu_ctx->state.key_cache   + loff + pos * kv_dim;
-    float *v_cache_pos = gpu_ctx->state.value_cache + loff + pos * kv_dim;
-    HIP_CHECK(hipMemcpy(k_cache_pos, k, k_size * sizeof(float), hipMemcpyDeviceToDevice));
-    HIP_CHECK(hipMemcpy(v_cache_pos, v, v_size * sizeof(float), hipMemcpyDeviceToDevice));
+    float *k_cache_pos = key_cache_base   + loff + pos * kv_dim;
+    float *v_cache_pos = value_cache_base + loff + pos * kv_dim;
+    HIP_CHECK(hipMemcpyAsync(k_cache_pos, k, k_size * sizeof(float), hipMemcpyDeviceToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(v_cache_pos, v, v_size * sizeof(float), hipMemcpyDeviceToDevice, stream));
 
     // RoPE
-    apply_rotary_emb_kernel_float<<<p->n_attn_heads, head_dim/2>>>(q, gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, p->n_attn_heads, head_dim);
-    apply_rotary_emb_kernel_float<<<p->n_kv_heads,   head_dim/2>>>(k, gpu_ctx->state.cos_vals, gpu_ctx->state.sin_vals, p->n_kv_heads,   head_dim);
-    HIP_CHECK(hipDeviceSynchronize());
+    apply_rotary_emb_kernel_float<<<p->n_attn_heads, head_dim/2, 0, stream>>>(q, cos_slot, sin_slot, p->n_attn_heads, head_dim);
+    apply_rotary_emb_kernel_float<<<p->n_kv_heads,   head_dim/2, 0, stream>>>(k, cos_slot, sin_slot, p->n_kv_heads,   head_dim);
 
     // Update K cache after RoPE
-    HIP_CHECK(hipMemcpy(k_cache_pos, k, k_size * sizeof(float), hipMemcpyDeviceToDevice));
+    HIP_CHECK(hipMemcpyAsync(k_cache_pos, k, k_size * sizeof(float), hipMemcpyDeviceToDevice, stream));
 
     // Fused Multi-head attention: xử lý tất cả heads song song
     bool can_add_sink = (pos + 1) < p->seq_len;
@@ -804,128 +957,101 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
     
     // Launch fused kernel với grid 2D: [time_steps, heads]
     dim3 grid_fused(((pos + 1) + block.x - 1) / block.x, p->n_attn_heads);
-    fused_multihead_attention_kernel<<<grid_fused, block>>>(
+    fused_multihead_attention_kernel<<<grid_fused, block, 0, stream>>>(
         q,                           // All Q heads
-        gpu_ctx->state.key_cache,    // K cache
-        gpu_ctx->state.value_cache,  // V cache  
+        key_cache_base,              // K cache (slot base)
+        value_cache_base,            // V cache (slot base)
         gpu_ctx->weights.attn_sinks, // Attention sinks
-        gpu_ctx->state.att,          // Attention scores buffer
-        gpu_ctx->state.tb,           // Output buffer
+        att_base,                    // Attention scores buffer (slot base)
+        tb_slot,                     // Output buffer
         mask,                        // Sliding window mask
         head_dim, loff, kv_dim, kv_mul,
         p->n_attn_heads, pos, p->seq_len, l,
         can_add_sink);
-    HIP_CHECK(hipDeviceSynchronize());
 
     // Output projection of attention
     const hip_bfloat16 *w_o = gpu_ctx->weights.w_o + (size_t)l * (size_t)(head_dim * p->n_attn_heads) * (size_t)hidden_dim;
     const hip_bfloat16 *b_o = gpu_ctx->weights.b_o + (size_t)l * (size_t)hidden_dim;
-    matmul_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.tb2, gpu_ctx->state.tb, w_o, head_dim * p->n_attn_heads, hidden_dim);
-    add_bias_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.tb2, b_o, hidden_dim);
-    HIP_CHECK(hipDeviceSynchronize());
+    matmul_kernel_float<<<grid_hidden, block, 0, stream>>>(tb2_slot, tb_slot, w_o, head_dim * p->n_attn_heads, hidden_dim);
+    add_bias_kernel_float<<<grid_hidden, block, 0, stream>>>(tb2_slot, b_o, hidden_dim);
 
     // Residual
-    residual_connection_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.x, gpu_ctx->state.tb2, hidden_dim);
-    HIP_CHECK(hipDeviceSynchronize());
+    residual_connection_kernel_float<<<grid_hidden, block, 0, stream>>>(x_slot, tb2_slot, hidden_dim);
 
     // -------- MoE --------
     // FFN RMSNorm
     const hip_bfloat16 *rms_ffn_w = gpu_ctx->weights.rms_ffn_w + (size_t)l * (size_t)hidden_dim;
-    rmsnorm_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.t, gpu_ctx->state.x, rms_ffn_w, hidden_dim);
-    HIP_CHECK(hipDeviceSynchronize());
+    rmsnorm_kernel_float<<<grid_hidden, block, 0, stream>>>(t_slot, x_slot, rms_ffn_w, hidden_dim);
 
     // Router
     const hip_bfloat16 *w_router = gpu_ctx->weights.w_router + (size_t)l * (size_t)hidden_dim * (size_t)n_experts;
     const hip_bfloat16 *b_router = gpu_ctx->weights.b_router + (size_t)l * (size_t)n_experts;
-    matmul_kernel_float<<<grid_experts, block>>>(gpu_ctx->state.router_score, gpu_ctx->state.t, w_router, hidden_dim, n_experts);
-    add_bias_kernel_float<<<grid_experts, block>>>(gpu_ctx->state.router_score, b_router, n_experts);
-    HIP_CHECK(hipDeviceSynchronize());
+    matmul_kernel_float<<<grid_experts, block, 0, stream>>>(router_score_slot, t_slot, w_router, hidden_dim, n_experts);
+    add_bias_kernel_float<<<grid_experts, block, 0, stream>>>(router_score_slot, b_router, n_experts);
 
     // GPU Router top-k: find top-k over router_score on device
-    topk_kernel_float<<<1, 1>>>(gpu_ctx->state.router_score, n_experts, p->experts_per_token,
-                                gpu_ctx->state.topk_v, gpu_ctx->state.topk_i);
+    topk_kernel_float<<<1, 1, 0, stream>>>(router_score_slot, n_experts, p->experts_per_token,
+                                topk_v_slot, topk_i_slot);
     // Softmax the selected top-k (device)
-    softmax_kernel_float<<<1, 1>>>(gpu_ctx->state.topk_v, p->experts_per_token);
-    HIP_CHECK(hipDeviceSynchronize());
+    softmax_kernel_float<<<1, 1, 0, stream>>>(topk_v_slot, p->experts_per_token);
+    HIP_CHECK(hipStreamSynchronize(stream));
 
     // Fetch only K results to host for control flow (no H2D copy back)
     std::vector<float> cpu_topk_v(p->experts_per_token);
     std::vector<int>   cpu_topk_i(p->experts_per_token);
-    HIP_CHECK(hipMemcpy(cpu_topk_v.data(), gpu_ctx->state.topk_v, p->experts_per_token * sizeof(float), hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(cpu_topk_i.data(), gpu_ctx->state.topk_i, p->experts_per_token * sizeof(int),   hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(cpu_topk_v.data(), topk_v_slot, p->experts_per_token * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(cpu_topk_i.data(), topk_i_slot, p->experts_per_token * sizeof(int),   hipMemcpyDeviceToHost));
 
     // Init aggregation
-    HIP_CHECK(hipMemset(gpu_ctx->state.e_agg, 0, hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMemsetAsync(e_agg_slot, 0, hidden_dim * sizeof(float), stream));
 
-    // Expert parallelization: launch per-expert work on multiple streams (up to 4)
+    // Per-slot expert computation on the slot stream
     {
-      const int num_sel = p->experts_per_token;
-      const int max_S = gpu_ctx->num_expert_streams;
-      const int stride_mlp1 = 2 * intermediate_dim;
-      const int stride_mid  = intermediate_dim;
-      const int stride_out  = hidden_dim;
       dim3 grid_mlp1 = dim3(((2 * intermediate_dim) + block.x - 1) / block.x);
+      for (int sel_idx = 0; sel_idx < p->experts_per_token; ++sel_idx) {
+        int e = cpu_topk_i[sel_idx];
+        float expert_w = cpu_topk_v[sel_idx];
+        const hip_bfloat16 *w_mlp1 = gpu_ctx->weights.w_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
+        const hip_bfloat16 *b_mlp1 = gpu_ctx->weights.b_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim);
 
-      for (int start = 0; start < num_sel; start += max_S) {
-        int group = std::min(max_S, num_sel - start);
-        for (int g = 0; g < group; ++g) {
-          int sel_idx = start + g;
-          int e = cpu_topk_i[sel_idx];
-          float expert_w = cpu_topk_v[sel_idx];
+        // MLP1
+        matmul_kernel_float<<<grid_mlp1, block, 0, stream>>>(mlp1_out_slot, t_slot, w_mlp1, hidden_dim, 2 * intermediate_dim);
+        add_bias_kernel_float<<<grid_mlp1, block, 0, stream>>>(mlp1_out_slot, b_mlp1, 2 * intermediate_dim);
 
-          hipStream_t stream = gpu_ctx->expert_streams[g];
+        // Split + SwiGLU
+        split_gate_up_kernel_float<<<grid_intermediate, block, 0, stream>>>(gate_slot, up_slot, mlp1_out_slot, intermediate_dim);
+        swiglu_kernel_float<<<grid_intermediate, block, 0, stream>>>(gate_up_slot, gate_slot, up_slot, intermediate_dim, p->swiglu_limit);
 
-          const hip_bfloat16 *w_mlp1 = gpu_ctx->weights.w_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim) * (size_t)hidden_dim;
-          const hip_bfloat16 *b_mlp1 = gpu_ctx->weights.b_mlp1 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)(2 * intermediate_dim);
+        // MLP2
+        const hip_bfloat16 *w_mlp2 = gpu_ctx->weights.w_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim * (size_t)intermediate_dim;
+        const hip_bfloat16 *b_mlp2 = gpu_ctx->weights.b_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim;
+        matmul_kernel_float<<<grid_hidden, block, 0, stream>>>(tb2_slot, gate_up_slot, w_mlp2, intermediate_dim, hidden_dim);
+        add_bias_kernel_float<<<grid_hidden, block, 0, stream>>>(tb2_slot, b_mlp2, hidden_dim);
 
-          float *mlp1_out_s = gpu_ctx->state.mlp1_out_s + (size_t)g * (size_t)stride_mlp1;
-          float *gate_s     = gpu_ctx->state.gate_s     + (size_t)g * (size_t)stride_mid;
-          float *up_s       = gpu_ctx->state.up_s       + (size_t)g * (size_t)stride_mid;
-          float *gate_up_s  = gpu_ctx->state.gate_up_s  + (size_t)g * (size_t)stride_mid;
-          float *tb2_s      = gpu_ctx->state.tb2_s      + (size_t)g * (size_t)stride_out;
-
-          // MLP1
-          matmul_kernel_float<<<grid_mlp1, block, 0, stream>>>(mlp1_out_s, gpu_ctx->state.t, w_mlp1, hidden_dim, 2 * intermediate_dim);
-          add_bias_kernel_float<<<grid_mlp1, block, 0, stream>>>(mlp1_out_s, b_mlp1, 2 * intermediate_dim);
-
-          // Split + SwiGLU
-          split_gate_up_kernel_float<<<grid_intermediate, block, 0, stream>>>(gate_s, up_s, mlp1_out_s, intermediate_dim);
-          swiglu_kernel_float<<<grid_intermediate, block, 0, stream>>>(gate_up_s, gate_s, up_s, intermediate_dim, p->swiglu_limit);
-
-          // MLP2
-          const hip_bfloat16 *w_mlp2 = gpu_ctx->weights.w_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim * (size_t)intermediate_dim;
-          const hip_bfloat16 *b_mlp2 = gpu_ctx->weights.b_mlp2 + ((size_t)l * (size_t)n_experts + (size_t)e) * (size_t)hidden_dim;
-          matmul_kernel_float<<<grid_hidden, block, 0, stream>>>(tb2_s, gate_up_s, w_mlp2, intermediate_dim, hidden_dim);
-          add_bias_kernel_float<<<grid_hidden, block, 0, stream>>>(tb2_s, b_mlp2, hidden_dim);
-
-          // Accumulate with atomics
-          weighted_sum_atomic_kernel_float<<<grid_hidden, block, 0, stream>>>(gpu_ctx->state.e_agg, tb2_s, expert_w, hidden_dim);
-        }
-        // Wait for the group to complete before reusing per-stream buffers
-        HIP_CHECK(hipDeviceSynchronize());
+        // Accumulate into e_agg
+        weighted_sum_kernel_float<<<grid_hidden, block, 0, stream>>>(e_agg_slot, tb2_slot, expert_w, hidden_dim);
       }
     }
 
-    residual_connection_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.x, gpu_ctx->state.e_agg, hidden_dim);
-    HIP_CHECK(hipDeviceSynchronize());
+    residual_connection_kernel_float<<<grid_hidden, block, 0, stream>>>(x_slot, e_agg_slot, hidden_dim);
   }
 
   // Final RMSNorm
-  rmsnorm_kernel_float<<<grid_hidden, block>>>(gpu_ctx->state.x, gpu_ctx->state.x, gpu_ctx->weights.rms_out_w, hidden_dim);
-  HIP_CHECK(hipDeviceSynchronize());
+  rmsnorm_kernel_float<<<grid_hidden, block, 0, stream>>>(x_slot, x_slot, gpu_ctx->weights.rms_out_w, hidden_dim);
 
   // Output logits directly: W(BF16)*x(FP32)->logits(FP32)
   dim3 grid_vocab2 = dim3((p->vocab_size + block.x - 1) / block.x);
-  matvec_wbf16_xfp32_outfp32<<<grid_vocab2, block>>>(gpu_ctx->state.logits_fp32, gpu_ctx->state.x, gpu_ctx->weights.out,
+  float *logits_slot = gpu_ctx->state.logits_fp32 + (size_t)slot * (size_t)p->vocab_size;
+  matvec_wbf16_xfp32_outfp32<<<grid_vocab2, block, 0, stream>>>(logits_slot, x_slot, gpu_ctx->weights.out,
                                                      /*n=*/hidden_dim, /*d=*/p->vocab_size);
-  HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipStreamSynchronize(stream));
 
   // Copy logits to CPU (thread-local buffer across calls)
   thread_local float *cpu_logits = NULL;
   if (cpu_logits == NULL) {
     cpu_logits = (float*)malloc(p->vocab_size * sizeof(float));
   }
-  HIP_CHECK(hipMemcpy(cpu_logits, gpu_ctx->state.logits_fp32, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(cpu_logits, logits_slot, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
   return cpu_logits;
 }
 
@@ -945,8 +1071,17 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int d = 0; d < max_devices; ++d) {
     HIP_CHECK(hipSetDevice(d));
     gpu_contexts[d].device_id = d;
+    // Configure per-GPU max batch from env, default 8
+    const char *env_mb = getenv("GETP_MAX_BATCH");
+    int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 8;
+    gpu_contexts[d].max_batch = mb;
     gpu_copy_weights(&gpu_contexts[d].weights, &transformer->weights, &transformer->config);
-    gpu_malloc_run_state(&gpu_contexts[d].state, &transformer->config);
+    gpu_malloc_run_state(&gpu_contexts[d].state, &transformer->config, gpu_contexts[d].max_batch);
+    // Create per-slot persistent streams
+    gpu_contexts[d].slot_streams.resize(gpu_contexts[d].max_batch);
+    for (int s = 0; s < gpu_contexts[d].max_batch; ++s) {
+      HIP_CHECK(hipStreamCreate(&gpu_contexts[d].slot_streams[s]));
+    }
     // Create expert streams (up to MAX_EXPERT_STREAMS)
     gpu_contexts[d].num_expert_streams = MAX_EXPERT_STREAMS;
     for (int s = 0; s < gpu_contexts[d].num_expert_streams; ++s) {
@@ -971,6 +1106,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
   for (auto &gpu_ctx : gpu_contexts) {
     HIP_CHECK(hipSetDevice(gpu_ctx.device_id));
+    // Destroy per-slot streams
+    for (auto &st : gpu_ctx.slot_streams) {
+      if (st != nullptr) HIP_CHECK(hipStreamDestroy(st));
+    }
+    gpu_ctx.slot_streams.clear();
     for (int s = 0; s < gpu_ctx.num_expert_streams; ++s) {
       if (gpu_ctx.expert_streams[s] != nullptr) HIP_CHECK(hipStreamDestroy(gpu_ctx.expert_streams[s]));
     }
@@ -1005,7 +1145,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   const int max_steps = std::min(steps, max_ctx); // bound pos to seq_len
 
   while (pos < max_steps) {
-    float *logits = gpu_forward(transformer, token, pos, gpu_ctx);
+    float *logits = gpu_forward(transformer, token, pos, gpu_ctx, /*slot=*/0, gpu_ctx->slot_streams[0]);
 
     pos++;
     if (pos < num_prompt_tokens) {
@@ -1029,26 +1169,21 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   if (gpu_contexts.empty()) warm_up(transformer, tokenizer);
   const int num_devices = (int)gpu_contexts.size();
   if (requests->num_reqs <= 0 || num_devices <= 0) return 0;
-
-  // // 3.1. Chuẩn bị global job queue (chỉ lưu index request)
-  // MPMCQueue<int> jobq;
-  // #pragma omp parallel for
-  // for (int i = 0; i < requests->num_reqs; ++i) jobq.push(i);
-  // jobq.close(); // không còn producer nào khác → đóng để worker thoát khi hết việc
-// 3.1. Với tập request cố định: dùng chỉ số toàn cục lock-free thay vì queue
+  // Global request index for all workers (lock-free producer)
   std::atomic<int> next_idx{0};
 
   std::atomic<long long> total_out{0};
   std::vector<std::thread> workers;
   workers.reserve(num_devices);
 
-  // 3.2. Mỗi GPU là một worker: lấy chỉ số tiếp theo bằng fetch_add (work-stealing đơn giản)
+  // Continuous batching per GPU worker
   for (int t = 0; t < num_devices; ++t) {
     workers.emplace_back([&, t]() {
       HIP_CHECK(hipSetDevice(gpu_contexts[t].device_id));
-      t_ctx = &gpu_contexts[t];
+      GPUContext *ctx = &gpu_contexts[t];
+      t_ctx = ctx;
 
-      // Sampler riêng cho từng thread/GPU (seed lệch để tránh tương quan RNG)
+      // Per-thread sampler
       Sampler local_sampler;
       build_sampler(&local_sampler,
                     sampler->vocab_size,
@@ -1056,22 +1191,86 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     sampler->topp,
                     sampler->rng_state + 0x9E3779B97f4A7C15ULL * (t + 1));
 
+      struct Slot {
+        bool active = false;
+        int req_idx = -1;
+        std::vector<int> prompt;
+        int num_prompt_tokens = 0;
+        int pos = 0;
+        int token = 0;
+        int *out_ptr = nullptr;
+        int max_steps = 0; // bounded by seq_len
+      };
+
+      std::vector<Slot> slots(ctx->max_batch);
       long long local_out = 0;
 
-
-      // Vòng lặp lấy việc cho đến khi hết request
-      while (true) {
+      auto acquire_slot = [&](int sidx) {
         int idx = next_idx.fetch_add(1, std::memory_order_relaxed);
-        if (idx >= requests->num_reqs) break;
-
+        if (idx >= requests->num_reqs) return false;
+        Slot &s = slots[sidx];
+        s.active = true;
+        s.req_idx = idx;
         const char *input_seq = get_str_req_ptr(requests, idx);
-        int *output_tokens    = get_tok_gen_ptr(requests, idx);
+        s.out_ptr = get_tok_gen_ptr(requests, idx);
+        // Encode prompt
+        int alloc = (int)strlen(input_seq) + 3;
+        s.prompt.resize(alloc);
+        encode(tokenizer, input_seq, -1, -1, s.prompt.data(), &s.num_prompt_tokens,
+               transformer->config.initial_context_length);
+        // Initialize state
+        s.pos = 0;
+        s.token = s.prompt[0];
+        s.max_steps = std::min(requests->max_seq_len, transformer->config.seq_len);
+        return true;
+      };
 
-        // Chạy tuần tự trên GPU này cho request 'idx'
-        local_out += simple_getp_generate(transformer, tokenizer, &local_sampler,
-                                          input_seq, output_tokens,
-                                          requests->max_seq_len, t_ctx);
-        // Khi xong, vòng lặp quay lại pop việc mới → “work-stealing” tự nhiên
+      // Prime initial batch
+      for (int i = 0; i < ctx->max_batch; ++i) {
+        acquire_slot(i);
+      }
+
+      int active_cnt = 0;
+      for (auto &s : slots) if (s.active) active_cnt++;
+
+      while (active_cnt > 0) {
+        for (int sidx = 0; sidx < (int)slots.size(); ++sidx) {
+          Slot &s = slots[sidx];
+          if (!s.active) continue;
+
+          float *logits = gpu_forward(transformer, s.token, s.pos, ctx, sidx, ctx->slot_streams[sidx]);
+
+          s.pos++;
+          int next;
+          if (s.pos < s.num_prompt_tokens) {
+            next = s.prompt[s.pos];
+          } else {
+            next = sample(&local_sampler, logits);
+            int gen_index = s.pos - s.num_prompt_tokens - 0 + 0; // clarity
+            s.out_ptr[gen_index] = next;
+          }
+
+          bool finished = false;
+          if (next == 199999 || next == 200002) finished = true;
+          if (s.pos >= s.max_steps) finished = true; // bound pos to seq_len
+          if (s.pos >= transformer->config.seq_len) finished = true;
+
+          if (finished) {
+            int gen_tokens = std::max(0, s.pos - s.num_prompt_tokens);
+            s.out_ptr[gen_tokens] = -1;
+            local_out += (long long)(gen_tokens + 1); // include sentinel
+            s.active = false;
+            s.req_idx = -1;
+            s.prompt.clear();
+            active_cnt--;
+            // Backfill this slot with a new request if any
+            if (acquire_slot(sidx)) {
+              active_cnt++;
+            }
+          } else {
+            s.token = next;
+          }
+        }
       }
 
       total_out.fetch_add(local_out, std::memory_order_relaxed);
@@ -1089,33 +1288,37 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
 
 
-void gpu_malloc_run_state(GPURunState *s, Config *p) {
+void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   int kv_dim = p->head_dim * p->n_kv_heads;
+  size_t B = (size_t)max_batch;
 
-  HIP_CHECK(hipMalloc(&s->x,   p->hidden_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->t,   p->hidden_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->tb,  p->head_dim * p->n_attn_heads * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->tb2, p->hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->x,   B * (size_t)p->hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->t,   B * (size_t)p->hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->tb,  B * (size_t)p->head_dim * (size_t)p->n_attn_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->tb2, B * (size_t)p->hidden_dim * sizeof(float)));
 
-  HIP_CHECK(hipMalloc(&s->router_score,      p->n_experts * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->topk_v,            p->experts_per_token * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->topk_i,            p->experts_per_token * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->router_score,      B * (size_t)p->n_experts * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->topk_v,            B * (size_t)p->experts_per_token * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->topk_i,            B * (size_t)p->experts_per_token * sizeof(int)));
 
-  HIP_CHECK(hipMalloc(&s->mlp1_out, 2 * p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate,     p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->up,       p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up,  p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->e_agg,    p->hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->mlp1_out, B * 2 * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate,     B * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->up,       B * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up,  B * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->e_agg,    B * (size_t)p->hidden_dim * sizeof(float)));
 
-  HIP_CHECK(hipMalloc(&s->qkv, p->head_dim * (p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->q,   p->n_attn_heads * p->head_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->k,   p->n_kv_heads   * p->head_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->v,   p->n_kv_heads   * p->head_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->qkv, B * (size_t)p->head_dim * (size_t)(p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->q,   B * (size_t)p->n_attn_heads * (size_t)p->head_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->k,   B * (size_t)p->n_kv_heads   * (size_t)p->head_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->v,   B * (size_t)p->n_kv_heads   * (size_t)p->head_dim * sizeof(float)));
 
-  HIP_CHECK(hipMalloc(&s->key_cache,   p->n_layers * p->seq_len * kv_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->value_cache, p->n_layers * p->seq_len * kv_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->att,         p->n_attn_heads * p->seq_len * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->logits,      p->vocab_size * sizeof(float)));
+  // Allocate KV cache and att per-slot for continuous batching
+  size_t kv_cache_elems = (size_t)max_batch * (size_t)p->n_layers * (size_t)p->seq_len * (size_t)kv_dim;
+  size_t att_elems      = (size_t)max_batch * (size_t)p->n_attn_heads * (size_t)p->seq_len;
+  HIP_CHECK(hipMalloc(&s->key_cache,   kv_cache_elems * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->value_cache, kv_cache_elems * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->att,         att_elems * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->logits,      B * (size_t)p->vocab_size * sizeof(float)));
 
   if (p->sliding_window > 0) {
     HIP_CHECK(hipMalloc(&s->mask, p->seq_len * p->seq_len * sizeof(float)));
@@ -1123,19 +1326,19 @@ void gpu_malloc_run_state(GPURunState *s, Config *p) {
     s->mask = NULL;
   }
 
-  HIP_CHECK(hipMalloc(&s->cos_vals, (p->head_dim / 2) * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->sin_vals, (p->head_dim / 2) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->cos_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->sin_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
 
   // Note: acc_buffer no longer needed since we use float state directly
   s->acc_buffer = nullptr;
-  HIP_CHECK(hipMalloc(&s->logits_fp32, p->vocab_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->logits_fp32, B * (size_t)p->vocab_size * sizeof(float)));
 
   // Per-stream expert scratch buffers
-  HIP_CHECK(hipMalloc(&s->mlp1_out_s, MAX_EXPERT_STREAMS * 2 * p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_s,     MAX_EXPERT_STREAMS * p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->up_s,       MAX_EXPERT_STREAMS * p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up_s,  MAX_EXPERT_STREAMS * p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->tb2_s,      MAX_EXPERT_STREAMS * p->hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->mlp1_out_s, MAX_EXPERT_STREAMS * 2 * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_s,     MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->up_s,       MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up_s,  MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->tb2_s,      MAX_EXPERT_STREAMS * (size_t)p->hidden_dim * sizeof(float)));
 }
 
 
