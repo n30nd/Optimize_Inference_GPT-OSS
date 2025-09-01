@@ -100,6 +100,12 @@ typedef struct {
   float *up_s;         // [MAX_EXPERT_STREAMS][intermediate_dim]
   float *gate_up_s;    // [MAX_EXPERT_STREAMS][intermediate_dim]
   float *tb2_s;        // [MAX_EXPERT_STREAMS][hidden_dim]
+  // Batched MoE staging (for grouped GEMMs across slots/experts)
+  int   *sel_sids;        // [max_batch * experts_per_token]
+  int   *sel_eids;        // [max_batch * experts_per_token]
+  float *sel_w;           // [max_batch * experts_per_token]
+  float *mlp1_out_all;    // [max_batch * experts_per_token][2 * intermediate_dim]
+  float *gate_up_all;     // [max_batch * experts_per_token][intermediate_dim]
 } GPURunState;
 
 // Per-GPU device context
@@ -671,6 +677,138 @@ __global__ void residual_connection_kernel_float_batched(float *x, const float *
   }
 }
 
+// Zero e_agg for selected slots
+__global__ void zero_selected_slots_kernel_float(float *buf, int stride, const int *slot_ids, int batch) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = blockIdx.y;
+  if (b < batch) {
+    int sid = slot_ids[b];
+    float *dst = buf + (size_t)sid * (size_t)stride;
+    if (i < stride) dst[i] = 0.0f;
+  }
+}
+
+// Fused TopK + Softmax for each slot in batch, serial per-slot (thread 0)
+__global__ void topk_softmax_batched_kernel_float(const float *router_scores,
+                                                  int n, int k,
+                                                  float *topv, int *topi,
+                                                  int score_stride, int topk_stride,
+                                                  const int *slot_ids, int batch) {
+  int b = blockIdx.x;
+  if (b >= batch) return;
+  if (threadIdx.x != 0) return;
+  int sid = slot_ids[b];
+  const float *scores = router_scores + (size_t)sid * (size_t)score_stride;
+  float *topv_s = topv + (size_t)sid * (size_t)topk_stride;
+  int   *topi_s = topi + (size_t)sid * (size_t)topk_stride;
+  // init
+  for (int i = 0; i < k; ++i) { topv_s[i] = -INFINITY; topi_s[i] = -1; }
+  // top-k selection
+  for (int j = 0; j < n; ++j) {
+    float v = scores[j];
+    int pos = -1;
+    for (int t = 0; t < k; ++t) { if (v > topv_s[t]) { pos = t; break; } }
+    if (pos >= 0) {
+      for (int t = k - 1; t > pos; --t) { topv_s[t] = topv_s[t - 1]; topi_s[t] = topi_s[t - 1]; }
+      topv_s[pos] = v; topi_s[pos] = j;
+    }
+  }
+  // softmax over top-k
+  float maxv = topv_s[0];
+  for (int i = 1; i < k; ++i) if (topv_s[i] > maxv) maxv = topv_s[i];
+  float sum = 0.0f;
+  for (int i = 0; i < k; ++i) { topv_s[i] = expf(topv_s[i] - maxv); sum += topv_s[i]; }
+  float inv = 1.0f / sum;
+  for (int i = 0; i < k; ++i) topv_s[i] *= inv;
+}
+
+// Gather per-slot top-k into flattened [batch*k] lists
+__global__ void gather_topk_pairs_kernel(const float *topv, const int *topi,
+                                         const int *slot_ids, int batch, int k,
+                                         float *sel_w, int *sel_eids, int *sel_sids) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int M = batch * k;
+  if (idx < M) {
+    int b = idx / k;
+    int t = idx % k;
+    int sid = slot_ids[b];
+    sel_w[idx]    = topv[(size_t)sid * (size_t)k + t];
+    sel_eids[idx] = topi[(size_t)sid * (size_t)k + t];
+    sel_sids[idx] = sid;
+  }
+}
+
+// Grouped MLP1: for each (sid,e) pair compute y = W_mlp1[e] * t[sid] + b_mlp1[e]
+__global__ void mlp1_grouped_kernel_float(float *mlp1_out_all,
+                                          const float *t, const hip_bfloat16 *w_mlp1, const hip_bfloat16 *b_mlp1,
+                                          const int *sel_sids, const int *sel_eids,
+                                          int M, int hidden_dim, int intermediate_dim,
+                                          int layer, int n_experts) {
+  int o = blockIdx.x * blockDim.x + threadIdx.x; // output idx in [0, 2*intermediate_dim)
+  int m = blockIdx.y; // selection idx
+  int out_dim = 2 * intermediate_dim;
+  if (m < M && o < out_dim) {
+    int sid = sel_sids[m];
+    int eid = sel_eids[m];
+    const float *x = t + (size_t)sid * (size_t)hidden_dim;
+    size_t base = ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)out_dim * (size_t)hidden_dim;
+    const hip_bfloat16 *w = w_mlp1 + base + (size_t)o * (size_t)hidden_dim;
+    float sum = 0.0f;
+    for (int j = 0; j < hidden_dim; ++j) {
+      sum += bfloat16_to_float(w[j]) * x[j];
+    }
+    const hip_bfloat16 *b = b_mlp1 + ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)out_dim;
+    mlp1_out_all[(size_t)m * (size_t)out_dim + (size_t)o] = sum + bfloat16_to_float(b[o]);
+  }
+}
+
+// Split + SwiGLU batched for all selections
+__global__ void swiglu_grouped_kernel_float(float *gate_up_all, const float *mlp1_out_all,
+                                            int M, int intermediate_dim, float swiglu_limit) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; // [0, intermediate_dim)
+  int m = blockIdx.y;
+  if (m < M && i < intermediate_dim) {
+    int out_dim = 2 * intermediate_dim;
+    const float *row = mlp1_out_all + (size_t)m * (size_t)out_dim;
+    float gate = row[2 * i + 0];
+    float up   = row[2 * i + 1];
+    if (gate >  swiglu_limit) gate =  swiglu_limit;
+    if (up   >  swiglu_limit) up   =  swiglu_limit;
+    if (up   < -swiglu_limit) up   = -swiglu_limit;
+    const float alpha = 1.702f;
+    gate *= (1.0f / (1.0f + expf(-alpha * gate)));
+    float v = gate * (up + 1.0f);
+    gate_up_all[(size_t)m * (size_t)intermediate_dim + (size_t)i] = v;
+  }
+}
+
+// Grouped MLP2 + accumulate: for each (sid,e) pair compute y = W_mlp2[e] * gate_up[m] + b_mlp2[e]
+// and atomically accumulate into e_agg[sid]
+__global__ void mlp2_accum_grouped_kernel_float(float *e_agg,
+                                                const float *gate_up_all,
+                                                const hip_bfloat16 *w_mlp2, const hip_bfloat16 *b_mlp2,
+                                                const int *sel_sids, const int *sel_eids, const float *sel_w,
+                                                int M, int hidden_dim, int intermediate_dim,
+                                                int layer, int n_experts, int eagg_stride) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; // output idx in [0, hidden_dim)
+  int m = blockIdx.y;
+  if (m < M && i < hidden_dim) {
+    int sid = sel_sids[m];
+    int eid = sel_eids[m];
+    float ew = sel_w[m];
+    const float *g = gate_up_all + (size_t)m * (size_t)intermediate_dim;
+    size_t base = ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)hidden_dim * (size_t)intermediate_dim;
+    const hip_bfloat16 *w = w_mlp2 + base + (size_t)i * (size_t)intermediate_dim;
+    float sum = 0.0f;
+    for (int j = 0; j < intermediate_dim; ++j) {
+      sum += bfloat16_to_float(w[j]) * g[j];
+    }
+    const hip_bfloat16 *b = b_mlp2 + ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)hidden_dim;
+    float y = sum + bfloat16_to_float(b[i]);
+    atomicAdd(&e_agg[(size_t)sid * (size_t)eagg_stride + (size_t)i], ew * y);
+  }
+}
+
 __global__ void bf16_to_float_kernel(float *out, const hip_bfloat16 *in, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < size) {
@@ -1081,7 +1219,7 @@ float *gpu_forward(Transformer *transformer, int token, int pos, GPUContext *gpu
 }
 
 // Batched attention path over all active slots; includes embedding, per-layer
-// attention (RMSNorm->QKV->RoPE->FusedAttn->W_o+residual). MoE/FFN remains per-slot (below).
+// attention (RMSNorm->QKV->RoPE->FusedAttn->W_o+residual). MoE is batched & grouped across slots/experts.
 // host_logits_out: optional, if not null and do_final=true, copies logits of each slot
 // into host buffer packed as [batch, vocab].
 void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
@@ -1293,103 +1431,85 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         gpu_ctx->state.x, gpu_ctx->state.tb2, hidden_dim, batch, hidden_dim, gpu_ctx->d_slot_ids);
     }
 
-    // -------- MoE (per-slot; unchanged) --------
+    // -------- MoE batched & grouped across slots and experts --------
     const hip_bfloat16 *rms_ffn_w = gpu_ctx->weights.rms_ffn_w + (size_t)l * (size_t)hidden_dim;
     const hip_bfloat16 *w_router = gpu_ctx->weights.w_router + (size_t)l * (size_t)hidden_dim * (size_t)p->n_experts;
     const hip_bfloat16 *b_router = gpu_ctx->weights.b_router + (size_t)l * (size_t)p->n_experts;
-
+    // 1) FFN RMSNorm per slot
     for (int bi = 0; bi < batch; ++bi) {
       int sid = h_slot_ids[bi];
-      hipStream_t s = gpu_ctx->batch_stream; // keep on batch stream for simplicity
       dim3 block(256), grid_hidden((hidden_dim + block.x - 1) / block.x);
-      dim3 grid_intermediate((p->intermediate_dim + block.x - 1) / block.x);
-      dim3 grid_experts((p->n_experts + block.x - 1) / block.x);
-
-      // FFN RMSNorm
-      rmsnorm_kernel_float<<<grid_hidden, block, 0, s>>>(
+      rmsnorm_kernel_float<<<grid_hidden, block, 0, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.t + (size_t)sid * (size_t)hidden_dim,
         gpu_ctx->state.x + (size_t)sid * (size_t)hidden_dim,
         rms_ffn_w, hidden_dim);
-
-      // Router
-      matmul_kernel_float<<<grid_experts, block, 0, s>>>(
-        gpu_ctx->state.router_score + (size_t)sid * (size_t)p->n_experts,
-        gpu_ctx->state.t + (size_t)sid * (size_t)hidden_dim,
-        w_router, hidden_dim, p->n_experts);
-      add_bias_kernel_float<<<grid_experts, block, 0, s>>>(
-        gpu_ctx->state.router_score + (size_t)sid * (size_t)p->n_experts,
-        b_router, p->n_experts);
-
-      // GPU Top-k + softmax
-      topk_kernel_float<<<1, 1, 0, s>>>(
-        gpu_ctx->state.router_score + (size_t)sid * (size_t)p->n_experts,
+    }
+    // 2) Router matmul + bias (batched across slots)
+    {
+      dim3 block(256), grid((p->n_experts + block.x - 1) / block.x, batch);
+      matmul_kernel_float_batched<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.router_score, gpu_ctx->state.t, w_router, hidden_dim, p->n_experts,
+        batch, p->n_experts, hidden_dim, gpu_ctx->d_slot_ids);
+      add_bias_kernel_float_batched<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.router_score, b_router, p->n_experts, batch, p->n_experts, gpu_ctx->d_slot_ids);
+    }
+    // 3) Top-k + softmax on device for all slots (fused per-slot kernel)
+    {
+      dim3 grid(batch), block(1);
+      topk_softmax_batched_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.router_score, p->n_experts, p->experts_per_token,
+        gpu_ctx->state.topk_v, gpu_ctx->state.topk_i,
         p->n_experts, p->experts_per_token,
-        gpu_ctx->state.topk_v + (size_t)sid * (size_t)p->experts_per_token,
-        gpu_ctx->state.topk_i + (size_t)sid * (size_t)p->experts_per_token);
-      softmax_kernel_float<<<1, 1, 0, s>>>(
-        gpu_ctx->state.topk_v + (size_t)sid * (size_t)p->experts_per_token,
-        p->experts_per_token);
-
-      // Init aggregation
-      HIP_CHECK(hipMemsetAsync(gpu_ctx->state.e_agg + (size_t)sid * (size_t)hidden_dim, 0, hidden_dim * sizeof(float), s));
-
-      // Experts sequentially for this slot
-      for (int sel_idx = 0; sel_idx < p->experts_per_token; ++sel_idx) {
-        // Copy top-k to host to choose expert index
-        float v_host;
-        int e_host;
-        HIP_CHECK(hipMemcpyAsync(&v_host, gpu_ctx->state.topk_v + (size_t)sid * (size_t)p->experts_per_token + sel_idx,
-                                 sizeof(float), hipMemcpyDeviceToHost, s));
-        HIP_CHECK(hipMemcpyAsync(&e_host, gpu_ctx->state.topk_i + (size_t)sid * (size_t)p->experts_per_token + sel_idx,
-                                 sizeof(int), hipMemcpyDeviceToHost, s));
-        HIP_CHECK(hipStreamSynchronize(s));
-
-        const hip_bfloat16 *w_mlp1 = gpu_ctx->weights.w_mlp1 + ((size_t)l * (size_t)p->n_experts + (size_t)e_host) * (size_t)(2 * p->intermediate_dim) * (size_t)hidden_dim;
-        const hip_bfloat16 *b_mlp1 = gpu_ctx->weights.b_mlp1 + ((size_t)l * (size_t)p->n_experts + (size_t)e_host) * (size_t)(2 * p->intermediate_dim);
-        const hip_bfloat16 *w_mlp2 = gpu_ctx->weights.w_mlp2 + ((size_t)l * (size_t)p->n_experts + (size_t)e_host) * (size_t)hidden_dim * (size_t)p->intermediate_dim;
-        const hip_bfloat16 *b_mlp2 = gpu_ctx->weights.b_mlp2 + ((size_t)l * (size_t)p->n_experts + (size_t)e_host) * (size_t)hidden_dim;
-
-        dim3 grid_mlp1((2 * p->intermediate_dim + block.x - 1) / block.x);
-        matmul_kernel_float<<<grid_mlp1, block, 0, s>>>(
-          gpu_ctx->state.mlp1_out + (size_t)sid * (size_t)(2 * p->intermediate_dim),
-          gpu_ctx->state.t + (size_t)sid * (size_t)hidden_dim,
-          w_mlp1, hidden_dim, 2 * p->intermediate_dim);
-        add_bias_kernel_float<<<grid_mlp1, block, 0, s>>>(
-          gpu_ctx->state.mlp1_out + (size_t)sid * (size_t)(2 * p->intermediate_dim),
-          b_mlp1, 2 * p->intermediate_dim);
-
-        dim3 grid_mid((p->intermediate_dim + block.x - 1) / block.x);
-        split_gate_up_kernel_float<<<grid_mid, block, 0, s>>>(
-          gpu_ctx->state.gate + (size_t)sid * (size_t)p->intermediate_dim,
-          gpu_ctx->state.up   + (size_t)sid * (size_t)p->intermediate_dim,
-          gpu_ctx->state.mlp1_out + (size_t)sid * (size_t)(2 * p->intermediate_dim),
-          p->intermediate_dim);
-        swiglu_kernel_float<<<grid_mid, block, 0, s>>>(
-          gpu_ctx->state.gate_up + (size_t)sid * (size_t)p->intermediate_dim,
-          gpu_ctx->state.gate    + (size_t)sid * (size_t)p->intermediate_dim,
-          gpu_ctx->state.up      + (size_t)sid * (size_t)p->intermediate_dim,
-          p->intermediate_dim, p->swiglu_limit);
-
-        dim3 grid_out((hidden_dim + block.x - 1) / block.x);
-        matmul_kernel_float<<<grid_out, block, 0, s>>>(
-          gpu_ctx->state.tb2 + (size_t)sid * (size_t)hidden_dim,
-          gpu_ctx->state.gate_up + (size_t)sid * (size_t)p->intermediate_dim,
-          w_mlp2, p->intermediate_dim, hidden_dim);
-        add_bias_kernel_float<<<grid_out, block, 0, s>>>(
-          gpu_ctx->state.tb2 + (size_t)sid * (size_t)hidden_dim,
-          b_mlp2, hidden_dim);
-        weighted_sum_kernel_float<<<grid_out, block, 0, s>>>(
-          gpu_ctx->state.e_agg + (size_t)sid * (size_t)hidden_dim,
-          gpu_ctx->state.tb2 + (size_t)sid * (size_t)hidden_dim,
-          v_host, hidden_dim);
-      }
-
-      // Residual x += e_agg
-      dim3 grid_res((hidden_dim + block.x - 1) / block.x);
-      residual_connection_kernel_float<<<grid_res, block, 0, s>>>(
-        gpu_ctx->state.x + (size_t)sid * (size_t)hidden_dim,
-        gpu_ctx->state.e_agg + (size_t)sid * (size_t)hidden_dim,
-        hidden_dim);
+        gpu_ctx->d_slot_ids, batch);
+    }
+    // 4) Zero e_agg for selected slots
+    {
+      dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
+      zero_selected_slots_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.e_agg, hidden_dim, gpu_ctx->d_slot_ids, batch);
+    }
+    // 5) Gather top-k selections into flattened arrays [batch * K]
+    int M = batch * p->experts_per_token;
+    {
+      dim3 block(256), grid((M + block.x - 1) / block.x);
+      gather_topk_pairs_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.topk_v, gpu_ctx->state.topk_i,
+        gpu_ctx->d_slot_ids, batch, p->experts_per_token,
+        gpu_ctx->state.sel_w, gpu_ctx->state.sel_eids, gpu_ctx->state.sel_sids);
+    }
+    // 6) Grouped MLP1 across all selections
+    {
+      dim3 block(256), grid((2 * p->intermediate_dim + block.x - 1) / block.x, M);
+      mlp1_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.mlp1_out_all,
+        gpu_ctx->state.t, gpu_ctx->weights.w_mlp1, gpu_ctx->weights.b_mlp1,
+        gpu_ctx->state.sel_sids, gpu_ctx->state.sel_eids,
+        M, hidden_dim, p->intermediate_dim,
+        l, p->n_experts);
+    }
+    // 7) Split + SwiGLU batched across all selections
+    {
+      dim3 block(256), grid((p->intermediate_dim + block.x - 1) / block.x, M);
+      swiglu_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.gate_up_all, gpu_ctx->state.mlp1_out_all,
+        M, p->intermediate_dim, p->swiglu_limit);
+    }
+    // 8) Grouped MLP2 and accumulate into e_agg per slot with expert weights
+    {
+      dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, M);
+      mlp2_accum_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.e_agg,
+        gpu_ctx->state.gate_up_all,
+        gpu_ctx->weights.w_mlp2, gpu_ctx->weights.b_mlp2,
+        gpu_ctx->state.sel_sids, gpu_ctx->state.sel_eids, gpu_ctx->state.sel_w,
+        M, hidden_dim, p->intermediate_dim,
+        l, p->n_experts, hidden_dim);
+    }
+    // 9) Residual x += e_agg for selected slots
+    {
+      dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
+      residual_connection_kernel_float_batched<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.x, gpu_ctx->state.e_agg, hidden_dim, batch, hidden_dim, gpu_ctx->d_slot_ids);
     }
   }
 
@@ -1722,6 +1842,14 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->up_s,       MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->gate_up_s,  MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->tb2_s,      MAX_EXPERT_STREAMS * (size_t)p->hidden_dim * sizeof(float)));
+
+  // Grouped MoE staging buffers
+  size_t Mmax = (size_t)max_batch * (size_t)p->experts_per_token;
+  HIP_CHECK(hipMalloc(&s->sel_sids,     Mmax * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sel_eids,     Mmax * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sel_w,        Mmax * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
 }
 
 
@@ -1756,6 +1884,12 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->up_s));
   HIP_CHECK(hipFree(s->gate_up_s));
   HIP_CHECK(hipFree(s->tb2_s));
+  // Grouped MoE staging buffers
+  HIP_CHECK(hipFree(s->sel_sids));
+  HIP_CHECK(hipFree(s->sel_eids));
+  HIP_CHECK(hipFree(s->sel_w));
+  HIP_CHECK(hipFree(s->mlp1_out_all));
+  HIP_CHECK(hipFree(s->gate_up_all));
 }
 
 void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
