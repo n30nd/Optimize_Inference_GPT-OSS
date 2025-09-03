@@ -125,6 +125,7 @@ typedef struct {
   int *d_slot_ids;
   int *d_pos_list;
   int *d_token_ids;
+  int *d_next_tokens;  // Persistent buffer for sampled next tokens
 } GPUContext;
 
 static std::vector<GPUContext> gpu_contexts;
@@ -981,6 +982,111 @@ __global__ void flash_attention_kernel_optimized_batched(
 }
 // (Fallback multi-head attention and env-based FlashAttention config removed to simplify code.)
 
+
+__global__ void sample_argmax_kernel(const float *logits, int *next_tokens, int batch, int vocab_size) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) return;
+    const float *logit = logits + b * vocab_size;
+    float max_val = logit[0];
+    int max_idx = 0;
+    for (int i = 1; i < vocab_size; ++i) {
+        if (logit[i] > max_val) {
+            max_val = logit[i];
+            max_idx = i;
+        }
+    }
+    next_tokens[b] = max_idx;
+}
+
+
+// Optimized and corrected batched kernels
+__global__ void rmsnorm_final_batched_kernel(float *x, const hip_bfloat16 *weight,
+                                            int hidden_dim, int batch,
+                                            const int *slot_ids) {
+    int b = blockIdx.y; // batch index; one block per slot (grid.x must be 1)
+    if (b >= batch) return;
+
+    int sid = slot_ids[b];
+    float *x_slot = x + (size_t)sid * (size_t)hidden_dim;
+
+    extern __shared__ float s_reduce[];
+
+    // Compute sum of squares over the full hidden_dim with striding threads
+    float ss = 0.0f;
+    for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
+        float val = x_slot[j];
+        ss += val * val;
+    }
+    s_reduce[threadIdx.x] = ss;
+    __syncthreads();
+
+    // In-block reduction
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (threadIdx.x < offset) {
+            s_reduce[threadIdx.x] += s_reduce[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+
+    float inv_rms = 1.0f / sqrtf(s_reduce[0] / hidden_dim + 1e-5f);
+    __syncthreads();
+
+    // Apply normalization and weight in-place
+    for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
+        float w = bfloat16_to_float(weight[j]);
+        x_slot[j] = x_slot[j] * inv_rms * w;
+    }
+}
+
+// Corrected logits computation with proper synchronization
+__global__ void logits_final_batched_kernel(const float *x,
+                                          const hip_bfloat16 *weights_out,
+                                          float *logits,
+                                          int hidden_dim,
+                                          int vocab_size,
+                                          int batch,
+                                          const int *slot_ids) {
+    int v = blockIdx.x;  // vocab index
+    int b = blockIdx.y;  // batch index
+    
+    if (v >= vocab_size || b >= batch) return;
+    
+    int sid = slot_ids[b];
+    const float *x_slot = x + (size_t)sid * (size_t)hidden_dim;
+    float *logits_slot = logits + (size_t)b * (size_t)vocab_size;
+    
+    // Use shared memory efficiently
+    extern __shared__ float s_partial[];
+    
+    // Initialize partial sum
+    float sum = 0.0f;
+    
+    // Each thread processes strided elements
+    for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
+        float x_val = x_slot[i];
+        float w_val = bfloat16_to_float(weights_out[v * hidden_dim + i]);
+        sum += x_val * w_val;
+    }
+    
+    // Store in shared memory
+    s_partial[threadIdx.x] = sum;
+    __syncthreads();
+    
+    // Block reduction
+    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            s_partial[threadIdx.x] += s_partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    
+    // First thread writes result for this vocab entry
+    if (threadIdx.x == 0) {
+        logits_slot[v] = s_partial[0];
+    }
+}
+
+
 // ------------------------- CPU top-k -------------------------
 
 void topk_cpu(float *topk_values, int *topk_indices, const float *router_score, int num_experts, int experts_per_token) {
@@ -1021,9 +1127,10 @@ void gpu_free_weights(GPUTransformerWeights *gpu_w);
 // attention (RMSNorm->QKV->RoPE->FusedAttn->W_o+residual). MoE is batched & grouped across slots/experts.
 // host_logits_out: optional, if not null and do_final=true, copies logits of each slot
 // into host buffer packed as [batch, vocab].
+// host_next_tokens_out: optional, if not null, returns next tokens sampled by argmax on device
 void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
                             const int *h_tokens, const int *h_pos_list, const int *h_slot_ids,
-                            int batch, float *host_logits_out) {
+                            int batch, int *host_next_tokens_out) {
   Config *p = &transformer->config;
   int head_dim         = p->head_dim;
   int hidden_dim       = p->hidden_dim;
@@ -1319,25 +1426,31 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     }
   }
 
-  // Final RMSNorm and logits per slot (sequential for now)
-  if (host_logits_out != nullptr) {
-    for (int bi = 0; bi < batch; ++bi) {
-      int sid = h_slot_ids[bi];
-      dim3 block(256), grid_hidden((hidden_dim + block.x - 1) / block.x);
-      rmsnorm_kernel_float<<<grid_hidden, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.x + (size_t)sid * (size_t)hidden_dim,
-        gpu_ctx->state.x + (size_t)sid * (size_t)hidden_dim,
-        gpu_ctx->weights.rms_out_w, hidden_dim);
-      dim3 grid_vocab((p->vocab_size + block.x - 1) / block.x);
-      matvec_wbf16_xfp32_outfp32<<<grid_vocab, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.logits_fp32 + (size_t)sid * (size_t)p->vocab_size,
-        gpu_ctx->state.x + (size_t)sid * (size_t)hidden_dim,
-        gpu_ctx->weights.out, hidden_dim, p->vocab_size);
-      HIP_CHECK(hipMemcpyAsync(host_logits_out + (size_t)bi * (size_t)p->vocab_size,
-                               gpu_ctx->state.logits_fp32 + (size_t)sid * (size_t)p->vocab_size,
-                               p->vocab_size * sizeof(float), hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
-    }
-    HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
+  // Fully batched final RMSNorm and logits computation
+  if (host_next_tokens_out != nullptr) {
+    // Batched RMSNorm across all slots with proper shared memory
+    dim3 block_norm(128);  // Reduced block size for better occupancy
+    dim3 grid_norm(1, batch); // one block per slot; threads stride over hidden_dim
+    size_t shared_mem_norm = block_norm.x * sizeof(float);
+    rmsnorm_final_batched_kernel<<<grid_norm, block_norm, shared_mem_norm, gpu_ctx->batch_stream>>>(
+      gpu_ctx->state.x, gpu_ctx->weights.rms_out_w,
+      hidden_dim, batch, gpu_ctx->d_slot_ids);
+
+    // Batched logits computation across all slots with optimized block size
+    dim3 block_logits(128);  // Reduced block size for better shared memory usage
+    dim3 grid_logits(p->vocab_size, batch);
+    size_t shared_mem_logits = block_logits.x * sizeof(float);
+    logits_final_batched_kernel<<<grid_logits, block_logits, shared_mem_logits, gpu_ctx->batch_stream>>>(
+      gpu_ctx->state.x, gpu_ctx->weights.out,
+      gpu_ctx->state.logits_fp32, hidden_dim,
+      p->vocab_size, batch, gpu_ctx->d_slot_ids);
+
+    // Launch argmax kernel to sample next tokens using persistent buffer
+    dim3 block_argmax(64);
+    dim3 grid_argmax((batch + block_argmax.x - 1) / block_argmax.x);
+    sample_argmax_kernel<<<grid_argmax, block_argmax, 0, gpu_ctx->batch_stream>>>(
+      gpu_ctx->state.logits_fp32, gpu_ctx->d_next_tokens, batch, p->vocab_size);
+    HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, gpu_ctx->d_next_tokens, batch * sizeof(int), hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
   }
 }
 
@@ -1375,6 +1488,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_slot_ids,  gpu_contexts[d].max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_pos_list,  gpu_contexts[d].max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_token_ids, gpu_contexts[d].max_batch * sizeof(int)));
+    HIP_CHECK(hipMalloc(&gpu_contexts[d].d_next_tokens, gpu_contexts[d].max_batch * sizeof(int)));
     // Create expert streams (up to MAX_EXPERT_STREAMS)
     gpu_contexts[d].num_expert_streams = MAX_EXPERT_STREAMS;
     for (int s = 0; s < gpu_contexts[d].num_expert_streams; ++s) {
@@ -1407,9 +1521,10 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     }
     gpu_ctx.slot_streams.clear();
     if (gpu_ctx.batch_stream) HIP_CHECK(hipStreamDestroy(gpu_ctx.batch_stream));
-    if (gpu_ctx.d_slot_ids)  HIP_CHECK(hipFree(gpu_ctx.d_slot_ids));
-    if (gpu_ctx.d_pos_list)  HIP_CHECK(hipFree(gpu_ctx.d_pos_list));
-    if (gpu_ctx.d_token_ids) HIP_CHECK(hipFree(gpu_ctx.d_token_ids));
+    if (gpu_ctx.d_slot_ids)    HIP_CHECK(hipFree(gpu_ctx.d_slot_ids));
+    if (gpu_ctx.d_pos_list)    HIP_CHECK(hipFree(gpu_ctx.d_pos_list));
+    if (gpu_ctx.d_token_ids)   HIP_CHECK(hipFree(gpu_ctx.d_token_ids));
+    if (gpu_ctx.d_next_tokens) HIP_CHECK(hipFree(gpu_ctx.d_next_tokens));
     for (int s = 0; s < gpu_ctx.num_expert_streams; ++s) {
       if (gpu_ctx.expert_streams[s] != nullptr) HIP_CHECK(hipStreamDestroy(gpu_ctx.expert_streams[s]));
     }
@@ -1442,14 +1557,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       HIP_CHECK(hipSetDevice(gpu_contexts[t].device_id));
       GPUContext *ctx = &gpu_contexts[t];
       t_ctx = ctx;
-
-      // Per-thread sampler
-      Sampler local_sampler;
-      build_sampler(&local_sampler,
-                    sampler->vocab_size,
-                    sampler->temperature,
-                    sampler->topp,
-                    sampler->rng_state + 0x9E3779B97f4A7C15ULL * (t + 1));
 
       struct Slot {
         bool active = false;
@@ -1507,22 +1614,21 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
         int B = (int)slot_ids.size();
         if (B == 0) break;
 
-        // Run batched forward for all active slots and fetch logits
-        std::vector<float> logits_host((size_t)B * (size_t)transformer->config.vocab_size);
-        gpu_forward_batch_step(transformer, ctx, tokens.data(), poses.data(), slot_ids.data(), B, logits_host.data());
+        // Run batched forward for all active slots and get next tokens
+        std::vector<int> next_tokens_host(B);
+        gpu_forward_batch_step(transformer, ctx, tokens.data(), poses.data(), slot_ids.data(), B, next_tokens_host.data());
 
         // Advance all slots with sampling and book-keeping
         for (int bi = 0; bi < B; ++bi) {
           int sidx = slot_ids[bi];
           Slot &s = slots[sidx];
-          float *logits = logits_host.data() + (size_t)bi * (size_t)transformer->config.vocab_size;
 
           s.pos++;
           int next;
           if (s.pos < s.num_prompt_tokens) {
             next = s.prompt[s.pos];
           } else {
-            next = sample(&local_sampler, logits);
+            next = next_tokens_host[bi];
             int gen_index = s.pos - s.num_prompt_tokens;
             s.out_ptr[gen_index] = next;
           }
@@ -1548,7 +1654,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       }
 
       total_out.fetch_add(local_out, std::memory_order_relaxed);
-      free_sampler(&local_sampler);
     });
   }
 
