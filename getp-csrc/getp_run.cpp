@@ -131,6 +131,16 @@ typedef struct {
 static std::vector<GPUContext> gpu_contexts;
 static thread_local GPUContext* t_ctx = nullptr;
 
+struct Slot {
+  bool active = false;
+  int req_idx = -1;
+  std::vector<int> prompt;
+  int num_prompt_tokens = 0;
+  int pos = 0;
+  int token = 0;
+  int *out_ptr = nullptr;
+  int max_steps = 0; // bounded by seq_len
+};
 
 
 // ------------------------- BF16 utils -------------------------
@@ -748,18 +758,31 @@ __global__ void mlp1_grouped_kernel_float(float *mlp1_out_all,
                                           const int *sel_sids, const int *sel_eids,
                                           int M, int hidden_dim, int intermediate_dim,
                                           int layer, int n_experts) {
-  int o = blockIdx.x * blockDim.x + threadIdx.x; // output idx in [0, 2*intermediate_dim)
   int m = blockIdx.y; // selection idx
+  if (m >= M) return;
+
+  // Cache input vector x for this selection into shared memory once per block
+  extern __shared__ float x_shared[];
+
+  int sid = sel_sids[m];
+  int eid = sel_eids[m];
+  const float *x = t + (size_t)sid * (size_t)hidden_dim;
+
+  // Cooperative load of x into shared memory
+  for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
+    x_shared[j] = x[j];
+  }
+  __syncthreads();
+
+  int o = blockIdx.x * blockDim.x + threadIdx.x; // output idx in [0, 2*intermediate_dim)
   int out_dim = 2 * intermediate_dim;
-  if (m < M && o < out_dim) {
-    int sid = sel_sids[m];
-    int eid = sel_eids[m];
-    const float *x = t + (size_t)sid * (size_t)hidden_dim;
+  if (o < out_dim) {
     size_t base = ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)out_dim * (size_t)hidden_dim;
     const hip_bfloat16 *w = w_mlp1 + base + (size_t)o * (size_t)hidden_dim;
     float sum = 0.0f;
+    #pragma unroll 4
     for (int j = 0; j < hidden_dim; ++j) {
-      sum += bfloat16_to_float(w[j]) * x[j];
+      sum += bfloat16_to_float(w[j]) * x_shared[j];
     }
     const hip_bfloat16 *b = b_mlp1 + ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)out_dim;
     mlp1_out_all[(size_t)m * (size_t)out_dim + (size_t)o] = sum + bfloat16_to_float(b[o]);
@@ -999,7 +1022,6 @@ __global__ void sample_argmax_kernel(const float *logits, int *next_tokens, int 
 }
 
 
-// Optimized and corrected batched kernels
 __global__ void rmsnorm_final_batched_kernel(float *x, const hip_bfloat16 *weight,
                                             int hidden_dim, int batch,
                                             const int *slot_ids) {
@@ -1038,7 +1060,6 @@ __global__ void rmsnorm_final_batched_kernel(float *x, const hip_bfloat16 *weigh
     }
 }
 
-// Corrected logits computation with proper synchronization
 __global__ void logits_final_batched_kernel(const float *x,
                                           const hip_bfloat16 *weights_out,
                                           float *logits,
@@ -1393,7 +1414,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     // 6) Grouped MLP1 across all selections
     {
       dim3 block(256), grid((2 * p->intermediate_dim + block.x - 1) / block.x, M);
-      mlp1_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+      // Use dynamic shared memory to cache input vector x per selection
+      mlp1_grouped_kernel_float<<<grid, block, (size_t)hidden_dim * sizeof(float), gpu_ctx->batch_stream>>>(
         gpu_ctx->state.mlp1_out_all,
         gpu_ctx->state.t, gpu_ctx->weights.w_mlp1, gpu_ctx->weights.b_mlp1,
         gpu_ctx->state.sel_sids, gpu_ctx->state.sel_eids,
@@ -1557,17 +1579,6 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
       HIP_CHECK(hipSetDevice(gpu_contexts[t].device_id));
       GPUContext *ctx = &gpu_contexts[t];
       t_ctx = ctx;
-
-      struct Slot {
-        bool active = false;
-        int req_idx = -1;
-        std::vector<int> prompt;
-        int num_prompt_tokens = 0;
-        int pos = 0;
-        int token = 0;
-        int *out_ptr = nullptr;
-        int max_steps = 0; // bounded by seq_len
-      };
 
       std::vector<Slot> slots(ctx->max_batch);
       long long local_out = 0;
