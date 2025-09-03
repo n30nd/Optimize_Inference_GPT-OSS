@@ -809,8 +809,18 @@ __global__ void swiglu_grouped_kernel_float(float *gate_up_all, const float *mlp
   }
 }
 
+// Optimized vectorized bfloat16 to float conversion
+__device__ __forceinline__ float4 bfloat16_to_float4(const hip_bfloat16 *bf16_ptr) {
+  float4 result;
+  result.x = bfloat16_to_float(bf16_ptr[0]);
+  result.y = bfloat16_to_float(bf16_ptr[1]);
+  result.z = bfloat16_to_float(bf16_ptr[2]);
+  result.w = bfloat16_to_float(bf16_ptr[3]);
+  return result;
+}
+
 // Grouped MLP2 + accumulate: for each (sid,e) pair compute y = W_mlp2[e] * gate_up[m] + b_mlp2[e]
-// and atomically accumulate into e_agg[sid]
+// and atomically accumulate into e_agg[sid] - OPTIMIZED VERSION
 __global__ void mlp2_accum_grouped_kernel_float(float *e_agg,
                                                 const float *gate_up_all,
                                                 const hip_bfloat16 *w_mlp2, const hip_bfloat16 *b_mlp2,
@@ -826,15 +836,33 @@ __global__ void mlp2_accum_grouped_kernel_float(float *e_agg,
     const float *g = gate_up_all + (size_t)m * (size_t)intermediate_dim;
     size_t base = ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)hidden_dim * (size_t)intermediate_dim;
     const hip_bfloat16 *w = w_mlp2 + base + (size_t)i * (size_t)intermediate_dim;
+    
     float sum = 0.0f;
-    for (int j = 0; j < intermediate_dim; ++j) {
+    
+    // Vectorized computation with 4-element unrolling
+    int j = 0;
+    for (; j + 3 < intermediate_dim; j += 4) {
+      // Load 4 bfloat16 weights and convert to float4
+      float4 w_vec = bfloat16_to_float4(&w[j]);
+      // Load 4 gate values as float4
+      float4 g_vec = make_float4(g[j], g[j+1], g[j+2], g[j+3]);
+      
+      // Compute dot product
+      sum += w_vec.x * g_vec.x + w_vec.y * g_vec.y + 
+             w_vec.z * g_vec.z + w_vec.w * g_vec.w;
+    }
+    
+    // Handle remaining elements
+    for (; j < intermediate_dim; ++j) {
       sum += bfloat16_to_float(w[j]) * g[j];
     }
+    
     const hip_bfloat16 *b = b_mlp2 + ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)hidden_dim;
     float y = sum + bfloat16_to_float(b[i]);
     atomicAdd(&e_agg[(size_t)sid * (size_t)eagg_stride + (size_t)i], ew * y);
   }
 }
+
 
 __global__ void bf16_to_float_kernel(float *out, const hip_bfloat16 *in, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
