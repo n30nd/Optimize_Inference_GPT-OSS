@@ -13,6 +13,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
 #include <limits>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1034,19 +1035,80 @@ __global__ void flash_attention_kernel_optimized_batched(
 // (Fallback multi-head attention and env-based FlashAttention config removed to simplify code.)
 
 
-__global__ void sample_argmax_kernel(const float *logits, int *next_tokens, int batch, int vocab_size) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
+// Optimized argmax: one block per batch element, warp-level reduction, tie-break on lower index
+__global__ void sample_argmax_kernel(const float *__restrict__ logits,
+                                     int *__restrict__ next_tokens,
+                                     int batch, int vocab_size) {
+    int b = blockIdx.x; // one block per batch element
     if (b >= batch) return;
-    const float *logit = logits + b * vocab_size;
-    float max_val = logit[0];
-    int max_idx = 0;
-    for (int i = 1; i < vocab_size; ++i) {
-        if (logit[i] > max_val) {
-            max_val = logit[i];
-            max_idx = i;
+
+    const float *logit = logits + (size_t)b * (size_t)vocab_size;
+
+    int tid = threadIdx.x;
+    const int W = warpSize;                 // 64 on MI250
+    const int warp_id = tid / W;            // warp index in block
+    const int lane    = tid & (W - 1);      // lane index in warp
+
+    // Per-thread scan over vocab with coalesced, strided access
+    float local_max;
+    int   local_idx;
+    int i0 = tid;
+    if (i0 < vocab_size) {
+        local_max = logit[i0];
+        local_idx = i0;
+        for (int i = i0 + blockDim.x; i < vocab_size; i += blockDim.x) {
+            float v = logit[i];
+            // tie-break: prefer lower index on equal values (matches original behavior)
+            if (v > local_max || (v == local_max && i < local_idx)) {
+                local_max = v;
+                local_idx = i;
+            }
+        }
+    } else {
+        local_max = -INFINITY;
+        local_idx = INT_MAX;
+    }
+
+    // Warp-level argmax reduction (value, index) with tie-break
+    for (int offset = W >> 1; offset > 0; offset >>= 1) {
+        float v_other = __shfl_down(local_max, offset);
+        int   i_other = __shfl_down(local_idx, offset);
+        if (v_other > local_max || (v_other == local_max && i_other < local_idx)) {
+            local_max = v_other;
+            local_idx = i_other;
         }
     }
-    next_tokens[b] = max_idx;
+
+    // Shared memory holds one (val, idx) per warp
+    extern __shared__ unsigned char smem_raw[];
+    float *s_val = reinterpret_cast<float*>(smem_raw);
+    int   *s_idx = reinterpret_cast<int*>(s_val + (blockDim.x + W - 1) / W);
+
+    if (lane == 0) {
+        s_val[warp_id] = local_max;
+        s_idx[warp_id] = local_idx;
+    }
+    __syncthreads();
+
+    // Final reduction by first warp across warp results
+    if (warp_id == 0) {
+        // Number of warps participating
+        int warp_count = (blockDim.x + W - 1) / W;
+        float v = (lane < warp_count) ? s_val[lane] : -INFINITY;
+        int   i = (lane < warp_count) ? s_idx[lane] : INT_MAX;
+        // Reduce within the first warp
+        for (int offset = W >> 1; offset > 0; offset >>= 1) {
+            float v_other = __shfl_down(v, offset);
+            int   i_other = __shfl_down(i, offset);
+            if (v_other > v || (v_other == v && i_other < i)) {
+                v = v_other;
+                i = i_other;
+            }
+        }
+        if (lane == 0) {
+            next_tokens[b] = i;
+        }
+    }
 }
 
 
@@ -1495,10 +1557,11 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       gpu_ctx->state.logits_fp32, hidden_dim,
       p->vocab_size, batch, gpu_ctx->d_slot_ids);
 
-    // Launch argmax kernel to sample next tokens using persistent buffer
-    dim3 block_argmax(64);
-    dim3 grid_argmax((batch + block_argmax.x - 1) / block_argmax.x);
-    sample_argmax_kernel<<<grid_argmax, block_argmax, 0, gpu_ctx->batch_stream>>>(
+    // Launch optimized argmax kernel: one block per batch element
+    dim3 block_argmax(256); // multiples of 64 (MI250 wavefront size)
+    dim3 grid_argmax(batch);
+    size_t smem_argmax = (size_t)block_argmax.x * (sizeof(float) + sizeof(int)); // generous upper-bound
+    sample_argmax_kernel<<<grid_argmax, block_argmax, smem_argmax, gpu_ctx->batch_stream>>>(
       gpu_ctx->state.logits_fp32, gpu_ctx->d_next_tokens, batch, p->vocab_size);
     HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, gpu_ctx->d_next_tokens, batch * sizeof(int), hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
   }
