@@ -1900,9 +1900,30 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
 
   // Packed X buffer (BF16) for GEMM: K_max x Bpad
+  // int Bpad = ((max_batch + 15) / 16) * 16;
+  // size_t Kmax = (size_t)p->hidden_dim; // maximum K among GEMMs we use
+  // HIP_CHECK(hipMalloc(&s->xpack_bf16, Kmax * (size_t)Bpad * sizeof(hip_bfloat16)));
+
+  // gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch)
+
+// ...
   int Bpad = ((max_batch + 15) / 16) * 16;
-  size_t Kmax = (size_t)p->hidden_dim; // maximum K among GEMMs we use
-  HIP_CHECK(hipMalloc(&s->xpack_bf16, Kmax * (size_t)Bpad * sizeof(hip_bfloat16)));
+
+  // K dùng cho pack X:
+  // - QKV, Router: K = hidden_dim
+  // - W_O:         K = head_dim * n_attn_heads
+  size_t Kmax_xpack = std::max(
+      (size_t)p->hidden_dim,
+      (size_t)p->head_dim * (size_t)p->n_attn_heads
+  );
+
+  // Nếu sau này còn case khác, có thể mở rộng:
+  // Kmax_xpack = std::max({ (size_t)p->hidden_dim,
+  //                         (size_t)p->head_dim * (size_t)p->n_attn_heads });
+
+  HIP_CHECK(hipMalloc(&s->xpack_bf16, Kmax_xpack * (size_t)Bpad * sizeof(hip_bfloat16)));
+
+
 }
 
 
