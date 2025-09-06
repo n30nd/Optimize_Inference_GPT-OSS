@@ -50,6 +50,33 @@
 #define MAX_EXPERT_STREAMS 4
 #endif
 
+
+// 4 x float (accumulator fragment per lane)
+using v4f = __attribute__((ext_vector_type(4))) float;
+// 4 x u16 (bf16 bit-patterns per lane)
+using v4u16 = __attribute__((ext_vector_type(4))) unsigned short;
+// 8 x u16 (để load 16B = 8 * bf16)
+using v8u16 = __attribute__((ext_vector_type(8))) unsigned short;
+// 128-bit alias cho load/stor 16B
+using u32x4 = __attribute__((ext_vector_type(4))) unsigned int;
+
+__device__ __forceinline__ int lane_id()
+{
+  // wave64
+  return threadIdx.x & 63;
+}
+
+__device__ __forceinline__ v4u16 ld_bf16x4(const hip_bfloat16* p)
+{
+  // nạp 8 byte (4 * bf16) an toàn bằng 32-bit loads (hợp lệ vì hipMalloc trả pointer >= 16B aligned)
+  v4u16 v;
+  const unsigned short* s = reinterpret_cast<const unsigned short*>(p);
+  v[0] = s[0]; v[1] = s[1]; v[2] = s[2]; v[3] = s[3];
+  return v;
+}
+
+
+
 // ------------------------- GPU weights & run state -------------------------
 
 typedef struct {
@@ -458,66 +485,183 @@ __global__ void gather_pack_x_fp32_to_bf16_kernel(const float *x, hip_bfloat16 *
   }
 }
 
-// GEMM: W_packed [Mpad x Kpad] (tiles 16x16), Xpack [K x Bpad] -> scatter to dst per-slot
-// Accumulate in FP32, add bias per-row in epilogue, scatter columns via slot_ids
-__global__ void gemm16x16_bf16_packedW_batched_scatter_bias(
-    const hip_bfloat16 *W_packed,
-    const hip_bfloat16 *Xpack,
-    float *dst,
-    const hip_bfloat16 *bias,
+// // GEMM: W_packed [Mpad x Kpad] (tiles 16x16), Xpack [K x Bpad] -> scatter to dst per-slot
+// // Accumulate in FP32, add bias per-row in epilogue, scatter columns via slot_ids
+// __global__ void gemm16x16_bf16_packedW_batched_scatter_bias(
+//     const hip_bfloat16 *W_packed,
+//     const hip_bfloat16 *Xpack,
+//     float *dst,
+//     const hip_bfloat16 *bias,
+//     int M, int K, int B, int Bpad,
+//     int out_stride,
+//     const int *slot_ids,
+//     int Mpad, int Kpad) {
+
+//   // Tile indices
+//   int tile_m = blockIdx.x; // along M
+//   int tile_n = blockIdx.y; // along B
+//   int ty = threadIdx.y;    // [0..15] row within tile
+//   int tx = threadIdx.x;    // [0..15] col within tile
+
+//   int row = tile_m * 16 + ty;
+//   int col = tile_n * 16 + tx;
+
+//   const int Ktiles = (Kpad + 15) / 16;
+
+//   __shared__ hip_bfloat16 sW[16][16];
+//   __shared__ hip_bfloat16 sX[16][16];
+
+//   float acc = 0.0f;
+
+//   for (int kk = 0; kk < Ktiles; ++kk) {
+//     // Load W tile [16x16] for this block row and kk
+//     size_t w_tile_base = ((size_t)tile_m * (size_t)Ktiles + (size_t)kk) * (size_t)256;
+//     sW[ty][tx] = W_packed[w_tile_base + (size_t)ty * 16 + (size_t)tx];
+//     // Load X tile [16x16] for this kk and block col (K-major layout)
+//     int k_base = kk * 16;
+//     int b_base = tile_n * 16;
+//     hip_bfloat16 xv = float_to_bfloat16(0.0f);
+//     if (k_base + ty < Kpad && b_base + tx < Bpad) {
+//       // Safe to read from Xpack (padded with zeros in K/B as needed)
+//       xv = Xpack[(size_t)(k_base + ty) * (size_t)Bpad + (size_t)(b_base + tx)];
+//     }
+//     sX[ty][tx] = xv;
+//     __syncthreads();
+
+//     // Compute 16-way FMA in registers
+//     #pragma unroll
+//     for (int k = 0; k < 16; ++k) {
+//       float wv = bfloat16_to_float(sW[ty][k]);
+//       float xv2 = bfloat16_to_float(sX[k][tx]);
+//       acc += wv * xv2;
+//     }
+//     __syncthreads();
+//   }
+
+//   if (row < M && col < B) {
+//     if (bias) acc += bfloat16_to_float(bias[row]);
+//     int sid = slot_ids[col];
+//     float *out_s = dst + (size_t)sid * (size_t)out_stride;
+//     out_s[row] = acc;
+//   }
+// }
+// GEMM MFMA: W_packed [Mpad x Kpad] (tile 16x16, liên tục), Xpack [K x Bpad] (row-major theo K, stride = Bpad)
+// Accumulate FP32, cộng bias, scatter về từng slot (cột) qua slot_ids.
+// Mỗi block = 1 wave (64 thread) cho 1 ô 16x16 (tile_m, tile_n).
+using v4s = __attribute__((ext_vector_type(4))) short;
+__global__ __launch_bounds__(64)
+void gemm16x16_mfma_bf16_packedW_batched_scatter_bias(
+    const hip_bfloat16* __restrict__ W_packed,   // [Mpad x Kpad] packed dạng tile 16x16, liên tục 256 elems/tile
+    const hip_bfloat16* __restrict__ Xpack,      // [K x Bpad], stride = Bpad
+    float* __restrict__ dst,                     // scatter theo slot
+    const hip_bfloat16* __restrict__ bias,       // [M] hoặc nullptr
     int M, int K, int B, int Bpad,
-    int out_stride,
-    const int *slot_ids,
-    int Mpad, int Kpad) {
+    int out_stride,                              // = M
+    const int* __restrict__ slot_ids,
+    int Mpad, int Kpad)
+{
+  const int lane = threadIdx.x & 63;
+  if (blockDim.x != 64 || blockDim.y != 1) return;
 
-  // Tile indices
-  int tile_m = blockIdx.x; // along M
-  int tile_n = blockIdx.y; // along B
-  int ty = threadIdx.y;    // [0..15] row within tile
-  int tx = threadIdx.x;    // [0..15] col within tile
+  // Tile chỉ số theo M (hàng) và B (cột)
+  const int tile_m = blockIdx.x;     // tile theo M
+  const int tile_n = blockIdx.y;     // tile theo B
+  const int base_row = tile_m * 16;  // hàng bắt đầu của tile
+  const int base_col = tile_n * 16;  // cột  bắt đầu của tile
 
-  int row = tile_m * 16 + ty;
-  int col = tile_n * 16 + tx;
+  // Lane mapping CHUẨN cho MFMA 16x16x16bf16_1k
+  const int Ai   = lane % 16;           // hàng của A dùng để load
+  const int Aj0  = (lane / 16) * 4;     // 4 cột liên tiếp của A
+  const int Bj   = lane % 16;           // cột của B
+  const int Bk0  = (lane / 16) * 4;     // 4 hàng liên tiếp của B
+
+  const int Dc   = lane % 16;           // cột của D mà lane này phụ trách (trong tile)
+  const int Dr0  = (lane / 16) * 4;     // 4 hàng của D mà lane này phụ trách (trong tile)
 
   const int Ktiles = (Kpad + 15) / 16;
 
-  __shared__ hip_bfloat16 sW[16][16];
-  __shared__ hip_bfloat16 sX[16][16];
+  // Shared: 1 tile W (16x16) + 1 tile X (16x16)
+  __shared__ __align__(16) hip_bfloat16 sW[16 * 16];
+  __shared__ __align__(16) hip_bfloat16 sX[16 * 16];
 
-  float acc = 0.0f;
+  v4f acc = {0.f, 0.f, 0.f, 0.f};
 
   for (int kk = 0; kk < Ktiles; ++kk) {
-    // Load W tile [16x16] for this block row and kk
-    size_t w_tile_base = ((size_t)tile_m * (size_t)Ktiles + (size_t)kk) * (size_t)256;
-    sW[ty][tx] = W_packed[w_tile_base + (size_t)ty * 16 + (size_t)tx];
-    // Load X tile [16x16] for this kk and block col (K-major layout)
-    int k_base = kk * 16;
-    int b_base = tile_n * 16;
-    hip_bfloat16 xv = float_to_bfloat16(0.0f);
-    if (k_base + ty < Kpad && b_base + tx < Bpad) {
-      // Safe to read from Xpack (padded with zeros in K/B as needed)
-      xv = Xpack[(size_t)(k_base + ty) * (size_t)Bpad + (size_t)(b_base + tx)];
+    // ---- Tải W tile (liên tục 512B): dùng 32 lane đầu, mỗi lane copy 16B
+    if (lane < 32) {
+      const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256; // 256 = 16*16
+      const hip_bfloat16* w_src = W_packed + w_tile_base;
+      reinterpret_cast<u32x4*>(sW)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
     }
-    sX[ty][tx] = xv;
+
+    // ---- Tải X tile (16x16, stride Bpad): dùng 32 lane còn lại, mỗi lane copy nửa hàng (16B)
+    if (lane >= 32) {
+      const int vec = lane - 32;           // 0..31
+      const int r   = (vec >> 1);          // 0..15 (mỗi hàng 2 nửa: 0..7 và 8..15)
+      const int c8  = (vec & 1) * 8;       // 0 hoặc 8
+
+      const int k_row = kk * 16 + r;
+      hip_bfloat16* dst_row = sX + r * 16 + c8;
+
+      const bool in_k = (k_row < Kpad);
+      const bool in_b = (base_col + c8) < Bpad;
+
+      if (in_k && in_b) {
+        const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
+        reinterpret_cast<u32x4*>(dst_row)[0] = reinterpret_cast<const u32x4*>(src)[0]; // 16B
+      } else {
+        reinterpret_cast<u32x4*>(dst_row)[0] = u32x4{0u,0u,0u,0u};
+      }
+    }
+
     __syncthreads();
 
-    // Compute 16-way FMA in registers
-    #pragma unroll
-    for (int k = 0; k < 16; ++k) {
-      float wv = bfloat16_to_float(sW[ty][k]);
-      float xv2 = bfloat16_to_float(sX[k][tx]);
-      acc += wv * xv2;
+    // ---- Tạo a4 và b4 đúng mapping:
+    // A: hàng Ai, cột Aj0..Aj0+3 (LIÊN TIẾP)
+    v4s a4;
+    {
+      const short* rowptr = reinterpret_cast<const short*>(&sW[Ai * 16]);
+      a4[0] = rowptr[Aj0 + 0];
+      a4[1] = rowptr[Aj0 + 1];
+      a4[2] = rowptr[Aj0 + 2];
+      a4[3] = rowptr[Aj0 + 3];
     }
+    // B: hàng Bk0..Bk0+3, cột Bj
+    v4s b4;
+    {
+      const short* sx = reinterpret_cast<const short*>(sX);
+      b4[0] = sx[(Bk0 + 0) * 16 + Bj];
+      b4[1] = sx[(Bk0 + 1) * 16 + Bj];
+      b4[2] = sx[(Bk0 + 2) * 16 + Bj];
+      b4[3] = sx[(Bk0 + 3) * 16 + Bj];
+    }
+
+    // MFMA: acc = A(4) * B(4) + acc
+    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a4, b4, acc, 0, 0, 0);
+
     __syncthreads();
   }
 
-  if (row < M && col < B) {
-    if (bias) acc += bfloat16_to_float(bias[row]);
-    int sid = slot_ids[col];
-    float *out_s = dst + (size_t)sid * (size_t)out_stride;
-    out_s[row] = acc;
+  // ---- Epilogue: cộng bias và scatter về slot theo cột "col = base_col + Dc"
+  const int col = base_col + Dc;
+  if (col < B) {
+    const int sid = slot_ids[col];
+    float* out_s = dst + (size_t)sid * (size_t)out_stride;
+
+    // Mỗi lane ghi 4 HÀNG: row = base_row + (Dr0 + r)
+    #pragma unroll
+    for (int r = 0; r < 4; ++r) {
+      const int row = base_row + (Dr0 + r);
+      if (row < M) {
+        const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
+        out_s[row] = acc[r] + biasv;
+      }
+    }
   }
 }
+
+
 
 // Pack and convert FP32 row-major [M x K] to BF16 16x16 tiles with padding
 __global__ void pack_convert_fp32_to_bf16_tiles16_kernel(
@@ -1443,8 +1587,10 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     // GEMM W_qkv_packed x Xpack -> qkv (scattered per slot) + bias
     {
       const hip_bfloat16 *w_qkv_packed = gpu_ctx->weights.w_qkv_packed16 + (size_t)l * (size_t)Mpad * (size_t)Kpad;
-      dim3 block(16,16), grid((unsigned int)((Mpad + 15) / 16), (unsigned int)((Bpad + 15) / 16));
-      gemm16x16_bf16_packedW_batched_scatter_bias<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+      // dim3 block(16,16), grid((unsigned int)((Mpad + 15) / 16), (unsigned int)((Bpad + 15) / 16));
+      dim3 grid((unsigned)(Mpad + 15) / 16, (unsigned)(Bpad + 15) / 16);
+      dim3 block(64, 1, 1);
+      gemm16x16_mfma_bf16_packedW_batched_scatter_bias<<<grid, block, 0, gpu_ctx->batch_stream>>>(
         w_qkv_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.qkv, b_qkv,
         qkv_out_dim, Kqkv, batch, Bpad, qkv_out_dim, gpu_ctx->d_slot_ids, Mpad, Kpad);
     }
@@ -1507,8 +1653,10 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.tb, gpu_ctx->state.xpack_bf16, Kow, batch, Bpad2, Kow, gpu_ctx->d_slot_ids);
       const hip_bfloat16 *w_o_packed = gpu_ctx->weights.w_o_packed16 + (size_t)l * (size_t)Mpad2 * (size_t)Kpad2;
-      dim3 blockG(16,16), gridG((unsigned int)((Mpad2 + 15) / 16), (unsigned int)((Bpad2 + 15) / 16));
-      gemm16x16_bf16_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+      // dim3 blockG(16,16), gridG((unsigned int)((Mpad2 + 15) / 16), (unsigned int)((Bpad2 + 15) / 16));
+      dim3 blockG(64, 1, 1), gridG((unsigned int)((Mpad2 + 15) / 16), (unsigned int)((Bpad2 + 15) / 16));
+
+      gemm16x16_mfma_bf16_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
         w_o_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.tb2, b_o,
         Mwo, Kow, batch, Bpad2, Mwo, gpu_ctx->d_slot_ids, Mpad2, Kpad2);
     }
@@ -1545,8 +1693,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.t, gpu_ctx->state.xpack_bf16, Kr, batch, Bpadr, hidden_dim, gpu_ctx->d_slot_ids);
       const hip_bfloat16 *w_router_packed = gpu_ctx->weights.w_router_packed16 + (size_t)l * (size_t)Mpadr * (size_t)Kpadr;
-      dim3 blockG(16,16), gridG((unsigned int)((Mpadr + 15) / 16), (unsigned int)((Bpadr + 15) / 16));
-      gemm16x16_bf16_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+      // dim3 blockG(16,16), gridG((unsigned int)((Mpadr + 15) / 16), (unsigned int)((Bpadr + 15) / 16));
+      dim3 blockG(64, 1, 1), gridG((unsigned)(Mpadr + 15) / 16, (unsigned)(Bpadr + 15) / 16);
+      gemm16x16_mfma_bf16_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
         w_router_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.router_score, b_router,
         Mr, Kr, batch, Bpadr, Mr, gpu_ctx->d_slot_ids, Mpadr, Kpadr);
     }
