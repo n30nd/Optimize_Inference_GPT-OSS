@@ -96,7 +96,7 @@ typedef struct {
   hip_bfloat16 *w_mlp2;
   hip_bfloat16 *b_mlp1;
   hip_bfloat16 *b_mlp2;
-  // Packed (16x16 tiling) BF16 weights for GEMM core
+  // Packed (16x16 tiling) BF16 weights for GEMM core (convert to FP32 per tile in shared memory)
   hip_bfloat16 *w_qkv_packed16;   // [n_layers][Mpad * Kpad]
   hip_bfloat16 *w_o_packed16;     // [n_layers][Mpad * Kpad]
   hip_bfloat16 *w_router_packed16;// [n_layers][Mpad * Kpad]
@@ -128,8 +128,8 @@ typedef struct {
   // FP32 buffers for accumulation and precision-sensitive ops
   float *acc_buffer;         // x in FP32 for output matvec
   float *logits_fp32;        // final logits
-  // Packed input buffer for GEMM (BF16), size: K_max x Bpad
-  hip_bfloat16 *xpack_bf16;
+  // Packed input buffer for GEMM (FP32), size: K_max x Bpad
+  float *xpack_f32;
   // Per-stream scratch buffers for expert parallelization
   float *mlp1_out_s;   // [MAX_EXPERT_STREAMS][2 * intermediate_dim]
   float *gate_s;       // [MAX_EXPERT_STREAMS][intermediate_dim]
@@ -197,6 +197,24 @@ __global__ void convert_fp32_to_bf16_kernel(const float *fp32_data, hip_bfloat16
 __global__ void convert_bf16_to_fp32_kernel(const hip_bfloat16 *bf16_data, float *fp32_data, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < size) fp32_data[tid] = bfloat16_to_float(bf16_data[tid]);
+}
+
+// Pack X: gather FP32 inputs per-slot and pack to [K x Bpad] (FP32)
+__global__ void gather_pack_x_fp32_to_fp32_kernel(const float *x, float *xpack,
+                                                  int K, int B, int Bpad,
+                                                  int in_stride, const int *slot_ids) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = (size_t)K * (size_t)Bpad;
+  if (idx >= total) return;
+  int k = (int)(idx / Bpad);
+  int b = (int)(idx % Bpad);
+  if (b < B) {
+    int sid = slot_ids[b];
+    float v = x[(size_t)sid * (size_t)in_stride + (size_t)k];
+    xpack[(size_t)k * (size_t)Bpad + (size_t)b] = v;
+  } else {
+    xpack[(size_t)k * (size_t)Bpad + (size_t)b] = 0.0f;
+  }
 }
 
 __global__ void rmsnorm_kernel_bf16(hip_bfloat16 *o, const hip_bfloat16 *x, const hip_bfloat16 *weight, int size) {
@@ -663,6 +681,114 @@ void gemm16x16_mfma_bf16_packedW_batched_scatter_bias(
 
 
 
+// GEMM MFMA FP32: W_packed [Mpad x Kpad] (tile 16x16 contiguous), Xpack [K x Bpad] (row-major K, stride=Bpad)
+// Accumulate FP32, add BF16 bias, and scatter to per-slot outputs via slot_ids.
+// Each block computes one 16x16 tile with 64 threads (dim3 block(16,4,1)).
+__global__ __launch_bounds__(64)
+void gemm16x16_mfma_f32_packedW_batched_scatter_bias(
+    const hip_bfloat16* __restrict__ W_packed,
+    const float* __restrict__ Xpack,
+    float* __restrict__ dst,
+    const hip_bfloat16* __restrict__ bias,  // nullable
+    int M, int K, int B, int Bpad,
+    int out_stride,
+    const int* __restrict__ slot_ids,
+    int Mpad, int Kpad)
+{
+  // Thread mapping matches AMD 16x16x4f32 MFMA sample: blockDim(16,4,1)
+  const int tx = threadIdx.x;  // 0..15 -> column within tile (N)
+  const int ty = threadIdx.y;  // 0..3  -> selects k within 4-wide micro-tile and output row group
+
+  // Compute lane id for shared loads grouping
+  const int lane = ty * 16 + tx; // 0..63
+
+  const int tile_m = blockIdx.x;     // along M
+  const int tile_n = blockIdx.y;     // along B
+  const int base_row = tile_m * 16;
+  const int base_col = tile_n * 16;
+
+  const int Ktiles = (Kpad + 15) / 16;
+
+  extern __shared__ unsigned char s_mem[]; // not used; keep static allocation
+  __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
+  __shared__ __align__(16) float sWf[16 * 16];
+  __shared__ __align__(16) float sX[16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v dmn = {0.f, 0.f, 0.f, 0.f};
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    // Load W tile BF16: 16x16 contiguous (256 bf16 -> 512B). 32 lanes copy 16 bytes each.
+    if (lane < 32) {
+      const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256; // 256 elements (bf16)
+      const hip_bfloat16* w_src = W_packed + w_tile_base;
+      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+    }
+
+    // Load X tile: rows k = kk*16..+15, cols b = base_col..+15, stride Bpad
+    if (lane < 64) {
+      const int r   = lane >> 1;          // 0..31 maps to 0..15 rows, each with two half-row copies
+      const int c8  = (lane & 1) * 8;     // 0 or 8
+      const int k_row = kk * 16 + r;      // actual K row
+
+      float* dst_row = sX + r * 16 + c8;
+
+      const bool in_k = (k_row < K);      // guard by true K, not Kpad
+      const bool in_b = (base_col + c8) < Bpad;
+
+      if (in_k && in_b) {
+        const float* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
+        reinterpret_cast<u32x4*>(dst_row)[0] = reinterpret_cast<const u32x4*>(src)[0]; // 16B
+      } else {
+        reinterpret_cast<u32x4*>(dst_row)[0] = u32x4{0u,0u,0u,0u};
+      }
+    }
+
+    __syncthreads();
+
+    // Convert W tile BF16 -> FP32 in shared memory (64 lanes x 4 elems)
+    {
+      int idx4 = lane * 4;
+      if (idx4 < 256) {
+        sWf[idx4 + 0] = bfloat16_to_float(sWb[idx4 + 0]);
+        sWf[idx4 + 1] = bfloat16_to_float(sWb[idx4 + 1]);
+        sWf[idx4 + 2] = bfloat16_to_float(sWb[idx4 + 2]);
+        sWf[idx4 + 3] = bfloat16_to_float(sWb[idx4 + 3]);
+      }
+    }
+
+    // Iterate 4 micro-steps over the 16-wide K tile using MFMA 16x16x4 f32
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const int k4 = ty + 4 * t; // 0..15
+      // A: row = tx (M), col = k4
+      float amk = sWf[tx * 16 + k4];
+      // B: row = k4, col = tx (N)
+      float bkn = sX[k4 * 16 + tx];
+      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    }
+
+    __syncthreads();
+  }
+
+  // Epilogue: add bias and scatter store
+  const int col = base_col + tx;
+  if (col < B) {
+    const int sid = slot_ids[col];
+    float* out_s = dst + (size_t)sid * (size_t)out_stride;
+    // Each thread writes 4 rows: row = base_row + (ty*4 + i)
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = base_row + (ty * 4 + i);
+      if (row < M) {
+        const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
+        out_s[row] = dmn[i] + biasv;
+      }
+    }
+  }
+}
+
 // Pack and convert FP32 row-major [M x K] to BF16 16x16 tiles with padding
 __global__ void pack_convert_fp32_to_bf16_tiles16_kernel(
     const float *src_fp32, int row_offset, int rows,
@@ -682,6 +808,26 @@ __global__ void pack_convert_fp32_to_bf16_tiles16_kernel(
   size_t tiles_per_row = (size_t)(Kpad + 15) / 16;
   size_t dst_index = ((size_t)tile_m * tiles_per_row + (size_t)tile_k) * (size_t)256 + (size_t)im * 16 + (size_t)ik;
   dst_packed[dst_index] = float_to_bfloat16(src_fp32[(size_t)r * (size_t)K + (size_t)c]);
+}
+
+// Pack FP32 row-major [M x K] into FP32 16x16 tiles with zero padding
+__global__ void pack_convert_fp32_to_fp32_tiles16_kernel(
+    const float *src_fp32, int row_offset, int rows,
+    int M, int K,
+    float *dst_packed, int Mpad, int Kpad) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = (size_t)rows * (size_t)K;
+  if (idx >= total) return;
+  int r = (int)(idx / K);
+  int c = (int)(idx % K);
+  int m = row_offset + r;
+  int tile_m = m / 16;
+  int tile_k = c / 16;
+  int im = m % 16;
+  int ik = c % 16;
+  size_t tiles_per_row = (size_t)(Kpad + 15) / 16;
+  size_t dst_index = ((size_t)tile_m * tiles_per_row + (size_t)tile_k) * (size_t)256 + (size_t)im * 16 + (size_t)ik;
+  dst_packed[dst_index] = src_fp32[(size_t)r * (size_t)K + (size_t)c];
 }
 
 __global__ void add_bias_kernel_float(float *output, const hip_bfloat16 *bias, int size) {
@@ -1577,21 +1723,20 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     int Bpad = ((batch + 15) / 16) * 16;
     int Mpad = ((qkv_out_dim + 15) / 16) * 16;
     int Kpad = ((Kqkv + 15) / 16) * 16;
-    // Gather/pack inputs t -> xpack_bf16
+    // Gather/pack inputs t -> xpack_f32
     {
       size_t total = (size_t)Kqkv * (size_t)Bpad;
       dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
-      gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.t, gpu_ctx->state.xpack_bf16, Kqkv, batch, Bpad, hidden_dim, gpu_ctx->d_slot_ids);
+      gather_pack_x_fp32_to_fp32_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.t, gpu_ctx->state.xpack_f32, Kqkv, batch, Bpad, hidden_dim, gpu_ctx->d_slot_ids);
     }
     // GEMM W_qkv_packed x Xpack -> qkv (scattered per slot) + bias
     {
       const hip_bfloat16 *w_qkv_packed = gpu_ctx->weights.w_qkv_packed16 + (size_t)l * (size_t)Mpad * (size_t)Kpad;
-      // dim3 block(16,16), grid((unsigned int)((Mpad + 15) / 16), (unsigned int)((Bpad + 15) / 16));
       dim3 grid((unsigned)(Mpad + 15) / 16, (unsigned)(Bpad + 15) / 16);
-      dim3 block(64, 1, 1);
-      gemm16x16_mfma_bf16_packedW_batched_scatter_bias<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        w_qkv_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.qkv, b_qkv,
+      dim3 block(16, 4, 1);
+      gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        w_qkv_packed, gpu_ctx->state.xpack_f32, gpu_ctx->state.qkv, b_qkv,
         qkv_out_dim, Kqkv, batch, Bpad, qkv_out_dim, gpu_ctx->d_slot_ids, Mpad, Kpad);
     }
 
@@ -1647,17 +1792,16 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int Bpad2 = ((batch + 15) / 16) * 16;
       int Mpad2 = ((Mwo + 15) / 16) * 16;
       int Kpad2 = ((Kow + 15) / 16) * 16;
-      // Gather/pack tb -> xpack_bf16
+      // Gather/pack tb -> xpack_f32
       size_t total = (size_t)Kow * (size_t)Bpad2;
       dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
-      gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.tb, gpu_ctx->state.xpack_bf16, Kow, batch, Bpad2, Kow, gpu_ctx->d_slot_ids);
+      gather_pack_x_fp32_to_fp32_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.tb, gpu_ctx->state.xpack_f32, Kow, batch, Bpad2, Kow, gpu_ctx->d_slot_ids);
       const hip_bfloat16 *w_o_packed = gpu_ctx->weights.w_o_packed16 + (size_t)l * (size_t)Mpad2 * (size_t)Kpad2;
-      // dim3 blockG(16,16), gridG((unsigned int)((Mpad2 + 15) / 16), (unsigned int)((Bpad2 + 15) / 16));
-      dim3 blockG(64, 1, 1), gridG((unsigned int)((Mpad2 + 15) / 16), (unsigned int)((Bpad2 + 15) / 16));
+      dim3 blockG(16, 4, 1), gridG((unsigned int)((Mpad2 + 15) / 16), (unsigned int)((Bpad2 + 15) / 16));
 
-      gemm16x16_mfma_bf16_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
-        w_o_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.tb2, b_o,
+      gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+        w_o_packed, gpu_ctx->state.xpack_f32, gpu_ctx->state.tb2, b_o,
         Mwo, Kow, batch, Bpad2, Mwo, gpu_ctx->d_slot_ids, Mpad2, Kpad2);
     }
 
@@ -1687,16 +1831,15 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int Bpadr = ((batch + 15) / 16) * 16;
       int Mpadr = ((Mr + 15) / 16) * 16;
       int Kpadr = ((Kr + 15) / 16) * 16;
-      // Gather/pack t -> xpack_bf16
+      // Gather/pack t -> xpack_f32
       size_t total = (size_t)Kr * (size_t)Bpadr;
       dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
-      gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.t, gpu_ctx->state.xpack_bf16, Kr, batch, Bpadr, hidden_dim, gpu_ctx->d_slot_ids);
+      gather_pack_x_fp32_to_fp32_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.t, gpu_ctx->state.xpack_f32, Kr, batch, Bpadr, hidden_dim, gpu_ctx->d_slot_ids);
       const hip_bfloat16 *w_router_packed = gpu_ctx->weights.w_router_packed16 + (size_t)l * (size_t)Mpadr * (size_t)Kpadr;
-      // dim3 blockG(16,16), gridG((unsigned int)((Mpadr + 15) / 16), (unsigned int)((Bpadr + 15) / 16));
-      dim3 blockG(64, 1, 1), gridG((unsigned)(Mpadr + 15) / 16, (unsigned)(Bpadr + 15) / 16);
-      gemm16x16_mfma_bf16_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
-        w_router_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.router_score, b_router,
+      dim3 blockG(16, 4, 1), gridG((unsigned)(Mpadr + 15) / 16, (unsigned)(Bpadr + 15) / 16);
+      gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+        w_router_packed, gpu_ctx->state.xpack_f32, gpu_ctx->state.router_score, b_router,
         Mr, Kr, batch, Bpadr, Mr, gpu_ctx->d_slot_ids, Mpadr, Kpadr);
     }
     // 3) Top-k + softmax on device for all slots (fused per-slot kernel)
@@ -1842,7 +1985,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     }
   }
   
-  printf("[GPU] Warm-up done on %d device(s). BF16 weights loaded to VRAM.\n", max_devices);
+  printf("[GPU] Warm-up done on %d device(s). Packed BF16 tiles for QKV/W_O/Router loaded.\n", max_devices);
   printf("[Attention] Using FlashAttention-like optimized kernel (always on)\n");
 }
 
@@ -2070,7 +2213,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   // Kmax_xpack = std::max({ (size_t)p->hidden_dim,
   //                         (size_t)p->head_dim * (size_t)p->n_attn_heads });
 
-  HIP_CHECK(hipMalloc(&s->xpack_bf16, Kmax_xpack * (size_t)Bpad * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->xpack_f32, Kmax_xpack * (size_t)Bpad * sizeof(float)));
 
 
 }
@@ -2112,7 +2255,7 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->sel_w));
   HIP_CHECK(hipFree(s->mlp1_out_all));
   HIP_CHECK(hipFree(s->gate_up_all));
-  HIP_CHECK(hipFree(s->xpack_bf16));
+  HIP_CHECK(hipFree(s->xpack_f32));
 }
 
 void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
@@ -2219,6 +2362,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipStreamDestroy(stream));
   };
 
+
   // Counts as size_t to avoid overflow
   size_t token_embed_count = (size_t)vocab_size * (size_t)hidden_dim;
   copy_and_convert(cpu_w->token_embedding_table, &gpu_w->token_embedding_table, token_embed_count);
@@ -2231,7 +2375,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   size_t rms_out_count = (size_t)hidden_dim;
   copy_and_convert(cpu_w->rms_out_w,  &gpu_w->rms_out_w,  rms_out_count);
 
-  // Pack selected projection weights (QKV, W_O, Router) into 16x16 tiles
+  // Pack selected projection weights (QKV, W_O, Router) into 16x16 BF16 tiles
   int M_qkv = head_dim * n_attn_heads + 2 * head_dim * n_kv_heads;
   int K_qkv = hidden_dim;
   pack_weights_fp32_rowmajor_to_bf16_tiles16(cpu_w->w_qkv, &gpu_w->w_qkv_packed16, n_layers, M_qkv, K_qkv);
