@@ -727,22 +727,22 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias(
       reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
     }
 
-    // Load X tile: rows k = kk*16..+15, cols b = base_col..+15, stride Bpad
+    // Load X tile FP32: 16x16 floats (64 lanes copy 16B each = 4 floats)
     if (lane < 64) {
-      const int r   = lane >> 1;          // 0..31 maps to 0..15 rows, each with two half-row copies
-      const int c8  = (lane & 1) * 8;     // 0 or 8
+      const int r   = lane % 16;          // row within tile
+      const int c4  = (lane / 16) * 4;    // column block of 4 floats: 0,4,8,12
       const int k_row = kk * 16 + r;      // actual K row
 
-      float* dst_row = sX + r * 16 + c8;
+      float* dst_vec = sX + r * 16 + c4;
 
-      const bool in_k = (k_row < K);      // guard by true K, not Kpad
-      const bool in_b = (base_col + c8) < Bpad;
+      const bool in_k = (k_row < K);
+      const bool in_b = (base_col + c4) < Bpad;
 
       if (in_k && in_b) {
-        const float* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
-        reinterpret_cast<u32x4*>(dst_row)[0] = reinterpret_cast<const u32x4*>(src)[0]; // 16B
+        const float* src_vec = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c4;
+        reinterpret_cast<u32x4*>(dst_vec)[0] = reinterpret_cast<const u32x4*>(src_vec)[0];
       } else {
-        reinterpret_cast<u32x4*>(dst_row)[0] = u32x4{0u,0u,0u,0u};
+        reinterpret_cast<u32x4*>(dst_vec)[0] = u32x4{0u,0u,0u,0u};
       }
     }
 
@@ -2025,6 +2025,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     sample_argmax_kernel_optimized<<<grid_argmax, block_argmax, smem_argmax, gpu_ctx->batch_stream>>>(
       gpu_ctx->state.logits_fp32, gpu_ctx->d_next_tokens, batch, p->vocab_size);
     HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, gpu_ctx->d_next_tokens, batch * sizeof(int), hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
+    HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
   }
 }
 
