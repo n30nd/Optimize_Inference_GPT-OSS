@@ -1265,42 +1265,7 @@ __global__ void gather_topk_pairs_kernel(const float *topv, const int *topi,
   }
 }
 
-// Grouped MLP1: for each (sid,e) pair compute y = W_mlp1[e] * t[sid] + b_mlp1[e]
-__global__ void mlp1_grouped_kernel_float(float *mlp1_out_all,
-                                          const float *t, const hip_bfloat16 *w_mlp1, const hip_bfloat16 *b_mlp1,
-                                          const int *sel_sids, const int *sel_eids,
-                                          int M, int hidden_dim, int intermediate_dim,
-                                          int layer, int n_experts) {
-  int m = blockIdx.y; // selection idx
-  if (m >= M) return;
 
-  // Cache input vector x for this selection into shared memory once per block
-  extern __shared__ float x_shared[];
-
-  int sid = sel_sids[m];
-  int eid = sel_eids[m];
-  const float *x = t + (size_t)sid * (size_t)hidden_dim;
-
-  // Cooperative load of x into shared memory
-  for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
-    x_shared[j] = x[j];
-  }
-  __syncthreads();
-
-  int o = blockIdx.x * blockDim.x + threadIdx.x; // output idx in [0, 2*intermediate_dim)
-  int out_dim = 2 * intermediate_dim;
-  if (o < out_dim) {
-    size_t base = ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)out_dim * (size_t)hidden_dim;
-    const hip_bfloat16 *w = w_mlp1 + base + (size_t)o * (size_t)hidden_dim;
-    float sum = 0.0f;
-    #pragma unroll 4
-    for (int j = 0; j < hidden_dim; ++j) {
-      sum += bfloat16_to_float(w[j]) * x_shared[j];
-    }
-    const hip_bfloat16 *b = b_mlp1 + ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)out_dim;
-    mlp1_out_all[(size_t)m * (size_t)out_dim + (size_t)o] = sum + bfloat16_to_float(b[o]);
-  }
-}
 
 // Split + SwiGLU batched for all selections
 __global__ void swiglu_grouped_kernel_float(float *gate_up_all, const float *mlp1_out_all,
