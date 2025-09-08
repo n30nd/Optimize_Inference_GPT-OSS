@@ -53,6 +53,18 @@
 
 // 128-bit alias cho load/stor 16B
 using u32x4 = __attribute__((ext_vector_type(4))) unsigned int;
+// Optional: fast SwiGLU path (set GETP_FAST_SWIGLU=1 at compile time to enable)
+#ifndef GETP_FAST_SWIGLU
+#define GETP_FAST_SWIGLU 0
+#endif
+__device__ __forceinline__ float sigmoid_approx(float x) {
+#if GETP_FAST_SWIGLU
+  // Use fast exp for speed; acceptable small numerical drift
+  return 1.0f / (1.0f + __expf(-x));
+#else
+  return 1.0f / (1.0f + expf(-x));
+#endif
+}
 
 
 
@@ -1219,7 +1231,6 @@ void gemm16x16_mlp1_fused_swiglu_scatter(
 
   // LDS tiles
   __shared__ __align__(16) hip_bfloat16 sWb[16*16];
-  __shared__ __align__(16) float        sWf[16*16];
   __shared__ __align__(16) float        sX [16*16];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
@@ -1253,24 +1264,23 @@ void gemm16x16_mlp1_fused_swiglu_scatter(
     }
     __syncthreads();
 
-    // BF16->FP32 cho W trong LDS
-    {
-      int i4 = lane*4;
-      if (i4 < 256) {
-        sWf[i4+0] = bfloat16_to_float(sWb[i4+0]);
-        sWf[i4+1] = bfloat16_to_float(sWb[i4+1]);
-        sWf[i4+2] = bfloat16_to_float(sWb[i4+2]);
-        sWf[i4+3] = bfloat16_to_float(sWb[i4+3]);
-      }
-    }
-
-    #pragma unroll
-    for (int t = 0; t < 4; ++t) {
-      const int k4 = ty + 4*t;           // 0..15
-      float a = sWf[tx*16 + k4];         // A(M,K)
-      float b = sX [k4*16 + tx];         // B(K,N)
-      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a, b, acc, 0,0,0);
-    }
+    // Pre-convert four A scalars for MFMA micro-steps, and read B scalars into registers
+    const int k0 = ty +  0;  // 0..3
+    const int k1 = ty +  4;  // 4..7
+    const int k2 = ty +  8;  // 8..11
+    const int k3 = ty + 12;  // 12..15
+    float a0 = bfloat16_to_float(sWb[tx*16 + k0]);
+    float a1 = bfloat16_to_float(sWb[tx*16 + k1]);
+    float a2 = bfloat16_to_float(sWb[tx*16 + k2]);
+    float a3 = bfloat16_to_float(sWb[tx*16 + k3]);
+    float b0 = sX[k0*16 + tx];
+    float b1 = sX[k1*16 + tx];
+    float b2 = sX[k2*16 + tx];
+    float b3 = sX[k3*16 + tx];
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0, b0, acc, 0,0,0);
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a1, b1, acc, 0,0,0);
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a2, b2, acc, 0,0,0);
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a3, b3, acc, 0,0,0);
     __syncthreads();
   }
 
@@ -1286,22 +1296,16 @@ void gemm16x16_mlp1_fused_swiglu_scatter(
   float* out_base  = gate_up_out + (size_t)col_id * (size_t)out_stride;
 
   // Helper đọc phần tử acc theo chỉ số (tránh lấy địa chỉ phần tử vector)
-  auto comp4 = [=] __device__ (int idx) -> float {
-    // acc là float4v: {x,y,z,w}
-    return (idx == 0) ? acc.x :
-          (idx == 1) ? acc.y :
-          (idx == 2) ? acc.z : acc.w;
-  };
-
   // Mỗi thread có 4 hàng liên tiếp: (ty*4 + i), i=0..3
   // Cặp even/odd luôn nằm trong cùng thread: (0,1) và (2,3).
   #pragma unroll
-  for (int i = 0; i < 4; i += 2) {                     // i = 0, 2
+  for (int iter = 0; iter < 2; ++iter) {               // iter = 0 -> rows 0,1 ; iter = 1 -> rows 2,3
+    const int i  = iter * 2;
     const int r  = row0 + (ty*4 + i);                  // even row
     const int rp = r + 1;                              // odd row (cặp với r)
     if (r < Mout && rp < Mout) {
-      float gate = comp4(i);
-      float up   = comp4(i + 1);
+      float gate = (iter == 0) ? acc.x : acc.z;
+      float up   = (iter == 0) ? acc.y : acc.w;
       if (bias) {
         gate += bfloat16_to_float(bias[r]);
         up   += bfloat16_to_float(bias[rp]);
@@ -1310,7 +1314,7 @@ void gemm16x16_mlp1_fused_swiglu_scatter(
       gate = fminf( swiglu_limit, gate);
       up   = fminf( swiglu_limit, fmaxf(-swiglu_limit, up));
       // SwiGLU: σ(α·gate) * gate * (up + 1)
-      gate *= (1.f / (1.f + expf(-alpha * gate)));
+      gate *= sigmoid_approx(alpha * gate);
       const int row_half = r >> 1;                     // 0..I-1
       if (row_half < I) {
         out_base[row_half] = gate * (up + 1.f);
@@ -1362,14 +1366,22 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
   const hip_bfloat16* __restrict__ B = bias_all ? (bias_all + mat_index * (size_t)Mout) : nullptr;
 
   __shared__ __align__(16) hip_bfloat16 sWb[16*16];
-  __shared__ __align__(16) float        sWf[16*16];
   __shared__ __align__(16) float        sX [16*16];
+  __shared__ __align__(16) float        sBias[16];  // cache bias for this 16-row tile
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   float4v acc = {0.f,0.f,0.f,0.f};
 
   const int Ktiles = (Kpad + 15)/16;
   const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+  // Cache bias for this tile once if present
+  if (B) {
+    if (lane < 16) {
+      const int r = row0 + lane;
+      sBias[lane] = (r < Mout) ? bfloat16_to_float(B[r]) : 0.f;
+    }
+    __syncthreads();
+  }
 
   for (int kk = 0; kk < Ktiles; ++kk) {
     // Load W tile → LDS (512B, 32 lanes * 16B)
@@ -1378,15 +1390,14 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
       const hip_bfloat16* src = W_packed + w_tile;
       reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(src)[lane];
     }
-    // Load X tile 16x16 floats from globally packed X (guard with Bpad_total)
+    // Load X tile 16x16 floats from globally packed X (Bpad_total padded to 16)
     if (lane < 64) {
       const int r  = lane % 16;
       const int c4 = (lane / 16) * 4;          // 0,4,8,12
       const int k_row = kk*16 + r;
       float* dst = sX + r*16 + c4;
       const bool in_k = (k_row < K);
-      const bool in_b = (col0 + c4) < Bpad_total;
-      if (in_k && in_b) {
+      if (in_k) {
         const float* src = Xpack + (size_t)k_row * (size_t)Bpad_total + (size_t)col0 + (size_t)c4;
         reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
       } else {
@@ -1395,23 +1406,23 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
     }
     __syncthreads();
 
-    // BF16->FP32 for W in LDS
-    int i4 = lane*4;
-    if (i4 < 256) {
-      sWf[i4+0] = bfloat16_to_float(sWb[i4+0]);
-      sWf[i4+1] = bfloat16_to_float(sWb[i4+1]);
-      sWf[i4+2] = bfloat16_to_float(sWb[i4+2]);
-      sWf[i4+3] = bfloat16_to_float(sWb[i4+3]);
-    }
-    __syncthreads();
-
-    #pragma unroll
-    for (int t = 0; t < 4; ++t) {
-      const int k4 = ty + 4*t;           // 0..15
-      float a = sWf[tx*16 + k4];         // A(M,K)
-      float b = sX [k4*16 + tx];         // B(K,N)
-      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a, b, acc, 0,0,0);
-    }
+    // Pre-convert four A scalars and read B scalars into registers for the 4 micro-steps
+    const int k0 = ty +  0;  // 0..3
+    const int k1 = ty +  4;  // 4..7
+    const int k2 = ty +  8;  // 8..11
+    const int k3 = ty + 12;  // 12..15
+    float a0 = bfloat16_to_float(sWb[tx*16 + k0]);
+    float a1 = bfloat16_to_float(sWb[tx*16 + k1]);
+    float a2 = bfloat16_to_float(sWb[tx*16 + k2]);
+    float a3 = bfloat16_to_float(sWb[tx*16 + k3]);
+    float b0 = sX[k0*16 + tx];
+    float b1 = sX[k1*16 + tx];
+    float b2 = sX[k2*16 + tx];
+    float b3 = sX[k3*16 + tx];
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0, b0, acc, 0,0,0);
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a1, b1, acc, 0,0,0);
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a2, b2, acc, 0,0,0);
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a3, b3, acc, 0,0,0);
     __syncthreads();
   }
 
@@ -1425,24 +1436,22 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
   const int col_id = d_col_ids[col];
   float* out_base  = gate_up_out + (size_t)col_id * (size_t)out_stride;
 
-  auto comp4 = [=] __device__ (int idx) -> float {
-    return (idx==0)?acc.x : (idx==1)?acc.y : (idx==2)?acc.z : acc.w;
-  };
-
   #pragma unroll
-  for (int i = 0; i < 4; i += 2) {     // even/odd pairs within this thread
+  for (int iter = 0; iter < 2; ++iter) {     // even/odd pairs within this thread
+    const int i  = iter * 2;
     const int r  = row0 + (ty*4 + i);
     const int rp = r + 1;
     if (r < Mout && rp < Mout) {
-      float gate = comp4(i);
-      float up   = comp4(i + 1);
+      float gate = (iter == 0) ? acc.x : acc.z;
+      float up   = (iter == 0) ? acc.y : acc.w;
       if (B) {
-        gate += bfloat16_to_float(B[r]);
-        up   += bfloat16_to_float(B[rp]);
+        const int rloc = (ty*4 + i);
+        gate += sBias[rloc];
+        up   += sBias[rloc + 1];
       }
       gate = fminf(swiglu_limit, gate);
       up   = fminf(swiglu_limit, fmaxf(-swiglu_limit, up));
-      gate *= (1.f / (1.f + expf(-alpha * gate)));
+      gate *= sigmoid_approx(alpha * gate);
       const int row_half = r >> 1;
       if (row_half < I) {
         out_base[row_half] = gate * (up + 1.f);
