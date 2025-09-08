@@ -61,6 +61,7 @@ using u32x4 = __attribute__((ext_vector_type(4))) unsigned int;
 typedef struct {
   hip_bfloat16 *token_embedding_table;
   hip_bfloat16 *out;
+  hip_bfloat16 *w_out_packed16;  // Packed 16x16 tiles for final classifier
   hip_bfloat16 *rms_attn_w;
   hip_bfloat16 *rms_ffn_w;
   hip_bfloat16 *rms_out_w;
@@ -158,6 +159,7 @@ typedef struct {
   int *d_pos_list;
   int *d_token_ids;
   int *d_next_tokens;  // Persistent buffer for sampled next tokens
+  int *d_batch_iota;   // Identity mapping [0,1,2,...] for batch-ordered outputs
 } GPUContext;
 
 static std::vector<GPUContext> gpu_contexts;
@@ -1113,52 +1115,6 @@ __global__ void rmsnorm_final_batched_kernel(float *x, const hip_bfloat16 *weigh
     }
 }
 
-__global__ void logits_final_batched_kernel(const float *x,
-                                          const hip_bfloat16 *weights_out,
-                                          float *logits,
-                                          int hidden_dim,
-                                          int vocab_size,
-                                          int batch,
-                                          const int *slot_ids) {
-    int v = blockIdx.x;  // vocab index
-    int b = blockIdx.y;  // batch index
-    
-    if (v >= vocab_size || b >= batch) return;
-    
-    int sid = slot_ids[b];
-    const float *x_slot = x + (size_t)sid * (size_t)hidden_dim;
-    float *logits_slot = logits + (size_t)b * (size_t)vocab_size;
-    
-    // Use shared memory efficiently
-    extern __shared__ float s_partial[];
-    
-    // Initialize partial sum
-    float sum = 0.0f;
-    
-    // Each thread processes strided elements
-    for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
-        float x_val = x_slot[i];
-        float w_val = bfloat16_to_float(weights_out[v * hidden_dim + i]);
-        sum += x_val * w_val;
-    }
-    
-    // Store in shared memory
-    s_partial[threadIdx.x] = sum;
-    __syncthreads();
-    
-    // Block reduction
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            s_partial[threadIdx.x] += s_partial[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    
-    // First thread writes result for this vocab entry
-    if (threadIdx.x == 0) {
-        logits_slot[v] = s_partial[0];
-    }
-}
 
 // ------------------------- MoE kernels -------------------------
 __global__ void build_padded_offsets_kernel(const int* __restrict__ counts,
@@ -2213,14 +2169,25 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       gpu_ctx->state.x, gpu_ctx->weights.rms_out_w,
       hidden_dim, batch, gpu_ctx->d_slot_ids);
 
-    // Batched logits computation across all slots with optimized block size
-    dim3 block_logits(128);  // Reduced block size for better shared memory usage
-    dim3 grid_logits(p->vocab_size, batch);
-    size_t shared_mem_logits = block_logits.x * sizeof(float);
-    logits_final_batched_kernel<<<grid_logits, block_logits, shared_mem_logits, gpu_ctx->batch_stream>>>(
-      gpu_ctx->state.x, gpu_ctx->weights.out,
-      gpu_ctx->state.logits_fp32, hidden_dim,
-      p->vocab_size, batch, gpu_ctx->d_slot_ids);
+    // Batched logits via packed BF16 GEMM: logits = W_out @ X (batched)
+    {
+      int Mout = p->vocab_size;
+      int Kout = hidden_dim;
+      int Bpad3 = ((batch + 15) / 16) * 16;
+      int Mpad3 = ((Mout + 15) / 16) * 16;
+      int Kpad3 = ((Kout + 15) / 16) * 16;
+      // Gather/pack x -> xpack_f32 in batch order using slot_ids
+      size_t total = (size_t)Kout * (size_t)Bpad3;
+      dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
+      gather_pack_x_fp32_to_fp32_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.x, gpu_ctx->state.xpack_f32, Kout, batch, Bpad3, hidden_dim, gpu_ctx->d_slot_ids);
+      const hip_bfloat16 *w_out_packed = gpu_ctx->weights.w_out_packed16;
+      dim3 blockG(16, 4, 1), gridG((unsigned int)((Mpad3 + 15) / 16), (unsigned int)((Bpad3 + 15) / 16));
+      // Use identity mapping for output rows (b -> row b)
+      gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+        w_out_packed, gpu_ctx->state.xpack_f32, gpu_ctx->state.logits_fp32, /*bias*/nullptr,
+        Mout, Kout, batch, Bpad3, Mout, gpu_ctx->d_batch_iota, Mpad3, Kpad3);
+    }
 
     // Launch optimized argmax kernel: one block per batch element
     dim3 block_argmax(256); // must match BLOCK_SIZE used in kernel
@@ -2274,6 +2241,15 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_pos_list,  gpu_contexts[d].max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_token_ids, gpu_contexts[d].max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_next_tokens, gpu_contexts[d].max_batch * sizeof(int)));
+    // Identity mapping buffer for batch-ordered outputs (0..B-1)
+    HIP_CHECK(hipMalloc(&gpu_contexts[d].d_batch_iota, gpu_contexts[d].max_batch * sizeof(int)));
+    {
+      dim3 threads(256);
+      dim3 blocks((unsigned int)((gpu_contexts[d].max_batch + threads.x - 1) / threads.x));
+      iota_kernel<<<blocks, threads>>>(gpu_contexts[d].d_batch_iota, gpu_contexts[d].max_batch);
+      HIP_CHECK(hipGetLastError());
+      HIP_CHECK(hipDeviceSynchronize());
+    }
     // Create expert streams (up to MAX_EXPERT_STREAMS). Allow override via GETP_NUM_EXPERT_STREAMS
     int nes = MAX_EXPERT_STREAMS;
     if (const char* env_es = getenv("GETP_NUM_EXPERT_STREAMS")) {
@@ -2298,7 +2274,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     }
   }
   
-  printf("[GPU] Warm-up done on %d device(s). Packed BF16 tiles for QKV/W_O/Router/MLP1 loaded.\n", max_devices);
+  printf("[GPU] Warm-up done on %d device(s). Packed BF16 tiles for QKV/W_O/Router/MLP1/MLP2/OUT loaded.\n", max_devices);
   printf("[Attention] Using FlashAttention-like optimized kernel (always on)\n");
 }
 
@@ -2315,6 +2291,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     if (gpu_ctx.d_pos_list)    HIP_CHECK(hipFree(gpu_ctx.d_pos_list));
     if (gpu_ctx.d_token_ids)   HIP_CHECK(hipFree(gpu_ctx.d_token_ids));
     if (gpu_ctx.d_next_tokens) HIP_CHECK(hipFree(gpu_ctx.d_next_tokens));
+    if (gpu_ctx.d_batch_iota)  HIP_CHECK(hipFree(gpu_ctx.d_batch_iota));
     for (int s = 0; s < gpu_ctx.num_expert_streams; ++s) {
       if (gpu_ctx.expert_streams[s] != nullptr) HIP_CHECK(hipStreamDestroy(gpu_ctx.expert_streams[s]));
     }
@@ -2729,6 +2706,13 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   printf("[GPU#%d] Copy embed/out...\n", dev);
   copy_and_convert(cpu_w->token_embedding_table, &gpu_w->token_embedding_table, token_embed_count);
   copy_and_convert(cpu_w->out,                    &gpu_w->out,                    token_embed_count);
+  // Pack final classifier (out) into 16x16 BF16 tiles for MFMA GEMM path
+  printf("[GPU#%d] Pack OUT (vocab x hidden) into 16x16 BF16 tiles...\n", dev);
+  {
+    int M_out = vocab_size;
+    int K_out = hidden_dim;
+    pack_weights_fp32_rowmajor_to_bf16_tiles16(cpu_w->out, &gpu_w->w_out_packed16, 1, M_out, K_out);
+  }
 
   size_t rms_count = (size_t)n_layers * (size_t)hidden_dim;
   printf("[GPU#%d] Copy RMS weights...\n", dev);
@@ -2895,6 +2879,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 void gpu_free_weights(GPUTransformerWeights *gpu_w) {
   if (gpu_w->token_embedding_table) HIP_CHECK(hipFree(gpu_w->token_embedding_table));
   if (gpu_w->out)                   HIP_CHECK(hipFree(gpu_w->out));
+  if (gpu_w->w_out_packed16)        HIP_CHECK(hipFree(gpu_w->w_out_packed16));
   if (gpu_w->rms_attn_w)            HIP_CHECK(hipFree(gpu_w->rms_attn_w));
   if (gpu_w->rms_ffn_w)             HIP_CHECK(hipFree(gpu_w->rms_ffn_w));
   if (gpu_w->rms_out_w)             HIP_CHECK(hipFree(gpu_w->rms_out_w));
