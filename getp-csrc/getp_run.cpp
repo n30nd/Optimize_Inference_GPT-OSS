@@ -1204,6 +1204,54 @@ __global__ void residual_connection_kernel_float_batched(float *x, const float *
   }
 }
 
+// Batched RMSNorm (FP32): out = weight * (x / rms(x)) for each slot in batch.
+// Optimized for AMD MI250: one block per slot (grid.y = batch),
+// threads stride across hidden_dim for coalesced access; in-block reduction in shared memory.
+__global__ __launch_bounds__(256) void rmsnorm_kernel_float_batched(
+    float *__restrict__ out,                 // [slots, hidden_dim]
+    const float *__restrict__ x,             // [slots, hidden_dim]
+    const hip_bfloat16 *__restrict__ weight, // [hidden_dim]
+    int hidden_dim,
+    int batch,
+    int stride,                 // per-slot stride == hidden_dim
+    const int *slot_ids) {
+
+  int b = blockIdx.y; // slot index within the batch
+  if (b >= batch) return;
+
+  int sid = slot_ids[b];
+  const float *x_slot = x + (size_t)sid * (size_t)stride;
+  float *out_slot = out + (size_t)sid * (size_t)stride;
+
+  extern __shared__ float s_reduce[]; // size = blockDim.x
+
+  // 1) Compute sum of squares across hidden_dim with thread striding
+  float ss = 0.0f;
+  for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
+    float v = x_slot[j];
+    ss += v * v;
+  }
+  s_reduce[threadIdx.x] = ss;
+  __syncthreads();
+
+  // 2) In-block parallel reduction
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      s_reduce[threadIdx.x] += s_reduce[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+
+  // 3) Compute inverse RMS and write normalized, scaled output
+  float inv_rms = rsqrtf(s_reduce[0] / hidden_dim + 1e-5f);
+  __syncthreads();
+
+  for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
+    float w = bfloat16_to_float(weight[j]);
+    out_slot[j] = x_slot[j] * inv_rms * w;
+  }
+}
+
 // Zero e_agg for selected slots
 __global__ void zero_selected_slots_kernel_float(float *buf, int stride, const int *slot_ids, int batch) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1912,15 +1960,14 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
   // 3) Loop over layers with batched Attention and W_o
   for (int l = 0; l < p->n_layers; ++l) {
-    // RMSNorm per slot (still per-slot; can be batched later)
+    // RMSNorm (batched across slots)
     const hip_bfloat16 *rms_attn_w = gpu_ctx->weights.rms_attn_w + (size_t)l * (size_t)hidden_dim;
-    for (int bi = 0; bi < batch; ++bi) {
-      int sid = h_slot_ids[bi];
-      dim3 block(256), grid_hidden((hidden_dim + block.x - 1) / block.x);
-      rmsnorm_kernel_float<<<grid_hidden, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.t + (size_t)sid * (size_t)hidden_dim,
-        gpu_ctx->state.x + (size_t)sid * (size_t)hidden_dim,
-        rms_attn_w, hidden_dim);
+    {
+      dim3 block_norm(256), grid_norm(1, batch);
+      size_t shared_mem_norm = block_norm.x * sizeof(float);
+      rmsnorm_kernel_float_batched<<<grid_norm, block_norm, shared_mem_norm, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.t, gpu_ctx->state.x, rms_attn_w,
+        hidden_dim, batch, hidden_dim, gpu_ctx->d_slot_ids);
     }
 
     // QKV projection (batched) via packed BF16 GEMM
@@ -2024,14 +2071,13 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     // -------- MoE batched & grouped across slots and experts --------
     const hip_bfloat16 *rms_ffn_w = gpu_ctx->weights.rms_ffn_w + (size_t)l * (size_t)hidden_dim;
     const hip_bfloat16 *b_router = gpu_ctx->weights.b_router + (size_t)l * (size_t)p->n_experts;
-    // 1) FFN RMSNorm per slot
-    for (int bi = 0; bi < batch; ++bi) {
-      int sid = h_slot_ids[bi];
-      dim3 block(256), grid_hidden((hidden_dim + block.x - 1) / block.x);
-      rmsnorm_kernel_float<<<grid_hidden, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.t + (size_t)sid * (size_t)hidden_dim,
-        gpu_ctx->state.x + (size_t)sid * (size_t)hidden_dim,
-        rms_ffn_w, hidden_dim);
+    // 1) FFN RMSNorm (batched across slots)
+    {
+      dim3 block_norm(256), grid_norm(1, batch);
+      size_t shared_mem_norm = block_norm.x * sizeof(float);
+      rmsnorm_kernel_float_batched<<<grid_norm, block_norm, shared_mem_norm, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.t, gpu_ctx->state.x, rms_ffn_w,
+        hidden_dim, batch, hidden_dim, gpu_ctx->d_slot_ids);
     }
     // 2) Router matmul + bias (batched across slots) via packed BF16 GEMM
     {
