@@ -1,0 +1,28 @@
+"Name","Calls","TotalDurationNs","AverageNs","Percentage"
+"<barrier packet>",10264,357498018348,34830282,49.61236771508155
+"pack_convert_fp32_to_bf16_tiles16_kernel(float const*, int, int, int, int, hip_bfloat16*, int, int)",2293,343948432283,149999316,47.73200191794989
+"gemm16x16_mlp1_fused_swiglu_scatter(hip_bfloat16 const*, float const*, float*, hip_bfloat16 const*, int, int, int, int, int, int const*, int, int, float)",32878,8225671685,250187,1.1415309383407592
+"gemm16x16_mlp2_f32_scatter_accum(hip_bfloat16 const*, float const*, float*, hip_bfloat16 const*, float const*, int const*, int, int, int, int, int, int, int)",32878,6975544519,212164,0.9680425119242783
+"logits_final_batched_kernel(float const*, hip_bfloat16 const*, float*, int, int, int, int const*)",50,2610631317,52212626,0.3622945980680461
+"gemm16x16_mfma_f32_packedW_batched_scatter_bias(hip_bfloat16 const*, float const*, float*, hip_bfloat16 const*, int, int, int, int, int, int const*, int, int)",3600,811486879,225413,0.11261540867541739
+"pack_gateup_to_xpack_kernel(float const*, float*, int, int, int, int)",32878,165232533,5025,0.022930412939269954
+"flash_attention_kernel_optimized_batched(float const*, float const*, float const*, hip_bfloat16 const*, float*, float const*, int, int, int, int, int, int, int, int const*, bool, int, int, int, int const*, int)",1200,164249142,136874,0.022793941257202587
+"gather_pack_x_fp32_to_fp32_kernel(float const*, float*, int, int, int, int, int const*)",4800,36305159,7563,0.005038307363452771
+"topk_softmax_batched_kernel_float(float const*, int, int, float*, int*, int, int, int const*, int)",1200,35185976,29321,0.004882990926195158
+"rmsnorm_kernel_float_batched(float*, float*, hip_bfloat16 const*, float const*, int, int, int, int const*)",2400,33347241,13894,0.004627817492305546
+"apply_rotary_emb_kernel_float_batched(float*, float const*, float const*, int, int, int, int, int, int const*)",2400,11540810,4808,0.0016015946384702344
+"residual_connection_kernel_float_batched(float*, float const*, int, int, int, int const*)",1200,7464978,6220,0.0010359644375999824
+"convert_fp32_to_bf16_kernel(float const*, hip_bfloat16*, int)",19,6778568,356766,0.0009407067758074086
+"build_padded_offsets_kernel(int const*, int*, int, int)",1200,6128809,5107,0.0008505354160243621
+"gather_topk_pairs_kernel(float const*, int const*, int const*, int, int, float*, int*, int*)",1200,5895526,4912,0.0008181611890813441
+"histogram_eid_counts_kernel(int const*, int, int*, int)",1200,5881928,4901,0.0008162741045618071
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::KVWriterK::run(float const*, float*, int, int, int, int, int, int, unsigned long, int const*, int const*)",1200,5864009,4886,0.0008137873662542924
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::KVWriterV::run(float const*, float*, int, int, int, int, int, int, unsigned long, int const*, int const*)",1200,5852806,4877,0.0008122326517468374
+"zero_selected_slots_kernel_float(float*, int, int const*, int)",1200,5831051,4859,0.0008092135663134995
+"fill_padding_and_blocks_kernel(int const*, int const*, int, int, int*, int*, int*, float*, int*)",1200,5265444,4387,0.000730720536909044
+"scatter_sorted_real_kernel(int const*, int const*, float const*, int, int const*, int*, int*, int*, int*, float*)",1200,4555850,3796,0.0006322454778888672
+"sample_argmax_kernel_optimized(float const*, int*, int, int)",50,2914880,58297,0.00040451720284660406
+"iota_kernel(int*, int)",1200,2865121,2387,0.00039761181686280914
+"rmsnorm_final_batched_kernel(float*, hip_bfloat16 const*, int, int, int const*)",50,830081,16601,0.00011519583799542758
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::KernelCS::run(float*, float*, int const*, int const*, int, float, int, float, float, float, float, int)",50,342720,6854,4.7561524234132505e-05
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::'lambda'()::operator()(",50,339520,6790,4.7117439040536494e-05
