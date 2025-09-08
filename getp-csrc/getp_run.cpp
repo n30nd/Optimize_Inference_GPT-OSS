@@ -1652,15 +1652,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     // -------- MoE batched & grouped across slots and experts --------
     const hip_bfloat16 *b_router = gpu_ctx->weights.b_router + (size_t)l * (size_t)p->n_experts;
     int total_post_pad = 0;
-    // 1) FFN RMSNorm per slot
-    for (int bi = 0; bi < batch; ++bi) {
-      int sid = h_slot_ids[bi];
-      dim3 block(256), grid_hidden((hidden_dim + block.x - 1) / block.x);
-      rmsnorm_kernel_float<<<grid_hidden, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.t + (size_t)sid * (size_t)hidden_dim,
-        gpu_ctx->state.x + (size_t)sid * (size_t)hidden_dim,
-        rms_ffn_w, hidden_dim);
-    }
     // 2) Router matmul + bias (batched across slots) via packed BF16 GEMM
     {
       int Mr = p->n_experts;
