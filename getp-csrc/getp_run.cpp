@@ -1319,48 +1319,48 @@ void gemm16x16_mlp1_fused_swiglu_scatter(
   }
 
   // Epilogue fused: (2I) → I (SwiGLU) và scatter theo column id
-const int col = col0 + tx;
-if (col >= Be) return;
+  const int col = col0 + tx;
+  if (col >= Be) return;
 
-const float alpha = 1.702f;
-const int   I     = Mout >> 1;
+  const float alpha = 1.702f;
+  const int   I     = Mout >> 1;
 
-// Lấy column-id toàn cục để scatter
-const int col_id = slot_ids[col];
-float* out_base  = gate_up_out + (size_t)col_id * (size_t)out_stride;
+  // Lấy column-id toàn cục để scatter
+  const int col_id = slot_ids[col];
+  float* out_base  = gate_up_out + (size_t)col_id * (size_t)out_stride;
 
-// Helper đọc phần tử acc theo chỉ số (tránh lấy địa chỉ phần tử vector)
-auto comp4 = [&](int idx) __device__ -> float {
-  // acc là float4v: {x,y,z,w}
-  return (idx == 0) ? acc.x :
-         (idx == 1) ? acc.y :
-         (idx == 2) ? acc.z : acc.w;
-};
+  // Helper đọc phần tử acc theo chỉ số (tránh lấy địa chỉ phần tử vector)
+  auto comp4 = [=] __device__ (int idx) -> float {
+    // acc là float4v: {x,y,z,w}
+    return (idx == 0) ? acc.x :
+          (idx == 1) ? acc.y :
+          (idx == 2) ? acc.z : acc.w;
+  };
 
-// Mỗi thread có 4 hàng liên tiếp: (ty*4 + i), i=0..3
-// Cặp even/odd luôn nằm trong cùng thread: (0,1) và (2,3).
-#pragma unroll
-for (int i = 0; i < 4; i += 2) {                     // i = 0, 2
-  const int r  = row0 + (ty*4 + i);                  // even row
-  const int rp = r + 1;                              // odd row (cặp với r)
-  if (r < Mout && rp < Mout) {
-    float gate = comp4(i);
-    float up   = comp4(i + 1);
-    if (bias) {
-      gate += bfloat16_to_float(bias[r]);
-      up   += bfloat16_to_float(bias[rp]);
-    }
-    // clamp nhẹ để ổn định số học
-    gate = fminf( swiglu_limit, gate);
-    up   = fminf( swiglu_limit, fmaxf(-swiglu_limit, up));
-    // SwiGLU: σ(α·gate) * gate * (up + 1)
-    gate *= (1.f / (1.f + expf(-alpha * gate)));
-    const int row_half = r >> 1;                     // 0..I-1
-    if (row_half < I) {
-      out_base[row_half] = gate * (up + 1.f);
+  // Mỗi thread có 4 hàng liên tiếp: (ty*4 + i), i=0..3
+  // Cặp even/odd luôn nằm trong cùng thread: (0,1) và (2,3).
+  #pragma unroll
+  for (int i = 0; i < 4; i += 2) {                     // i = 0, 2
+    const int r  = row0 + (ty*4 + i);                  // even row
+    const int rp = r + 1;                              // odd row (cặp với r)
+    if (r < Mout && rp < Mout) {
+      float gate = comp4(i);
+      float up   = comp4(i + 1);
+      if (bias) {
+        gate += bfloat16_to_float(bias[r]);
+        up   += bfloat16_to_float(bias[rp]);
+      }
+      // clamp nhẹ để ổn định số học
+      gate = fminf( swiglu_limit, gate);
+      up   = fminf( swiglu_limit, fmaxf(-swiglu_limit, up));
+      // SwiGLU: σ(α·gate) * gate * (up + 1)
+      gate *= (1.f / (1.f + expf(-alpha * gate)));
+      const int row_half = r >> 1;                     // 0..I-1
+      if (row_half < I) {
+        out_base[row_half] = gate * (up + 1.f);
+      }
     }
   }
-}
 }
 
 __global__ void pack_gateup_to_xpack_kernel(const float* __restrict__ gate_up_all,
@@ -1468,7 +1468,7 @@ void gemm16x16_mlp2_f32_scatter_accum(
   float* out_s  = e_agg + (size_t)sid * (size_t)out_stride;
 
   // helper để truy cập phần tử acc
-  auto comp4 = [&](int idx) __device__ -> float {
+  auto comp4 = [=] __device__ (int idx) -> float {
     return (idx==0)?acc.x : (idx==1)?acc.y : (idx==2)?acc.z : acc.w;
   };
 
@@ -1484,8 +1484,141 @@ void gemm16x16_mlp2_f32_scatter_accum(
 }
 
 
+// Grouped MLP2 matvec using MFMA and packed BF16 weights with accumulation into e_agg.
+// For each selection m (sid,eid), compute y = W_mlp2[layer,eid] @ gate_up_all[m] + b_mlp2[layer,eid]
+// then atomically accumulate e_agg[sid] += sel_w[m] * y.
+// W is packed as 16x16 BF16 tiles (Mpad x Kpad). Accumulate in FP32.
+// Optimized: each block processes 16 contiguous selections (all from the same expert),
+// filling the 16 MFMA columns with distinct vectors. Accumulates directly into x (residual fused).
+__global__ __launch_bounds__(64)
+void mlp2_grouped_mfma_matvec_residual_kernel(
+    float* __restrict__ x,                    // [slots][hidden_dim] — destination (residual fused)
+    const float* __restrict__ gate_up_all,    // [Btotal][intermediate_dim]
+    const hip_bfloat16* __restrict__ w_packed_mlp2,
+    const hip_bfloat16* __restrict__ b_mlp2,
+    const int*   __restrict__ sorted_sids,
+    const int*   __restrict__ sorted_eids,
+    const float* __restrict__ sorted_w,
+    const int*   __restrict__ sorted_indices,
+    int Btotal,
+    int hidden_dim, int intermediate_dim,
+    int layer, int n_experts,
+    int x_stride,
+    int Mpad, int Kpad)
+{
+  // Each block computes a 16x16 tile: 16 rows (M) x 16 selections (N) for the same expert.
+  // Y-dimension of the grid is over blocks of 16 contiguous selections grouped by expert.
+  const int tx = threadIdx.x;  // 0..15 (columns)
+  const int ty = threadIdx.y;  // 0..3  (row groups)
+  const int lane = ty * 16 + tx; // 0..63
 
+  const int tile_m = blockIdx.x;         // along hidden_dim (rows)
+  const int block_b = blockIdx.y;        // block of 16 selections
+  const int col0 = block_b * 16;
+  if (col0 >= Btotal) return;
+  const int base_row = tile_m * 16;
 
+  // All 16 columns in this block share the same expert due to prior grouping/padding.
+  const int eid = sorted_eids[col0];
+
+  // Pointers per (layer,eid)
+  const size_t per_mat_elems = (size_t)Mpad * (size_t)Kpad;
+  const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
+  const hip_bfloat16* __restrict__ W = w_packed_mlp2 + mat_index * per_mat_elems;
+  const hip_bfloat16* __restrict__ B = b_mlp2 + mat_index * (size_t)hidden_dim;
+
+  __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
+  __shared__ __align__(16) float        sWf[16 * 16];
+  __shared__ __align__(16) float        sX[16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v acc = {0.f, 0.f, 0.f, 0.f};
+
+  const int K = intermediate_dim;
+  const int Ktiles = (Kpad + 15) / 16;
+  const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    // Load W tile (shared across the 16 selections in this block)
+    if (lane < 32) {
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      const hip_bfloat16* w_src = W + w_tile_base;
+      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+    }
+
+    // Load 16 columns of X for this kk tile: gather one scalar from each selection
+    if (lane < 64) {
+      const int r   = lane % 16;           // K row within tile
+      const int c4  = (lane / 16) * 4;     // column group: 0,4,8,12
+      const int k_row = kk * 16 + r;       // absolute K index
+      float* dst_vec = sX + r * 16 + c4;
+
+      float v0 = 0.f, v1 = 0.f, v2 = 0.f, v3 = 0.f;
+      if (k_row < K) {
+        // Gather from four selections (columns)
+        const int col_0 = col0 + (c4 + 0);
+        const int col_1 = col0 + (c4 + 1);
+        const int col_2 = col0 + (c4 + 2);
+        const int col_3 = col0 + (c4 + 3);
+
+        if (col_0 < Btotal) v0 = gate_up_all[(size_t)col_0 * (size_t)intermediate_dim + (size_t)k_row];
+        if (col_1 < Btotal) v1 = gate_up_all[(size_t)col_1 * (size_t)intermediate_dim + (size_t)k_row];
+        if (col_2 < Btotal) v2 = gate_up_all[(size_t)col_2 * (size_t)intermediate_dim + (size_t)k_row];
+        if (col_3 < Btotal) v3 = gate_up_all[(size_t)col_3 * (size_t)intermediate_dim + (size_t)k_row];
+      }
+      float4v vpack = {v0, v1, v2, v3};
+      reinterpret_cast<float4v*>(dst_vec)[0] = vpack;
+    }
+
+    __syncthreads();
+
+    // Convert BF16 W to FP32 in shared memory
+    int idx4 = lane * 4;
+    if (idx4 < 256) {
+      sWf[idx4 + 0] = bfloat16_to_float(sWb[idx4 + 0]);
+      sWf[idx4 + 1] = bfloat16_to_float(sWb[idx4 + 1]);
+      sWf[idx4 + 2] = bfloat16_to_float(sWb[idx4 + 2]);
+      sWf[idx4 + 3] = bfloat16_to_float(sWb[idx4 + 3]);
+    }
+
+    __syncthreads();
+
+    // MFMA accumulate
+    #pragma unroll
+    for (int t4 = 0; t4 < 4; ++t4) {
+      const int k4 = ty + 4 * t4;
+      float amk = sWf[tx * 16 + k4];
+      float bkn = sX[k4 * 16 + tx];
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, acc, 0, 0, 0);
+    }
+
+    __syncthreads();
+  }
+
+  // Helper to access accumulator lanes
+  auto comp4 = [&] __device__ (int idx) -> float {
+    return (idx==0)?acc.x : (idx==1)?acc.y : (idx==2)?acc.z : acc.w;
+  };
+
+  // Each thread contributes its 4 rows for its column (selection)
+  const int msel = col0 + tx;  // selection index for this column
+  if (msel < Btotal) {
+    const int valid_idx = sorted_indices[msel];
+    const float ew = sorted_w[msel];
+    if (valid_idx >= 0 && ew != 0.f) {
+      const int sid = sorted_sids[msel];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row = base_row + (ty * 4 + i);
+        if (row < hidden_dim) {
+          const float biasv = B ? bfloat16_to_float(B[row]) : 0.f;
+          float y = comp4(i) + biasv;
+          atomicAdd(&x[(size_t)sid * (size_t)x_stride + (size_t)row], ew * y);
+        }
+      }
+    }
+  }
+}
 
 
 
@@ -1943,122 +2076,33 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         }
       }
     }
-
-    // [BỎ HẲN] 7''') swiglu_grouped_kernel_float(...)
         
     }
 
-    // // 8) Grouped MLP2 and accumulate into e_agg per slot with expert weights (using grouped selections)
-    // {
-    //   dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, M);
-    //   mlp2_accum_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-    //     gpu_ctx->state.e_agg,
-    //     gpu_ctx->state.gate_up_all,
-    //     gpu_ctx->weights.w_mlp2, gpu_ctx->weights.b_mlp2,
-    //     gpu_ctx->state.sel_sids_grouped, gpu_ctx->state.sel_eids_grouped, gpu_ctx->state.sel_w_grouped,
-    //     M, hidden_dim, p->intermediate_dim,
-    //     l, p->n_experts, hidden_dim);
-    // }
-    // 8') MLP2 grouped GEMM (per-expert) + fused scatter-accum into e_agg
+    // 8) Grouped MLP2 via MFMA matvec (packed) with in-kernel accumulation
     {
-      const int H = p->hidden_dim;
-      const int I = p->intermediate_dim;
-      const int Mpad_mlp2 = round_up16(H);
-      const int Kpad_mlp2 = round_up16(I);
-
-      // Lấy padded_offsets về host
-      std::vector<int> h_padded2(p->n_experts + 1);
-      HIP_CHECK(hipMemcpyAsync(h_padded2.data(),
-                              gpu_ctx->state.padded_offsets,
-                              (size_t)(p->n_experts + 1) * sizeof(int),
-                              hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
-      HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
-
-      // Tính Be_max của batch này để làm bank_stride cho mỗi stream
-      int Be_max = 0;
-      for (int e = 0; e < p->n_experts; ++e) {
-        int Be = h_padded2[e+1] - h_padded2[e];
-        if (Be > Be_max) Be_max = Be;
-      }
-      const int Bpad_bank = ((Be_max + 15) / 16) * 16;
-      const size_t bank_stride = (size_t)I * (size_t)Bpad_bank; // số phần tử float / bank
-
-      // (tùy chọn) assert dung lượng xpack_f32 đủ lớn cho num_expert_streams bank
-      // if ((size_t)gpu_ctx->num_expert_streams * bank_stride > prealloc_xpack_capacity) fallback...
-
-      for (int e = 0; e < p->n_experts; ++e) {
-        int c0 = h_padded2[e];
-        int c1 = h_padded2[e+1];
-        int Be = c1 - c0;
-        if (Be <= 0) continue;
-
-        const int Bpad_e = ((Be + 15) / 16) * 16;
-
-        // chọn stream & bank theo stream
-        const int sidx = (gpu_ctx->num_expert_streams > 0) ? (e % gpu_ctx->num_expert_streams) : 0;
-        hipStream_t es = gpu_ctx->expert_streams[sidx];
-
-        float* Xbank = gpu_ctx->state.xpack_f32 + (size_t)sidx * bank_stride;
-
-        // 1) PACK gate_up_all[:, c0:c1) -> Xbank (I x Bpad_e) *** chạy TRÊN es ***
-        {
-          size_t total = (size_t)I * (size_t)Bpad_e;
-          dim3 block(256), grid((unsigned)((total + block.x - 1) / block.x));
-          pack_gateup_to_xpack_kernel<<<grid, block, 0, es>>>(
-              gpu_ctx->state.gate_up_all, // [total_post_pad x I]
-              Xbank,                      // bank riêng cho stream sidx
-              I, Be, Bpad_e, c0);
-        }
-
-        // 2) GEMM (H x I) * (I x Be) với W_packed của (l,e) *** cùng stream es ***
-        {
-          const size_t per_mat = (size_t)Mpad_mlp2 * (size_t)Kpad_mlp2;
-          const size_t idx     = (size_t)l * (size_t)p->n_experts + (size_t)e;
-          const hip_bfloat16* W = gpu_ctx->weights.w_mlp2_packed16 + idx * per_mat;
-          const hip_bfloat16* B = gpu_ctx->weights.b_mlp2 +
-                                  ((size_t)l * (size_t)p->n_experts + (size_t)e) * (size_t)H;
-
-          dim3 blockG(16,4,1);
-          dim3 gridG((unsigned)((Mpad_mlp2 + 15)/16),
-                    (unsigned)((Bpad_e     + 15)/16));
-
-          gemm16x16_mlp2_f32_scatter_accum<<<gridG, blockG, 0, es>>>(
-              W,
-              Xbank,                             // đọc đúng bank
-              gpu_ctx->state.e_agg,              // accumulate
-              B,
-              gpu_ctx->state.sorted_w   + c0,    // ew per column
-              gpu_ctx->state.sorted_sids + c0,   // col→sid
-              H, I, Be, Bpad_e, H,
-              Mpad_mlp2, Kpad_mlp2);
-        }
-      }
-
-      // Đồng bộ các expert streams về batch_stream (giữ nguyên như bạn đã làm)
-      std::vector<hipEvent_t> evts2(gpu_ctx->num_expert_streams);
-      for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
-        evts2[s] = nullptr;
-        if (gpu_ctx->expert_streams[s]) {
-          HIP_CHECK(hipEventCreateWithFlags(&evts2[s], hipEventDisableTiming));
-          HIP_CHECK(hipEventRecord(evts2[s], gpu_ctx->expert_streams[s]));
-        }
-      }
-      for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
-        if (evts2[s]) {
-          HIP_CHECK(hipStreamWaitEvent(gpu_ctx->batch_stream, evts2[s], 0));
-          HIP_CHECK(hipEventDestroy(evts2[s]));
-        }
-      }
+      int Mpad_mlp2 = ((hidden_dim + 15) / 16) * 16;
+      int Kpad_mlp2 = ((p->intermediate_dim + 15) / 16) * 16;
+      dim3 blockG2(16, 4, 1);
+      // Use total_post_pad (Btotal) selections produced by fused MLP1 scatter
+      int Btotal = total_post_pad;
+      // Launch one block per 16 contiguous selections (grouped by expert)
+      dim3 gridG2((unsigned int)((Mpad_mlp2 + 15) / 16), (unsigned int)((Btotal + 15) / 16));
+      mlp2_grouped_mfma_matvec_residual_kernel<<<gridG2, blockG2, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.x,
+        gpu_ctx->state.gate_up_all,
+        gpu_ctx->weights.w_mlp2_packed16,
+        gpu_ctx->weights.b_mlp2,
+        gpu_ctx->state.sorted_sids,
+        gpu_ctx->state.sorted_eids,
+        gpu_ctx->state.sorted_w,
+        gpu_ctx->state.sorted_indices,
+        Btotal, hidden_dim, p->intermediate_dim,
+        l, p->n_experts, hidden_dim,
+        Mpad_mlp2, Kpad_mlp2);
     }
 
-
-
-    // 9) Residual x += e_agg for selected slots
-    {
-      dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
-      residual_connection_kernel_float_batched<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.x, gpu_ctx->state.e_agg, hidden_dim, batch, hidden_dim, gpu_ctx->d_slot_ids);
-    }
+    // 9) Residual fused in step 8 (mlp2 kernel accumulates directly into x)
   }
 
   // Fully batched final RMSNorm and logits computation
@@ -2465,7 +2509,7 @@ void gpu_free_run_state(GPURunState *s) {
 }
 
 void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
-  int dev = 0; hipGetDevice(&dev);
+  int dev = 0; HIP_CHECK(hipGetDevice(&dev));
   int head_dim      = p->head_dim;
   int n_layers      = p->n_layers;
   int n_experts     = p->n_experts;
@@ -2523,7 +2567,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipStreamDestroy(stream));
 
     if (pin_ret == hipSuccess) {
-      hipHostUnregister((void*)cpu_data);
+      HIP_CHECK(hipHostUnregister((void*)cpu_data));
     }
   };
 
@@ -2577,7 +2621,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipStreamDestroy(stream));
 
     if (pin_ret == hipSuccess) {
-      hipHostUnregister((void*)cpu_data);
+      HIP_CHECK(hipHostUnregister((void*)cpu_data));
     }
   };
 
@@ -2678,7 +2722,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipFree(d_stage_fp32));
     HIP_CHECK(hipStreamDestroy(stream));
     if (pin_ret_mlp1 == hipSuccess) {
-      hipHostUnregister((void*)cpu_w->w_mlp1);
+      HIP_CHECK(hipHostUnregister((void*)cpu_w->w_mlp1));
     }
   }
 
@@ -2740,7 +2784,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipFree(d_stage_fp32));
     HIP_CHECK(hipStreamDestroy(stream));
-    if (pin_ret_mlp2 == hipSuccess) hipHostUnregister((void*)cpu_w->w_mlp2);
+    if (pin_ret_mlp2 == hipSuccess) HIP_CHECK(hipHostUnregister((void*)cpu_w->w_mlp2));
 
     // (tùy chọn) bỏ con trỏ w_mlp2 cũ, vì không còn dùng đường dot-product:
     gpu_w->w_mlp2 = nullptr;
