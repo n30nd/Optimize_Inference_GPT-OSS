@@ -129,6 +129,16 @@ typedef struct {
   int   *eid_counts;         // [n_experts]
   int   *eid_offsets;        // [n_experts + 1]
   int   *eid_cursors;        // [n_experts] for scatter
+  // --- New: Block-aligned MoE staging for MLP1 ---
+  int   *sorted_indices;     // [M_pad]  index m gốc (hoặc -1 cho pad)
+  int   *sorted_sids;        // [M_pad]  sid theo thứ tự đã sắp xếp + đệm
+  int   *sorted_eids;        // [M_pad]  eid theo thứ tự đã sắp xếp + đệm
+  float *sorted_w;           // [M_pad]  trọng số top-k; 0.0f cho pad
+  int   *padded_offsets;     // [n_experts + 1] prefix-sum sau khi align block
+  int   *block_expert_ids;   // [M_pad / BLOCK_B] expert id cho mỗi block  (BLOCK_B=16)
+  int   *d_col_ids;          // [M_pad]  iota: 0..M_pad-1 dùng để scatter output theo cột
+  float *mlp1_Ypack;         // [M_out x M_pad] với M_out = 2*intermediate_dim (layout: col-major theo "slot_id")
+
 } GPURunState;
 
 // Per-GPU device context
@@ -171,6 +181,7 @@ __device__ __forceinline__ hip_bfloat16 float_to_bfloat16(float f) {
 __device__ __host__ __forceinline__ float bfloat16_to_float(hip_bfloat16 bf) {
   return float(bf);
 }
+__host__ __device__ __forceinline__ int round_up16(int x) { return ((x + 15) / 16) * 16; }
 
 // ------------------------- Kernels -------------------------
 
@@ -799,6 +810,7 @@ __global__ void mlp2_accum_grouped_kernel_float(float *e_agg,
     int sid = sel_sids[m];
     int eid = sel_eids[m];
     float ew = sel_w[m];
+    if (ew == 0.0f) return; // PAD: bỏ qua hoàn toàn
     const float *g = gate_up_all + (size_t)m * (size_t)intermediate_dim;
     size_t base = ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)hidden_dim * (size_t)intermediate_dim;
     const hip_bfloat16 *w = w_mlp2 + base + (size_t)i * (size_t)intermediate_dim;
@@ -1111,6 +1123,81 @@ __global__ void logits_final_batched_kernel(const float *x,
     }
 }
 
+// ------------------------- MoE kernels -------------------------
+__global__ void build_padded_offsets_kernel(const int* __restrict__ counts,
+                                            int* __restrict__ padded_offsets,
+                                            int n_experts, int block_size) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  int sum = 0;
+  padded_offsets[0] = 0;
+  for (int e = 0; e < n_experts; ++e) {
+    int c = counts[e];
+    int padc = ((c + block_size - 1) / block_size) * block_size;
+    padded_offsets[e] = sum;
+    sum += padc;
+  }
+  padded_offsets[n_experts] = sum; // total_post_pad
+}
+
+__global__ void scatter_sorted_real_kernel(const int* __restrict__ sel_sids_in,
+                                           const int* __restrict__ sel_eids_in,
+                                           const float* __restrict__ sel_w_in,
+                                           int M, const int* __restrict__ padded_offsets,
+                                           int* __restrict__ eid_cursors, // zeroed
+                                           int* __restrict__ sorted_indices,
+                                           int* __restrict__ sorted_sids,
+                                           int* __restrict__ sorted_eids,
+                                           float* __restrict__ sorted_w) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= M) return;
+  int e = sel_eids_in[idx];
+  int pos = atomicAdd(&eid_cursors[e], 1);                // 0..counts[e)-1
+  int out = padded_offsets[e] + pos;
+  sorted_indices[out] = idx;
+  sorted_sids[out]    = sel_sids_in[idx];
+  sorted_eids[out]    = e;
+  sorted_w[out]       = sel_w_in[idx];
+}
+
+__global__ void fill_padding_and_blocks_kernel(const int* __restrict__ counts,
+                                               const int* __restrict__ padded_offsets,
+                                               int n_experts, int block_size,
+                                               int* __restrict__ sorted_indices,
+                                               int* __restrict__ sorted_sids,
+                                               int* __restrict__ sorted_eids,
+                                               float* __restrict__ sorted_w,
+                                               int* __restrict__ block_expert_ids) {
+  int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= n_experts) return;
+
+  int start = padded_offsets[e];
+  int c     = counts[e];
+  int padc  = ((c + block_size - 1) / block_size) * block_size;
+
+  // Fill padding slots
+  for (int i = c; i < padc; ++i) {
+    int o = start + i;
+    sorted_indices[o] = -1;
+    sorted_sids[o] = 0;
+    sorted_eids[o] = e;
+    sorted_w[o] = 0.0f;  // đánh dấu pad
+  }
+  // Set block->expert id
+  for (int b = 0; b < padc / block_size; ++b) {
+    block_expert_ids[(start / block_size) + b] = e;
+  }
+}
+
+__global__ void iota_kernel(int* a, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] = i;
+}
+
+
+
+
+
+
 
 
 
@@ -1374,6 +1461,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     // -------- MoE batched & grouped across slots and experts --------
     const hip_bfloat16 *rms_ffn_w = gpu_ctx->weights.rms_ffn_w + (size_t)l * (size_t)hidden_dim;
     const hip_bfloat16 *b_router = gpu_ctx->weights.b_router + (size_t)l * (size_t)p->n_experts;
+    int total_post_pad = 0;
     // 1) FFN RMSNorm per slot
     for (int bi = 0; bi < batch; ++bi) {
       int sid = h_slot_ids[bi];
@@ -1434,56 +1522,136 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 blockH(256), gridH((M + blockH.x - 1) / blockH.x);
       histogram_eid_counts_kernel<<<gridH, blockH, 0, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.sel_eids, M, gpu_ctx->state.eid_counts, p->n_experts);
-      // Exclusive prefix sum to offsets (device-side, single thread)
-      exclusive_prefix_sum_small_kernel<<<1, 1, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.eid_counts, gpu_ctx->state.eid_offsets, p->n_experts);
-      // Scatter into grouped arrays
-      scatter_group_by_eid_kernel<<<gridH, blockH, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.sel_sids, gpu_ctx->state.sel_eids, gpu_ctx->state.sel_w, M,
-        gpu_ctx->state.eid_offsets, gpu_ctx->state.eid_cursors,
-        gpu_ctx->state.sel_sids_grouped, gpu_ctx->state.sel_eids_grouped, gpu_ctx->state.sel_w_grouped,
-        p->n_experts);
+      // 6') Xây prefix-sum đã đệm theo BLOCK_B
+      const int BLOCK_B = (getenv("GETP_MOE_BLOCK") ? std::max(1, atoi(getenv("GETP_MOE_BLOCK"))) : 16);
+      build_padded_offsets_kernel<<<1,1,0,gpu_ctx->batch_stream>>>(
+          gpu_ctx->state.eid_counts,
+          gpu_ctx->state.padded_offsets,
+          p->n_experts, BLOCK_B);
+
+      // Lấy total_post_pad từ padded_offsets[n_experts]
+      // int total_post_pad = 0;
+      HIP_CHECK(hipMemcpyAsync(&total_post_pad,
+                              gpu_ctx->state.padded_offsets + p->n_experts,
+                              sizeof(int),
+                              hipMemcpyDeviceToHost,
+                              gpu_ctx->batch_stream));
+      HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
+
+      // Reset cursors để scatter
+      HIP_CHECK(hipMemsetAsync(gpu_ctx->state.eid_cursors, 0,
+                              (size_t)p->n_experts * sizeof(int),
+                              gpu_ctx->batch_stream));
+
+      // 6'') Scatter các selection thật theo expert vào vùng đã sort
+      {
+        int threads = 256;
+        int blocks  = (M + threads - 1) / threads;
+        scatter_sorted_real_kernel<<<blocks, threads, 0, gpu_ctx->batch_stream>>>(
+            gpu_ctx->state.sel_sids, gpu_ctx->state.sel_eids, gpu_ctx->state.sel_w,
+            M,
+            gpu_ctx->state.padded_offsets,
+            gpu_ctx->state.eid_cursors,
+            gpu_ctx->state.sorted_indices,
+            gpu_ctx->state.sorted_sids,
+            gpu_ctx->state.sorted_eids,
+            gpu_ctx->state.sorted_w);
+      }
+
+      // 6''') Điền padding + block→expert id
+      {
+        int threads = 128;
+        int blocks  = (p->n_experts + threads - 1) / threads;
+        fill_padding_and_blocks_kernel<<<blocks, threads, 0, gpu_ctx->batch_stream>>>(
+            gpu_ctx->state.eid_counts,
+            gpu_ctx->state.padded_offsets,
+            p->n_experts, BLOCK_B,
+            gpu_ctx->state.sorted_indices,
+            gpu_ctx->state.sorted_sids,
+            gpu_ctx->state.sorted_eids,
+            gpu_ctx->state.sorted_w,
+            gpu_ctx->state.block_expert_ids);
+      }
+
+      // 6'''') Chuẩn bị iota cột toàn cục 0..total_post_pad-1
+      {
+        int threads = 256;
+        int blocks  = (total_post_pad + threads - 1) / threads;
+        iota_kernel<<<blocks, threads, 0, gpu_ctx->batch_stream>>>(
+            gpu_ctx->state.d_col_ids, total_post_pad);
+      }
+
     }
-    // 7) Fused MLP1+SwiGLU per expert group (auto-pad weights dims; no small-case fallback)
+    {
+        // 7') Pack X cho MLP1 theo thứ tự đã sort+pad
+    int Kmlp1 = p->hidden_dim;
+    int Bmlp1 = total_post_pad;
+    int Bpad_total = round_up16(Bmlp1); // Bpad dùng khi pack (toàn cục)
+    {
+      size_t total = (size_t)Kmlp1 * (size_t)Bpad_total;
+      dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
+      gather_pack_x_fp32_to_fp32_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+          gpu_ctx->state.t,            // nguồn: x đã RMSNorm-FFN per-slot
+          gpu_ctx->state.xpack_f32,    // đích:  [K x Bpad_total]
+          Kmlp1,
+          Bmlp1,
+          Bpad_total,
+          p->hidden_dim,
+          gpu_ctx->state.sorted_sids   // cột b → sid = sorted_sids[b]
+      );
+    }
+        // 7'') GEMM MLP1 per-expert (B theo expert đã căn block)
     {
       int Mout = 2 * p->intermediate_dim;
-      int Mpad_mlp1 = ((Mout + 15) / 16) * 16;
-      int Kpad_mlp1 = ((hidden_dim + 15) / 16) * 16;
-      dim3 blockG(16, 4, 1);
+      int Mpad_mlp1 = round_up16(Mout);
+      int Kpad_mlp1 = round_up16(p->hidden_dim);
 
-      // Copy counts+offsets to host to drive per-expert launches
-      std::vector<int> h_counts(p->n_experts);
-      std::vector<int> h_offsets(p->n_experts + 1);
-      HIP_CHECK(hipMemcpyAsync(h_counts.data(),  gpu_ctx->state.eid_counts,  (size_t)p->n_experts * sizeof(int), hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
+      // Lấy padded_offsets về host để biết [c0, c1) từng expert
+      std::vector<int> h_padded(p->n_experts + 1);
+      HIP_CHECK(hipMemcpyAsync(h_padded.data(),
+                               gpu_ctx->state.padded_offsets,
+                               (size_t)(p->n_experts + 1) * sizeof(int),
+                               hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
       HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
-      // Build host offsets locally to avoid extra D2H copy
-      int sum = 0;
-      for (int i = 0; i < p->n_experts; ++i) {
-        h_offsets[i] = sum;
-        sum += h_counts[i];
-      }
-      h_offsets[p->n_experts] = sum;
 
-      // Launch per-expert on multiple streams to overlap small groups
+      // Với mỗi expert e, xử lý đoạn cột [c0, c1)
       for (int e = 0; e < p->n_experts; ++e) {
-        int Me = h_counts[e];
-        if (Me <= 0) continue;
-        int off = h_offsets[e];
-        // No need to pad Y (selection dimension); kernel guards msel < Me
-        dim3 gridG((unsigned int)((Mpad_mlp1 + 15) / 16), (unsigned int)Me);
-        hipStream_t es = gpu_ctx->expert_streams[ (gpu_ctx->num_expert_streams > 0) ? (e % gpu_ctx->num_expert_streams) : 0 ];
-        mlp1_swiglu_grouped_mfma_matvec_kernel<<<gridG, blockG, 0, es>>>(
-          gpu_ctx->state.gate_up_all + (size_t)off * (size_t)p->intermediate_dim,
-          gpu_ctx->state.t,
-          gpu_ctx->weights.w_mlp1_packed16,
-          gpu_ctx->weights.b_mlp1,
-          gpu_ctx->state.sel_sids_grouped + off,
-          Me, hidden_dim, p->intermediate_dim,
-          l, p->n_experts, e,
-          Mpad_mlp1, Kpad_mlp1,
-          p->swiglu_limit);
+        int c0 = h_padded[e];
+        int c1 = h_padded[e+1];
+        int Be = c1 - c0;                  // đã là bội BLOCK_B
+        if (Be <= 0) continue;
+
+        // Grid theo N: ceil(Be/16)
+        dim3 blockG(16, 4, 1);
+        dim3 gridG((unsigned)((Mpad_mlp1 + 15) / 16),
+                   (unsigned)((Be + 15) / 16));
+
+        hipStream_t es = gpu_ctx->expert_streams[
+            (gpu_ctx->num_expert_streams > 0) ? (e % gpu_ctx->num_expert_streams) : 0];
+
+        // trọng số per (layer,e)
+        const size_t per_mat_elems = (size_t)Mpad_mlp1 * (size_t)Kpad_mlp1;
+        const size_t mat_index = (size_t)l * (size_t)p->n_experts + (size_t)e;
+        const hip_bfloat16* W = gpu_ctx->weights.w_mlp1_packed16 + mat_index * per_mat_elems;
+        const hip_bfloat16* B = gpu_ctx->weights.b_mlp1          + mat_index * (size_t)Mout;
+
+        // Quan trọng:
+        // - Xpack dùng Bpad_total (stride theo toàn bộ pack),
+        // - Offset cột bằng cách cộng (xpack + c0),
+        // - slot_ids = d_col_ids + c0 để scatter output ra mlp1_Ypack theo cột toàn cục.
+        gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, es>>>(
+            /*W_packed*/ W,
+            /*Xpack*/    gpu_ctx->state.xpack_f32 + (size_t)c0,
+            /*dst*/      gpu_ctx->state.mlp1_Ypack,
+            /*bias*/     B,
+            /*M=*/Mout, /*K=*/p->hidden_dim,
+            /*B=*/Be,   /*Bpad=*/Bpad_total,
+            /*out_stride=*/Mout,
+            /*slot_ids=*/gpu_ctx->state.d_col_ids + c0,
+            /*Mpad=*/Mpad_mlp1, /*Kpad=*/Kpad_mlp1);
       }
-      // Insert events on expert streams and have batch_stream wait (non-blocking on host)
+
+      // Đồng bộ expert streams về batch_stream như bạn đang làm cho matvec cũ
       std::vector<hipEvent_t> evts(gpu_ctx->num_expert_streams);
       for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
         evts[s] = nullptr;
@@ -1499,17 +1667,42 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         }
       }
     }
-    // 8) Grouped MLP2 and accumulate into e_agg per slot with expert weights (using grouped selections)
+
+      // 7''') SwiGLU: Ypack [2I] -> gate_up_all [I] cho toàn bộ total_post_pad cột
     {
-      dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, M);
-      mlp2_accum_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.e_agg,
-        gpu_ctx->state.gate_up_all,
-        gpu_ctx->weights.w_mlp2, gpu_ctx->weights.b_mlp2,
-        gpu_ctx->state.sel_sids_grouped, gpu_ctx->state.sel_eids_grouped, gpu_ctx->state.sel_w_grouped,
-        M, hidden_dim, p->intermediate_dim,
-        l, p->n_experts, hidden_dim);
+      dim3 blockS(256), gridS((p->intermediate_dim + 255) / 256, total_post_pad);
+      swiglu_grouped_kernel_float<<<gridS, blockS, 0, gpu_ctx->batch_stream>>>(
+          gpu_ctx->state.gate_up_all,
+          gpu_ctx->state.mlp1_Ypack,
+          total_post_pad,
+          p->intermediate_dim,
+          p->swiglu_limit);
     }
+    }
+
+    // // 8) Grouped MLP2 and accumulate into e_agg per slot with expert weights (using grouped selections)
+    // {
+    //   dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, M);
+    //   mlp2_accum_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+    //     gpu_ctx->state.e_agg,
+    //     gpu_ctx->state.gate_up_all,
+    //     gpu_ctx->weights.w_mlp2, gpu_ctx->weights.b_mlp2,
+    //     gpu_ctx->state.sel_sids_grouped, gpu_ctx->state.sel_eids_grouped, gpu_ctx->state.sel_w_grouped,
+    //     M, hidden_dim, p->intermediate_dim,
+    //     l, p->n_experts, hidden_dim);
+    // }
+        // 8') MLP2 + accumulate theo danh sách đã sort (pad tự bỏ qua nhờ ew=0)
+    {
+      dim3 block(256), grid((p->hidden_dim + block.x - 1) / block.x, total_post_pad);
+      mlp2_accum_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+          gpu_ctx->state.e_agg,
+          gpu_ctx->state.gate_up_all,
+          gpu_ctx->weights.w_mlp2, gpu_ctx->weights.b_mlp2,
+          gpu_ctx->state.sorted_sids, gpu_ctx->state.sorted_eids, gpu_ctx->state.sorted_w,
+          total_post_pad, p->hidden_dim, p->intermediate_dim,
+          l, p->n_experts, p->hidden_dim);
+    }
+
     // 9) Residual x += e_agg for selected slots
     {
       dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
@@ -1817,8 +2010,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->sel_sids,     Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sel_eids,     Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sel_w,        Mmax * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
+
   // Expert-grouped arrays and counters
   HIP_CHECK(hipMalloc(&s->sel_sids_grouped, Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sel_eids_grouped, Mmax * sizeof(int)));
@@ -1827,29 +2019,36 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->eid_offsets, ((size_t)p->n_experts + 1) * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->eid_cursors,  (size_t)p->n_experts * sizeof(int)));
 
-  // Packed X buffer (BF16) for GEMM: K_max x Bpad
-  // int Bpad = ((max_batch + 15) / 16) * 16;
-  // size_t Kmax = (size_t)p->hidden_dim; // maximum K among GEMMs we use
-  // HIP_CHECK(hipMalloc(&s->xpack_bf16, Kmax * (size_t)Bpad * sizeof(hip_bfloat16)));
 
-  // gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch)
+  const int BLOCK_B = (getenv("GETP_MOE_BLOCK") ? std::max(1, atoi(getenv("GETP_MOE_BLOCK"))) : 16);
 
-// ...
-  int Bpad = ((max_batch + 15) / 16) * 16;
+  int Bpad_batch = ((max_batch + 15) / 16) * 16;  // cho QKV/W_O/Router
+  // size_t Mmax      = (size_t)max_batch * (size_t)p->experts_per_token;               // B tối đa của selections
+  size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_B - 1);            // trừ hao pad tối đa
+  int Bpad_mlp1    = (int)round_up16((int)Mmax_pad);                                  // cho pack MLP1
+  int Bpad_pack    = std::max(Bpad_batch, Bpad_mlp1);
 
-  // K dùng cho pack X:
-  // - QKV, Router: K = hidden_dim
-  // - W_O:         K = head_dim * n_attn_heads
   size_t Kmax_xpack = std::max(
       (size_t)p->hidden_dim,
       (size_t)p->head_dim * (size_t)p->n_attn_heads
   );
+  HIP_CHECK(hipMalloc(&s->xpack_f32, Kmax_xpack * (size_t)Bpad_pack * sizeof(float)));
+  // HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
+  // HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax_pad * 2 * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax_pad * (size_t)p->intermediate_dim * sizeof(float)));
 
-  // Nếu sau này còn case khác, có thể mở rộng:
-  // Kmax_xpack = std::max({ (size_t)p->hidden_dim,
-  //                         (size_t)p->head_dim * (size_t)p->n_attn_heads });
+  // --- New: block-aligned staging buffers ---
+  HIP_CHECK(hipMalloc(&s->sorted_indices,   Mmax_pad * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sorted_sids,      Mmax_pad * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sorted_eids,      Mmax_pad * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sorted_w,         Mmax_pad * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->padded_offsets,  ((size_t)p->n_experts + 1) * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->block_expert_ids, ((Mmax_pad + BLOCK_B - 1) / BLOCK_B) * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->d_col_ids,        Mmax_pad * sizeof(int)));
 
-  HIP_CHECK(hipMalloc(&s->xpack_f32, Kmax_xpack * (size_t)Bpad * sizeof(float)));
+  size_t Mout = 2 * (size_t)p->intermediate_dim;
+  HIP_CHECK(hipMalloc(&s->mlp1_Ypack, Mout * Mmax_pad * sizeof(float)));
 
 
 }
@@ -1898,6 +2097,15 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->eid_offsets));
   HIP_CHECK(hipFree(s->eid_cursors));
   HIP_CHECK(hipFree(s->xpack_f32));
+  HIP_CHECK(hipFree(s->sorted_indices));
+  HIP_CHECK(hipFree(s->sorted_sids));
+  HIP_CHECK(hipFree(s->sorted_eids));
+  HIP_CHECK(hipFree(s->sorted_w));
+  HIP_CHECK(hipFree(s->padded_offsets));
+  HIP_CHECK(hipFree(s->block_expert_ids));
+  HIP_CHECK(hipFree(s->d_col_ids));
+  HIP_CHECK(hipFree(s->mlp1_Ypack));
+
 }
 
 void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
