@@ -221,7 +221,8 @@ void mlp1_swiglu_grouped_mfma_matvec_kernel(
     float* __restrict__ gate_up_out,       // [M selections][intermediate_dim]
     const float* __restrict__ t,           // [B slots][hidden_dim]
     const hip_bfloat16* __restrict__ w_packed, // [n_layers*n_experts][Mpad*Kpad]
-    const hip_bfloat16* __restrict__ b_mlp1,   // [n_layers*n_experts][2*intermediate_dim]
+    const hip_bfloat16*
+     __restrict__ b_mlp1,   // [n_layers*n_experts][2*intermediate_dim]
     const int* __restrict__ sel_sids,      // [M]
     int selections_M,
     int hidden_dim, int intermediate_dim,
@@ -1161,6 +1162,258 @@ __global__ void logits_final_batched_kernel(const float *x,
 }
 
 // ------------------------- MoE kernels -------------------------
+// One-shot MLP2 over all experts/blocks, reading gate_up_all directly.
+// Grid: dim3 grid((Mpad_H+15)/16, total_blocks), block(16,4,1)
+__global__ __launch_bounds__(64)
+void gemm16x16_mlp2_multiE_scatter_accum(
+    const hip_bfloat16* __restrict__ W_all_packed, // [L*E][Hpad*Ipad]
+    const hip_bfloat16* __restrict__ B_all,        // [L*E][H]
+    const float*        __restrict__ gate_up_all,  // [total_cols x I]
+    float*              __restrict__ e_agg,        // [B x H]
+    const float*        __restrict__ ew_cols,      // [total_cols]  (sorted_w)
+    const int*          __restrict__ col_sid,      // [total_cols]  (sorted_sids)
+    const int*          __restrict__ block_expert_ids, // [total_blocks]
+    // sizes
+    int layer, int n_experts,
+    int H, int I, int total_cols,
+    int out_stride,  // H
+    int Mpad_H, int Kpad_I)
+{
+  const int tx = threadIdx.x;      // 0..15
+  const int ty = threadIdx.y;      // 0..3
+  const int lane = ty*16 + tx;
+
+  const int tile_m = blockIdx.x;   // rows (H)
+  const int block_c = blockIdx.y;  // column block (16 cols)
+  const int row0  = tile_m * 16;
+  const int col0  = block_c * 16;
+
+  if (col0 >= total_cols) return;
+
+  const int eid = block_expert_ids[block_c];
+
+  const size_t per_mat = (size_t)Mpad_H * (size_t)Kpad_I;
+  const size_t midx    = (size_t)layer * (size_t)n_experts + (size_t)eid;
+  const hip_bfloat16* __restrict__ W = W_all_packed + midx * per_mat;
+  const hip_bfloat16* __restrict__ B = B_all + midx * (size_t)H;
+
+  __shared__ __align__(16) hip_bfloat16 sWb[16*16];
+  __shared__ __align__(16) float        sWf[16*16];
+  __shared__ __align__(16) float        sX [16*16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v acc = {0.f,0.f,0.f,0.f};
+
+  const int Ktiles = (Kpad_I + 15)/16;
+  const size_t tilesPerRow = (size_t)((Kpad_I + 15)/16);
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    // load W tile
+    if (lane < 32) {
+      const size_t w_tile = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(W + w_tile)[lane];
+    }
+    // build X tile from gate_up_all, scaling by ew per column
+    if (lane < 64) {
+      const int r  = lane % 16;       // K row (I)
+      const int c4 = (lane / 16) * 4; // 0,4,8,12
+      const int k_row = kk*16 + r;
+
+      float* dst = sX + r*16 + c4;
+
+      // 4 consecutive columns
+      #pragma unroll
+      for (int u=0; u<4; ++u) {
+        const int col = col0 + c4 + u;
+        float v = 0.f;
+        if (k_row < I && col < total_cols) {
+          const float ew = ew_cols[col];  // 0 if PAD
+          if (ew != 0.f) {
+            // gate_up_all layout: [total_cols x I] (col-major by "selection")
+            v = gate_up_all[(size_t)col * (size_t)I + (size_t)k_row] * ew;
+          }
+        }
+        dst[u] = v;
+      }
+    }
+    __syncthreads();
+
+    // BF16->FP32(W)
+    {
+      int i4 = lane*4;
+      if (i4 < 256) {
+        sWf[i4+0] = bfloat16_to_float(sWb[i4+0]);
+        sWf[i4+1] = bfloat16_to_float(sWb[i4+1]);
+        sWf[i4+2] = bfloat16_to_float(sWb[i4+2]);
+        sWf[i4+3] = bfloat16_to_float(sWb[i4+3]);
+      }
+    }
+
+    #pragma unroll
+    for (int t=0; t<4; ++t) {
+      const int k4 = ty + 4*t;
+      float a = sWf[tx*16 + k4];      // A(H,I)
+      float b = sX [k4*16 + tx];      // B(I,Be)
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a, b, acc, 0,0,0);
+    }
+    __syncthreads();
+  }
+
+// AFTER (đoạn epilogue của gemm16x16_mlp2_multiE_scatter_accum)
+const int col = col0 + tx;
+if (col >= total_cols) return;
+
+const float ew = ew_cols[col];
+if (ew == 0.f) return;
+
+const int sid = col_sid[col];
+float* out_s = e_agg + (size_t)sid * (size_t)out_stride;
+
+auto comp4 = [&](int idx) __device__ -> float {
+  return (idx==0)?acc.x : (idx==1)?acc.y : (idx==2)?acc.z : acc.w;
+};
+
+#pragma unroll
+for (int i=0; i<4; ++i) {
+  const int row = row0 + (ty*4 + i);
+  if (row < H) {
+    float v = comp4(i);
+    if (B) v += ew * bfloat16_to_float(B[row]);  // <<<< thêm * ew vào bias
+    atomicAdd(&out_s[row], v);
+  }
+}
+
+}
+
+
+
+// One-shot MLP1 over all experts/blocks.
+// Grid:  dim3 grid((Mpad+15)/16, total_blocks), block(16,4,1)
+// where total_blocks = (total_post_pad + 15)/16
+__global__ __launch_bounds__(64)
+void gemm16x16_mlp1_fused_swiglu_scatter_multiE(
+    const hip_bfloat16* __restrict__ W_all_packed, // [L*E][Mpad*Kpad]
+    const hip_bfloat16* __restrict__ B_all,        // [L*E][Mout]
+    const float*        __restrict__ Xpack,        // [K x Bpad_total] (đã pack 1 lần cho toàn batch)
+    float*              __restrict__ gate_up_out,  // [total_post_pad x I]
+    const int*          __restrict__ block_expert_ids, // [total_blocks]
+    const int*          __restrict__ d_col_ids,    // [total_post_pad]
+    // sizes
+    int layer, int n_experts,
+    int Mout, int K, int total_cols, int Bpad_total,
+    int out_stride,  // I
+    int Mpad, int Kpad,
+    float swiglu_limit)
+{
+  const int tx = threadIdx.x;           // 0..15
+  const int ty = threadIdx.y;           // 0..3
+  const int lane = ty*16 + tx;
+
+  const int tile_m   = blockIdx.x;      // rows
+  const int block_c  = blockIdx.y;      // block cột (16 cột)
+  const int row0     = tile_m * 16;
+  const int col0     = block_c * 16;
+
+  if (col0 >= total_cols) return;
+
+  // Expert of this column block
+  const int eid = block_expert_ids[block_c];
+
+  // Resolve W/B base for (layer, eid)
+  const size_t per_mat = (size_t)Mpad * (size_t)Kpad;
+  const size_t midx    = (size_t)layer * (size_t)n_experts + (size_t)eid;
+  const hip_bfloat16* __restrict__ W = W_all_packed + midx * per_mat;
+  const hip_bfloat16* __restrict__ B = B_all + midx * (size_t)Mout;
+
+  __shared__ __align__(16) hip_bfloat16 sWb[16*16];
+  __shared__ __align__(16) float        sWf[16*16];
+  __shared__ __align__(16) float        sX [16*16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v acc = {0.f,0.f,0.f,0.f};
+
+  const int Ktiles = (Kpad + 15)/16;
+  const size_t tilesPerRow = (size_t)((Kpad + 15)/16);
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    if (lane < 32) {
+      const size_t w_tile = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(W + w_tile)[lane];
+    }
+    if (lane < 64) {
+      const int r  = lane % 16;
+      const int c4 = (lane / 16) * 4;       // 0,4,8,12
+      const int k_row = kk*16 + r;
+      float* dst = sX + r*16 + c4;
+      const bool in_k = (k_row < K);
+      const bool in_b = (col0 + c4) < Bpad_total;
+      if (in_k && in_b) {
+        const float* src = Xpack + (size_t)k_row * (size_t)Bpad_total + (size_t)col0 + (size_t)c4;
+        reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+      } else {
+        reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+      }
+    }
+    __syncthreads();
+
+    // BF16->FP32 (W)
+    {
+      int i4 = lane*4;
+      if (i4 < 256) {
+        sWf[i4+0] = bfloat16_to_float(sWb[i4+0]);
+        sWf[i4+1] = bfloat16_to_float(sWb[i4+1]);
+        sWf[i4+2] = bfloat16_to_float(sWb[i4+2]);
+        sWf[i4+3] = bfloat16_to_float(sWb[i4+3]);
+      }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const int k4 = ty + 4*t;
+      float a = sWf[tx*16 + k4];
+      float b = sX [k4*16 + tx];
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a, b, acc, 0,0,0);
+    }
+    __syncthreads();
+  }
+
+  // Fused SwiGLU + scatter
+  const int col = col0 + tx;
+  if (col >= total_cols) return;
+
+  const float alpha = 1.702f;
+  const int   I     = Mout >> 1;
+
+  const int col_id = d_col_ids[col];
+  float* out_base  = gate_up_out + (size_t)col_id * (size_t)out_stride;
+
+  auto comp4 = [&](int idx) __device__ -> float {
+    return (idx==0)?acc.x : (idx==1)?acc.y : (idx==2)?acc.z : acc.w;
+  };
+
+  #pragma unroll
+  for (int i = 0; i < 4; i += 2) {
+    const int r  = row0 + (ty*4 + i);
+    const int rp = r + 1;
+    if (rp >= Mout) continue;
+
+    float gate = comp4(i);
+    float up   = comp4(i+1);
+    if (B) {
+      gate += bfloat16_to_float(B[r ]);
+      up   += bfloat16_to_float(B[rp]);
+    }
+    gate = fminf(swiglu_limit, gate);
+    up   = fminf(swiglu_limit, fmaxf(-swiglu_limit, up));
+    gate *= (1.f/(1.f + expf(-alpha * gate)));
+
+    const int row_half = r >> 1;
+    if (row_half < I) {
+      out_base[row_half] = gate * (up + 1.f);
+    }
+  }
+}
+
 __global__ void build_padded_offsets_kernel(const int* __restrict__ counts,
                                             int* __restrict__ padded_offsets,
                                             int n_experts, int block_size) {
@@ -1884,67 +2137,33 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       );
     }
         // 7'') GEMM MLP1 per-expert (fused epilogue SwiGLU → ghi thẳng gate_up_all)
-    {
-      const int Mout       = 2 * p->intermediate_dim;
-      const int I         = p->intermediate_dim;
-      const int Mpad_mlp1 = round_up16(Mout);
-      const int Kpad_mlp1 = round_up16(p->hidden_dim);
+{
+  const int Mout       = 2 * p->intermediate_dim;
+  const int Mpad_mlp1  = round_up16(Mout);
+  const int Kpad_mlp1  = round_up16(p->hidden_dim);
+  const int total_cols = total_post_pad;
+  const int total_blocks = (total_cols + 15) / 16;
 
-      std::vector<int> h_padded(p->n_experts + 1);
-      HIP_CHECK(hipMemcpyAsync(h_padded.data(),
-                              gpu_ctx->state.padded_offsets,
-                              (size_t)(p->n_experts + 1) * sizeof(int),
-                              hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
-      HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
+  dim3 blockG(16,4,1);
+  dim3 gridG((unsigned)((Mpad_mlp1 + 15)/16), (unsigned)total_blocks);
 
-      for (int e = 0; e < p->n_experts; ++e) {
-        int c0 = h_padded[e];
-        int c1 = h_padded[e+1];
-        int Be = c1 - c0;
-        if (Be <= 0) continue;
+  const hip_bfloat16* W_all = gpu_ctx->weights.w_mlp1_packed16;
+  const hip_bfloat16* B_all = gpu_ctx->weights.b_mlp1;
 
-        dim3 blockG(16, 4, 1);
-        dim3 gridG((unsigned)((Mpad_mlp1 + 15) / 16),
-                  (unsigned)((Be + 15) / 16));
+  gemm16x16_mlp1_fused_swiglu_scatter_multiE<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+      W_all, B_all,
+      /*Xpack*/ gpu_ctx->state.xpack_f32,
+      /*dst  */ gpu_ctx->state.gate_up_all,
+      /*maps */ gpu_ctx->state.block_expert_ids,
+                gpu_ctx->state.d_col_ids,
+      /*sizes*/ l, p->n_experts,
+                Mout, p->hidden_dim, total_cols, /*Bpad_total*/ round_up16(total_cols),
+                /*out_stride*/ p->intermediate_dim,
+                Mpad_mlp1, Kpad_mlp1,
+                p->swiglu_limit);
+}
 
-        hipStream_t es = gpu_ctx->expert_streams[
-            (gpu_ctx->num_expert_streams > 0) ? (e % gpu_ctx->num_expert_streams) : 0];
 
-        const size_t per_mat_elems = (size_t)Mpad_mlp1 * (size_t)Kpad_mlp1;
-        const size_t mat_index = (size_t)l * (size_t)p->n_experts + (size_t)e;
-        const hip_bfloat16* W = gpu_ctx->weights.w_mlp1_packed16 + mat_index * per_mat_elems;
-        const hip_bfloat16* B = gpu_ctx->weights.b_mlp1          + mat_index * (size_t)Mout;
-
-        gemm16x16_mlp1_fused_swiglu_scatter<<<gridG, blockG, 0, es>>>(
-            /*W_packed*/ W,
-            /*Xpack   */ gpu_ctx->state.xpack_f32 + (size_t)c0,
-            /*dst     */ gpu_ctx->state.gate_up_all,
-            /*bias    */ B,
-            /*Mout,K,Be,Bpad*/ Mout, p->hidden_dim, Be, Bpad_total,
-            /*out_stride(I)  */ I,
-            /*slot_ids*/ gpu_ctx->state.d_col_ids + c0,
-            /*pads*/     Mpad_mlp1, Kpad_mlp1,
-            /*limit*/    p->swiglu_limit);
-      }
-
-      // Đồng bộ các expert-streams về batch_stream
-      std::vector<hipEvent_t> evts(gpu_ctx->num_expert_streams);
-      for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
-        evts[s] = nullptr;
-        if (gpu_ctx->expert_streams[s]) {
-          HIP_CHECK(hipEventCreateWithFlags(&evts[s], hipEventDisableTiming));
-          HIP_CHECK(hipEventRecord(evts[s], gpu_ctx->expert_streams[s]));
-        }
-      }
-      for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
-        if (evts[s]) {
-          HIP_CHECK(hipStreamWaitEvent(gpu_ctx->batch_stream, evts[s], 0));
-          HIP_CHECK(hipEventDestroy(evts[s]));
-        }
-      }
-    }
-
-    // [BỎ HẲN] 7''') swiglu_grouped_kernel_float(...)
         
     }
 
@@ -1960,96 +2179,31 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     //     l, p->n_experts, hidden_dim);
     // }
     // 8') MLP2 grouped GEMM (per-expert) + fused scatter-accum into e_agg
-    {
-      const int H = p->hidden_dim;
-      const int I = p->intermediate_dim;
-      const int Mpad_mlp2 = round_up16(H);
-      const int Kpad_mlp2 = round_up16(I);
+{
+  const int H        = p->hidden_dim;
+  const int I        = p->intermediate_dim;
+  const int Mpad_H   = round_up16(H);
+  const int Kpad_I   = round_up16(I);
+  const int total_cols   = total_post_pad;
+  const int total_blocks = (total_cols + 15)/16;
 
-      // Lấy padded_offsets về host
-      std::vector<int> h_padded2(p->n_experts + 1);
-      HIP_CHECK(hipMemcpyAsync(h_padded2.data(),
-                              gpu_ctx->state.padded_offsets,
-                              (size_t)(p->n_experts + 1) * sizeof(int),
-                              hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
-      HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
+  dim3 blockG(16,4,1);
+  dim3 gridG((unsigned)((Mpad_H + 15)/16), (unsigned)total_blocks);
 
-      // Tính Be_max của batch này để làm bank_stride cho mỗi stream
-      int Be_max = 0;
-      for (int e = 0; e < p->n_experts; ++e) {
-        int Be = h_padded2[e+1] - h_padded2[e];
-        if (Be > Be_max) Be_max = Be;
-      }
-      const int Bpad_bank = ((Be_max + 15) / 16) * 16;
-      const size_t bank_stride = (size_t)I * (size_t)Bpad_bank; // số phần tử float / bank
+  gemm16x16_mlp2_multiE_scatter_accum<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+      gpu_ctx->weights.w_mlp2_packed16,
+      gpu_ctx->weights.b_mlp2,
+      gpu_ctx->state.gate_up_all,
+      gpu_ctx->state.e_agg,
+      gpu_ctx->state.sorted_w,     // ew per column
+      gpu_ctx->state.sorted_sids,  // col -> sid
+      gpu_ctx->state.block_expert_ids,
+      l, p->n_experts,
+      H, I, total_cols,
+      /*out_stride*/ H,
+      Mpad_H, Kpad_I);
+}
 
-      // (tùy chọn) assert dung lượng xpack_f32 đủ lớn cho num_expert_streams bank
-      // if ((size_t)gpu_ctx->num_expert_streams * bank_stride > prealloc_xpack_capacity) fallback...
-
-      for (int e = 0; e < p->n_experts; ++e) {
-        int c0 = h_padded2[e];
-        int c1 = h_padded2[e+1];
-        int Be = c1 - c0;
-        if (Be <= 0) continue;
-
-        const int Bpad_e = ((Be + 15) / 16) * 16;
-
-        // chọn stream & bank theo stream
-        const int sidx = (gpu_ctx->num_expert_streams > 0) ? (e % gpu_ctx->num_expert_streams) : 0;
-        hipStream_t es = gpu_ctx->expert_streams[sidx];
-
-        float* Xbank = gpu_ctx->state.xpack_f32 + (size_t)sidx * bank_stride;
-
-        // 1) PACK gate_up_all[:, c0:c1) -> Xbank (I x Bpad_e) *** chạy TRÊN es ***
-        {
-          size_t total = (size_t)I * (size_t)Bpad_e;
-          dim3 block(256), grid((unsigned)((total + block.x - 1) / block.x));
-          pack_gateup_to_xpack_kernel<<<grid, block, 0, es>>>(
-              gpu_ctx->state.gate_up_all, // [total_post_pad x I]
-              Xbank,                      // bank riêng cho stream sidx
-              I, Be, Bpad_e, c0);
-        }
-
-        // 2) GEMM (H x I) * (I x Be) với W_packed của (l,e) *** cùng stream es ***
-        {
-          const size_t per_mat = (size_t)Mpad_mlp2 * (size_t)Kpad_mlp2;
-          const size_t idx     = (size_t)l * (size_t)p->n_experts + (size_t)e;
-          const hip_bfloat16* W = gpu_ctx->weights.w_mlp2_packed16 + idx * per_mat;
-          const hip_bfloat16* B = gpu_ctx->weights.b_mlp2 +
-                                  ((size_t)l * (size_t)p->n_experts + (size_t)e) * (size_t)H;
-
-          dim3 blockG(16,4,1);
-          dim3 gridG((unsigned)((Mpad_mlp2 + 15)/16),
-                    (unsigned)((Bpad_e     + 15)/16));
-
-          gemm16x16_mlp2_f32_scatter_accum<<<gridG, blockG, 0, es>>>(
-              W,
-              Xbank,                             // đọc đúng bank
-              gpu_ctx->state.e_agg,              // accumulate
-              B,
-              gpu_ctx->state.sorted_w   + c0,    // ew per column
-              gpu_ctx->state.sorted_sids + c0,   // col→sid
-              H, I, Be, Bpad_e, H,
-              Mpad_mlp2, Kpad_mlp2);
-        }
-      }
-
-      // Đồng bộ các expert streams về batch_stream (giữ nguyên như bạn đã làm)
-      std::vector<hipEvent_t> evts2(gpu_ctx->num_expert_streams);
-      for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
-        evts2[s] = nullptr;
-        if (gpu_ctx->expert_streams[s]) {
-          HIP_CHECK(hipEventCreateWithFlags(&evts2[s], hipEventDisableTiming));
-          HIP_CHECK(hipEventRecord(evts2[s], gpu_ctx->expert_streams[s]));
-        }
-      }
-      for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
-        if (evts2[s]) {
-          HIP_CHECK(hipStreamWaitEvent(gpu_ctx->batch_stream, evts2[s], 0));
-          HIP_CHECK(hipEventDestroy(evts2[s]));
-        }
-      }
-    }
 
 
 
