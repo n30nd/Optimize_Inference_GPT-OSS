@@ -26,7 +26,6 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
-
 #ifndef GETP_RUN
 #define GETP_RUN
 
@@ -144,6 +143,13 @@ typedef struct {
   float *sel_w;           // [max_batch * experts_per_token]
   float *mlp1_out_all;    // [max_batch * experts_per_token][2 * intermediate_dim]
   float *gate_up_all;     // [max_batch * experts_per_token][intermediate_dim]
+  // Expert-grouped MoE staging
+  int   *sel_sids_grouped;   // grouped by expert
+  int   *sel_eids_grouped;   // grouped by expert
+  float *sel_w_grouped;      // grouped by expert
+  int   *eid_counts;         // [n_experts]
+  int   *eid_offsets;        // [n_experts + 1]
+  int   *eid_cursors;        // [n_experts] for scatter
 } GPURunState;
 
 // Per-GPU device context
@@ -216,6 +222,148 @@ __global__ void gather_pack_x_fp32_to_fp32_kernel(const float *x, float *xpack,
     xpack[(size_t)k * (size_t)Bpad + (size_t)b] = v;
   } else {
     xpack[(size_t)k * (size_t)Bpad + (size_t)b] = 0.0f;
+  }
+}
+
+// Fused MLP1 (matvec) + SwiGLU for a single expert group.
+// For each selection m (sid), compute y = W[layer,eid] @ x[sid] + b[layer,eid]
+// then apply SwiGLU to produce gate_up (size = intermediate_dim).
+// W is packed as 16x16 BF16 tiles (Mpad x Kpad). Accumulate in FP32.
+__global__ __launch_bounds__(64)
+void mlp1_swiglu_grouped_mfma_matvec_kernel(
+    float* __restrict__ gate_up_out,       // [M selections][intermediate_dim]
+    const float* __restrict__ t,           // [B slots][hidden_dim]
+    const hip_bfloat16* __restrict__ w_packed, // [n_layers*n_experts][Mpad*Kpad]
+    const hip_bfloat16* __restrict__ b_mlp1,   // [n_layers*n_experts][2*intermediate_dim]
+    const int* __restrict__ sel_sids,      // [M]
+    int selections_M,
+    int hidden_dim, int intermediate_dim,
+    int layer, int n_experts, int eid,
+    int Mpad, int Kpad,
+    float swiglu_limit)
+{
+  const int tx = threadIdx.x;  // 0..15
+  const int ty = threadIdx.y;  // 0..3
+  const int lane = ty * 16 + tx; // 0..63
+
+  const int tile_m = blockIdx.x;  // along output rows
+  const int msel   = blockIdx.y;  // selection index within this expert group
+  if (msel >= selections_M) return;
+
+  const int base_row = tile_m * 16;
+  const int out_dim = 2 * intermediate_dim;
+
+  // Selection sid (slot id)
+  const int sid = sel_sids[msel];
+
+  // Per-(layer,eid) base pointers
+  const size_t per_mat_elems = (size_t)Mpad * (size_t)Kpad;
+  const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
+  const hip_bfloat16* __restrict__ W = w_packed + mat_index * per_mat_elems;
+  const hip_bfloat16* __restrict__ B = b_mlp1 + mat_index * (size_t)out_dim;
+
+  __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
+  __shared__ __align__(16) float        sWf[16 * 16];
+  __shared__ __align__(16) float        sX[16 * 16];
+  __shared__ __align__(16) float        sY[16];       // store accumulated rows for this 16x1 tile
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v dmn = {0.f, 0.f, 0.f, 0.f};
+
+  const int K = hidden_dim;
+  const int Ktiles = (Kpad + 15) / 16;
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    // Load W tile [16x16] packed BF16
+    if (lane < 32) {
+      const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      const hip_bfloat16* w_src = W + w_tile_base;
+      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+    }
+
+    // Build X tile [16x16] by replicating vector entries across 16 columns
+    if (lane < 64) {
+      const int r   = lane % 16;        // K row within tile
+      const int c4  = (lane / 16) * 4;  // column block index {0,4,8,12}
+      const int k_row = kk * 16 + r;
+      float v = 0.f;
+      if (k_row < K) {
+        const float* __restrict__ x_b = t + (size_t)sid * (size_t)hidden_dim;
+        v = x_b[k_row];
+      }
+      float* dst = sX + r * 16 + c4;
+      dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = v;
+    }
+
+    __syncthreads();
+
+    // Convert W BF16 -> FP32 in shared
+    {
+      int idx4 = lane * 4;
+      if (idx4 < 256) {
+        sWf[idx4 + 0] = bfloat16_to_float(sWb[idx4 + 0]);
+        sWf[idx4 + 1] = bfloat16_to_float(sWb[idx4 + 1]);
+        sWf[idx4 + 2] = bfloat16_to_float(sWb[idx4 + 2]);
+        sWf[idx4 + 3] = bfloat16_to_float(sWb[idx4 + 3]);
+      }
+    }
+
+    // 4 micro-steps across the 16-wide K tile
+    #pragma unroll
+    for (int t4 = 0; t4 < 4; ++t4) {
+      const int k4 = ty + 4 * t4; // 0..15
+      float amk = sWf[tx * 16 + k4];   // A: row=tx, col=k4
+      float bkn = sX[k4 * 16 + tx];    // B: row=k4, col=tx
+      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    }
+
+    __syncthreads();
+  }
+
+  // Store accumulators into shared rows and then fuse SwiGLU on even rows
+  if (tx == 0) {
+    // Write accum rows for this tile
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int rloc = ty * 4 + i;     // 0..15
+      const int row  = base_row + rloc;
+      if (row < out_dim) {
+        sY[rloc] = dmn[i];
+      }
+    }
+  }
+
+  __syncthreads();
+
+  if (tx == 0) {
+    const float alpha = 1.702f;
+    float* out_vec = gate_up_out + (size_t)msel * (size_t)intermediate_dim;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int rloc = ty * 4 + i;     // 0..15
+      const int row  = base_row + rloc; // 0..out_dim-1
+      if ((row & 1) == 0) { // even -> gate
+        int gate_idx = row >> 1;
+        if (gate_idx < intermediate_dim && (row + 1) < out_dim) {
+          float gate = sY[rloc];
+          float up   = sY[rloc + 1];
+          // Add bias
+          if (B) {
+            gate += bfloat16_to_float(B[row]);
+            up   += bfloat16_to_float(B[row + 1]);
+          }
+          // Clamp
+          if (gate >  swiglu_limit) gate =  swiglu_limit;
+          if (up   >  swiglu_limit) up   =  swiglu_limit;
+          if (up   < -swiglu_limit) up   = -swiglu_limit;
+          // SwiGLU
+          gate *= (1.0f / (1.0f + expf(-alpha * gate)));
+          float v = gate * (up + 1.0f);
+          out_vec[gate_idx] = v;
+        }
+      }
+    }
   }
 }
 
@@ -1265,6 +1413,46 @@ __global__ void gather_topk_pairs_kernel(const float *topv, const int *topi,
   }
 }
 
+// Build histogram of expert IDs for M selections
+__global__ void histogram_eid_counts_kernel(const int *sel_eids, int M, int *eid_counts, int n_experts) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < M) {
+    int e = sel_eids[idx];
+    if (e >= 0 && e < n_experts) {
+      atomicAdd(&eid_counts[e], 1);
+    }
+  }
+}
+
+// Exclusive prefix sum for small arrays (single-thread)
+__global__ void exclusive_prefix_sum_small_kernel(const int *counts, int *offsets, int n_experts) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    int sum = 0;
+    for (int i = 0; i < n_experts; ++i) {
+      offsets[i] = sum;
+      sum += counts[i];
+    }
+    offsets[n_experts] = sum;
+  }
+}
+
+// Scatter selections into grouped arrays by expert id using atomic cursors
+__global__ void scatter_group_by_eid_kernel(const int *sel_sids_in, const int *sel_eids_in, const float *sel_w_in, int M,
+                                            const int *eid_offsets, int *eid_cursors,
+                                            int *sel_sids_out, int *sel_eids_out, float *sel_w_out, int n_experts) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < M) {
+    int e = sel_eids_in[idx];
+    if (e >= 0 && e < n_experts) {
+      int pos = atomicAdd(&eid_cursors[e], 1);
+      int out_idx = eid_offsets[e] + pos;
+      sel_sids_out[out_idx] = sel_sids_in[idx];
+      sel_eids_out[out_idx] = e;
+      sel_w_out[out_idx]    = sel_w_in[idx];
+    }
+  }
+}
+
 
 
 // Split + SwiGLU batched for all selections
@@ -2040,39 +2228,88 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         gpu_ctx->d_slot_ids, batch, p->experts_per_token,
         gpu_ctx->state.sel_w, gpu_ctx->state.sel_eids, gpu_ctx->state.sel_sids);
     }
-    // 6) Grouped MLP1 across all selections via MFMA matvec with packed weights
+    // 6) Group selections by expert (eid) into grouped arrays
+    {
+      // Zero counts and cursors
+      HIP_CHECK(hipMemsetAsync(gpu_ctx->state.eid_counts,  0, (size_t)p->n_experts * sizeof(int), gpu_ctx->batch_stream));
+      HIP_CHECK(hipMemsetAsync(gpu_ctx->state.eid_cursors, 0, (size_t)p->n_experts * sizeof(int), gpu_ctx->batch_stream));
+      // Histogram counts
+      dim3 blockH(256), gridH((M + blockH.x - 1) / blockH.x);
+      histogram_eid_counts_kernel<<<gridH, blockH, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.sel_eids, M, gpu_ctx->state.eid_counts, p->n_experts);
+      // Exclusive prefix sum to offsets (device-side, single thread)
+      exclusive_prefix_sum_small_kernel<<<1, 1, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.eid_counts, gpu_ctx->state.eid_offsets, p->n_experts);
+      // Scatter into grouped arrays
+      scatter_group_by_eid_kernel<<<gridH, blockH, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.sel_sids, gpu_ctx->state.sel_eids, gpu_ctx->state.sel_w, M,
+        gpu_ctx->state.eid_offsets, gpu_ctx->state.eid_cursors,
+        gpu_ctx->state.sel_sids_grouped, gpu_ctx->state.sel_eids_grouped, gpu_ctx->state.sel_w_grouped,
+        p->n_experts);
+    }
+    // 7) Fused MLP1+SwiGLU per expert group (auto-pad weights dims; no small-case fallback)
     {
       int Mout = 2 * p->intermediate_dim;
       int Mpad_mlp1 = ((Mout + 15) / 16) * 16;
       int Kpad_mlp1 = ((hidden_dim + 15) / 16) * 16;
       dim3 blockG(16, 4, 1);
-      dim3 gridG((unsigned int)((Mpad_mlp1 + 15) / 16), (unsigned int)M);
-      mlp1_grouped_mfma_matvec_kernel<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.mlp1_out_all,
-        gpu_ctx->state.t,
-        gpu_ctx->weights.w_mlp1_packed16,
-        gpu_ctx->weights.b_mlp1,
-        gpu_ctx->state.sel_sids,
-        gpu_ctx->state.sel_eids,
-        M, hidden_dim, Mout,
-        l, p->n_experts,
-        Mpad_mlp1, Kpad_mlp1);
+
+      // Copy counts+offsets to host to drive per-expert launches
+      std::vector<int> h_counts(p->n_experts);
+      std::vector<int> h_offsets(p->n_experts + 1);
+      HIP_CHECK(hipMemcpyAsync(h_counts.data(),  gpu_ctx->state.eid_counts,  (size_t)p->n_experts * sizeof(int), hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
+      HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
+      // Build host offsets locally to avoid extra D2H copy
+      int sum = 0;
+      for (int i = 0; i < p->n_experts; ++i) {
+        h_offsets[i] = sum;
+        sum += h_counts[i];
+      }
+      h_offsets[p->n_experts] = sum;
+
+      // Launch per-expert on multiple streams to overlap small groups
+      for (int e = 0; e < p->n_experts; ++e) {
+        int Me = h_counts[e];
+        if (Me <= 0) continue;
+        int off = h_offsets[e];
+        // No need to pad Y (selection dimension); kernel guards msel < Me
+        dim3 gridG((unsigned int)((Mpad_mlp1 + 15) / 16), (unsigned int)Me);
+        hipStream_t es = gpu_ctx->expert_streams[ (gpu_ctx->num_expert_streams > 0) ? (e % gpu_ctx->num_expert_streams) : 0 ];
+        mlp1_swiglu_grouped_mfma_matvec_kernel<<<gridG, blockG, 0, es>>>(
+          gpu_ctx->state.gate_up_all + (size_t)off * (size_t)p->intermediate_dim,
+          gpu_ctx->state.t,
+          gpu_ctx->weights.w_mlp1_packed16,
+          gpu_ctx->weights.b_mlp1,
+          gpu_ctx->state.sel_sids_grouped + off,
+          Me, hidden_dim, p->intermediate_dim,
+          l, p->n_experts, e,
+          Mpad_mlp1, Kpad_mlp1,
+          p->swiglu_limit);
+      }
+      // Insert events on expert streams and have batch_stream wait (non-blocking on host)
+      std::vector<hipEvent_t> evts(gpu_ctx->num_expert_streams);
+      for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
+        evts[s] = nullptr;
+        if (gpu_ctx->expert_streams[s]) {
+          HIP_CHECK(hipEventCreateWithFlags(&evts[s], hipEventDisableTiming));
+          HIP_CHECK(hipEventRecord(evts[s], gpu_ctx->expert_streams[s]));
+        }
+      }
+      for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
+        if (evts[s]) {
+          HIP_CHECK(hipStreamWaitEvent(gpu_ctx->batch_stream, evts[s], 0));
+          HIP_CHECK(hipEventDestroy(evts[s]));
+        }
+      }
     }
-    // 7) Split + SwiGLU batched across all selections
-    {
-      dim3 block(256), grid((p->intermediate_dim + block.x - 1) / block.x, M);
-      swiglu_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.gate_up_all, gpu_ctx->state.mlp1_out_all,
-        M, p->intermediate_dim, p->swiglu_limit);
-    }
-    // 8) Grouped MLP2 and accumulate into e_agg per slot with expert weights
+    // 8) Grouped MLP2 and accumulate into e_agg per slot with expert weights (using grouped selections)
     {
       dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, M);
       mlp2_accum_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.e_agg,
         gpu_ctx->state.gate_up_all,
         gpu_ctx->weights.w_mlp2, gpu_ctx->weights.b_mlp2,
-        gpu_ctx->state.sel_sids, gpu_ctx->state.sel_eids, gpu_ctx->state.sel_w,
+        gpu_ctx->state.sel_sids_grouped, gpu_ctx->state.sel_eids_grouped, gpu_ctx->state.sel_w_grouped,
         M, hidden_dim, p->intermediate_dim,
         l, p->n_experts, hidden_dim);
     }
@@ -2126,7 +2363,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   }
   // FlashAttention is always enabled; no env toggles required
   
+  // Limit number of devices used via env GETP_MAX_DEVICES (optional)
   int max_devices = device_count;
+  if (const char* env_nd = getenv("GETP_MAX_DEVICES")) {
+    int nd = atoi(env_nd);
+    if (nd > 0 && nd < max_devices) max_devices = nd;
+  }
   gpu_contexts.clear();
   gpu_contexts.resize(max_devices);
 
@@ -2150,8 +2392,13 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_pos_list,  gpu_contexts[d].max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_token_ids, gpu_contexts[d].max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_next_tokens, gpu_contexts[d].max_batch * sizeof(int)));
-    // Create expert streams (up to MAX_EXPERT_STREAMS)
-    gpu_contexts[d].num_expert_streams = MAX_EXPERT_STREAMS;
+    // Create expert streams (up to MAX_EXPERT_STREAMS). Allow override via GETP_NUM_EXPERT_STREAMS
+    int nes = MAX_EXPERT_STREAMS;
+    if (const char* env_es = getenv("GETP_NUM_EXPERT_STREAMS")) {
+      int v = atoi(env_es);
+      if (v > 0) nes = std::min(v, MAX_EXPERT_STREAMS);
+    }
+    gpu_contexts[d].num_expert_streams = nes;
     for (int s = 0; s < gpu_contexts[d].num_expert_streams; ++s) {
       HIP_CHECK(hipStreamCreate(&gpu_contexts[d].expert_streams[s]));
     }
@@ -2211,7 +2458,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   std::atomic<long long> total_out{0};
   std::vector<std::thread> workers;
   workers.reserve(num_devices);
-
+  
   // Continuous batching per GPU worker
   for (int t = 0; t < num_devices; ++t) {
     workers.emplace_back([&, t]() {
@@ -2266,6 +2513,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
         // Run batched forward for all active slots and get next tokens
         std::vector<int> next_tokens_host(B);
+        
         gpu_forward_batch_step(transformer, ctx, tokens.data(), poses.data(), slot_ids.data(), B, next_tokens_host.data());
 
         // Advance all slots with sampling and book-keeping
@@ -2374,6 +2622,13 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->sel_w,        Mmax * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
+  // Expert-grouped arrays and counters
+  HIP_CHECK(hipMalloc(&s->sel_sids_grouped, Mmax * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sel_eids_grouped, Mmax * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sel_w_grouped,    Mmax * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->eid_counts,   (size_t)p->n_experts * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->eid_offsets, ((size_t)p->n_experts + 1) * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->eid_cursors,  (size_t)p->n_experts * sizeof(int)));
 
   // Packed X buffer (BF16) for GEMM: K_max x Bpad
   // int Bpad = ((max_batch + 15) / 16) * 16;
@@ -2439,10 +2694,17 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->sel_w));
   HIP_CHECK(hipFree(s->mlp1_out_all));
   HIP_CHECK(hipFree(s->gate_up_all));
+  HIP_CHECK(hipFree(s->sel_sids_grouped));
+  HIP_CHECK(hipFree(s->sel_eids_grouped));
+  HIP_CHECK(hipFree(s->sel_w_grouped));
+  HIP_CHECK(hipFree(s->eid_counts));
+  HIP_CHECK(hipFree(s->eid_offsets));
+  HIP_CHECK(hipFree(s->eid_cursors));
   HIP_CHECK(hipFree(s->xpack_f32));
 }
 
 void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
+  int dev = 0; hipGetDevice(&dev);
   int head_dim      = p->head_dim;
   int n_layers      = p->n_layers;
   int n_experts     = p->n_experts;
@@ -2469,6 +2731,9 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
+
+    // Try to pin host memory region for faster HtoD copies
+    hipError_t pin_ret = hipHostRegister((void*)cpu_data, count * sizeof(float), 0);
 
     const size_t STAGING_BYTES = (size_t)512 * 1024 * 1024; // 512 MB
     size_t staging_elems = std::max((size_t)1, STAGING_BYTES / sizeof(float));
@@ -2499,6 +2764,10 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipFree(d_stage_fp32));
     HIP_CHECK(hipStreamDestroy(stream));
+
+    if (pin_ret == hipSuccess) {
+      hipHostUnregister((void*)cpu_data);
+    }
   };
 
   // Helper: pack FP32 row-major weights to BF16 16x16 tiles directly on device with streaming
@@ -2514,6 +2783,10 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
+
+    // Pin entire host buffer for faster streaming
+    size_t total_f32 = (size_t)layers * (size_t)M * (size_t)K;
+    hipError_t pin_ret = hipHostRegister((void*)cpu_data, total_f32 * sizeof(float), 0);
 
     const size_t STAGING_BYTES = (size_t)512 * 1024 * 1024; // 512 MB
     size_t staging_elems = std::max((size_t)1, STAGING_BYTES / sizeof(float));
@@ -2545,15 +2818,21 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipFree(d_stage_fp32));
     HIP_CHECK(hipStreamDestroy(stream));
+
+    if (pin_ret == hipSuccess) {
+      hipHostUnregister((void*)cpu_data);
+    }
   };
 
 
   // Counts as size_t to avoid overflow
   size_t token_embed_count = (size_t)vocab_size * (size_t)hidden_dim;
+  printf("[GPU#%d] Copy embed/out...\n", dev);
   copy_and_convert(cpu_w->token_embedding_table, &gpu_w->token_embedding_table, token_embed_count);
   copy_and_convert(cpu_w->out,                    &gpu_w->out,                    token_embed_count);
 
   size_t rms_count = (size_t)n_layers * (size_t)hidden_dim;
+  printf("[GPU#%d] Copy RMS weights...\n", dev);
   copy_and_convert(cpu_w->rms_attn_w, &gpu_w->rms_attn_w, rms_count);
   copy_and_convert(cpu_w->rms_ffn_w,  &gpu_w->rms_ffn_w,  rms_count);
 
@@ -2561,6 +2840,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   copy_and_convert(cpu_w->rms_out_w,  &gpu_w->rms_out_w,  rms_out_count);
 
   // Pack selected projection weights (QKV, W_O, Router) into 16x16 BF16 tiles
+  printf("[GPU#%d] Pack QKV...\n", dev);
   int M_qkv = head_dim * n_attn_heads + 2 * head_dim * n_kv_heads;
   int K_qkv = hidden_dim;
   pack_weights_fp32_rowmajor_to_bf16_tiles16(cpu_w->w_qkv, &gpu_w->w_qkv_packed16, n_layers, M_qkv, K_qkv);
@@ -2569,6 +2849,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
                        ((size_t)head_dim * (size_t)n_attn_heads + (size_t)2 * (size_t)head_dim * (size_t)n_kv_heads);
   copy_and_convert(cpu_w->b_qkv, &gpu_w->b_qkv, qkv_b_count);
 
+  printf("[GPU#%d] Pack W_O...\n", dev);
   int M_o = hidden_dim;
   int K_o = head_dim * n_attn_heads;
   pack_weights_fp32_rowmajor_to_bf16_tiles16(cpu_w->w_o, &gpu_w->w_o_packed16, n_layers, M_o, K_o);
@@ -2576,9 +2857,11 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   size_t o_b_count = (size_t)n_layers * (size_t)hidden_dim;
   copy_and_convert(cpu_w->b_o, &gpu_w->b_o, o_b_count);
 
+  printf("[GPU#%d] Copy attn sinks...\n", dev);
   size_t attn_sinks_count = (size_t)n_layers * (size_t)n_attn_heads;
   copy_and_convert(cpu_w->attn_sinks, &gpu_w->attn_sinks, attn_sinks_count);
 
+  printf("[GPU#%d] Pack Router...\n", dev);
   int M_router = n_experts;
   int K_router = hidden_dim;
   pack_weights_fp32_rowmajor_to_bf16_tiles16(cpu_w->w_router, &gpu_w->w_router_packed16, n_layers, M_router, K_router);
@@ -2587,10 +2870,14 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   copy_and_convert(cpu_w->b_router, &gpu_w->b_router, router_b_count);
 
   // Pack MLP1 per (layer,expert) into 16x16 BF16 tiles
+  printf("[GPU#%d] Pack MLP1 (layers=%d, experts=%d)...\n", dev, n_layers, n_experts);
   int M_mlp1 = 2 * intermediate_dim;
   int K_mlp1 = hidden_dim;
   // Treat each (layer,expert) as a separate matrix in a flattened array of length n_layers*n_experts
   {
+    // Pin host W_mlp1 for faster streaming
+    size_t total_f32 = (size_t)n_layers * (size_t)n_experts * (size_t)M_mlp1 * (size_t)K_mlp1;
+    hipError_t pin_ret_mlp1 = hipHostRegister((void*)cpu_w->w_mlp1, total_f32 * sizeof(float), 0);
     int layers_flat = n_layers * n_experts;
     int Mpad = round_up16(M_mlp1);
     int Kpad = round_up16(K_mlp1);
@@ -2610,6 +2897,8 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipMalloc(&d_stage_fp32, (size_t)max_rows * (size_t)K_mlp1 * sizeof(float)));
     const dim3 block(256);
     for (int l = 0; l < n_layers; ++l) {
+      // Simple progress indicator per layer
+      // fprintf(stdout, "[GPU#%d]  MLP1 layer %d/%d\n", dev, l+1, n_layers);
       for (int e = 0; e < n_experts; ++e) {
         int idx = l * n_experts + e;
         const float *src = cpu_w->w_mlp1 + (size_t)l * (size_t)n_experts * (size_t)M_mlp1 * (size_t)K_mlp1
@@ -2631,6 +2920,9 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipFree(d_stage_fp32));
     HIP_CHECK(hipStreamDestroy(stream));
+    if (pin_ret_mlp1 == hipSuccess) {
+      hipHostUnregister((void*)cpu_w->w_mlp1);
+    }
   }
 
   size_t mlp1_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)2 * (size_t)intermediate_dim;
