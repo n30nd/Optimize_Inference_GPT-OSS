@@ -1,26 +1,26 @@
 "Name","Calls","TotalDurationNs","AverageNs","Percentage"
-"<barrier packet>",5476,347246052148,63412354,49.60342047182833
-"pack_convert_fp32_to_bf16_tiles16_kernel(float const*, int, int, int, int, hip_bfloat16*, int, int)",2292,339784862964,148248195,48.53760416657608
-"gemm16x16_mlp1_fused_swiglu_scatter(hip_bfloat16 const*, float const*, float*, hip_bfloat16 const*, int, int, int, int, int, int const*, int, int, float)",32878,8205987059,249588,1.1722092273074194
-"logits_final_batched_kernel(float const*, hip_bfloat16 const*, float*, int, int, int, int const*)",50,2612862114,52257242,0.3732422507726953
-"mlp2_grouped_mfma_matvec_residual_kernel(float*, float const*, hip_bfloat16 const*, hip_bfloat16 const*, int const*, int const*, float const*, int const*, int, int, int, int, int, int, int, int)",1200,1044505105,870420,0.1492055146136083
-"gemm16x16_mfma_f32_packedW_batched_scatter_bias(hip_bfloat16 const*, float const*, float*, hip_bfloat16 const*, int, int, int, int, int, int const*, int, int)",3600,808454866,224570,0.11548619891465799
-"flash_attention_kernel_optimized_batched(float const*, float const*, float const*, hip_bfloat16 const*, float*, float const*, int, int, int, int, int, int, int, int const*, bool, int, int, int, int const*, int)",1200,163686526,136405,0.02338230060363733
-"gather_pack_x_fp32_to_fp32_kernel(float const*, float*, int, int, int, int, int const*)",4800,36479059,7599,0.005210962344425476
-"rmsnorm_kernel_float_batched(float*, float*, hip_bfloat16 const*, float const*, int, int, int, int const*)",2400,35488348,14786,0.005069441212665797
-"topk_softmax_batched_kernel_float(float const*, int, int, float*, int*, int, int, int const*, int)",1200,35221940,29351,0.0050313853500884844
-"apply_rotary_emb_kernel_float_batched(float*, float const*, float const*, int, int, int, int, int, int const*)",2400,11561925,4817,0.0016515984089411826
-"convert_fp32_to_bf16_kernel(float const*, hip_bfloat16*, int)",19,6788323,357280,0.0009696986847933052
-"build_padded_offsets_kernel(int const*, int*, int, int)",1200,6118723,5098,0.0008740476323407927
-"histogram_eid_counts_kernel(int const*, int, int*, int)",1200,5899685,4916,0.0008427584817626961
-"gather_topk_pairs_kernel(float const*, int const*, int const*, int, int, float*, int*, int*)",1200,5887367,4906,0.0008409988795164147
-"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::KVWriterV::run(float const*, float*, int, int, int, int, int, int, unsigned long, int const*, int const*)",1200,5886244,4905,0.0008408384611593297
-"zero_selected_slots_kernel_float(float*, int, int const*, int)",1200,5871201,4892,0.0008386895979842354
-"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::KVWriterK::run(float const*, float*, int, int, int, int, int, int, unsigned long, int const*, int const*)",1200,5826729,4855,0.0008323368596260093
-"fill_padding_and_blocks_kernel(int const*, int const*, int, int, int*, int*, int*, float*, int*)",1200,5206561,4338,0.0007437470718461859
-"scatter_sorted_real_kernel(int const*, int const*, float const*, int, int const*, int*, int*, int*, int*, float*)",1200,4590240,3825,0.0006557068205042131
-"sample_argmax_kernel_optimized(float const*, int*, int, int)",50,2904480,58089,0.00041489929633702744
-"iota_kernel(int*, int)",1200,2839524,2366,0.00040562045857850686
-"rmsnorm_final_batched_kernel(float*, hip_bfloat16 const*, int, int, int const*)",50,916800,18336,0.0001309630897378487
-"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::KernelCS::run(float*, float*, int const*, int const*, int, float, int, float, float, float, float, int)",50,343360,6867,4.904830551089412e-05
-"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::'lambda'()::operator()(",50,329920,6598,4.712842775557487e-05
+"pack_convert_fp32_to_bf16_tiles16_kernel(float const*, int, int, int, int, hip_bfloat16*, int, int)",2251,314997872502,139936860,49.501945247290145
+"<barrier packet>",647,314619102927,486273729,49.44242157300606
+"logits_final_batched_kernel(float const*, hip_bfloat16 const*, float*, int, int, int, int const*)",50,2612741568,52254831,0.41059258279159905
+"gemm16x16_mlp1_fused_swiglu_scatter_grouped(hip_bfloat16 const*, float const*, float*, hip_bfloat16 const*, int, int, int, int, int, int const*, int const*, int, int, int, int, int, float)",1200,1906150907,1588459,0.29955179405469584
+"mlp2_grouped_mfma_matvec_residual_kernel(float*, float const*, hip_bfloat16 const*, hip_bfloat16 const*, int const*, int const*, float const*, int const*, int, int, int, int, int, int, int, int)",1200,1042311996,868593,0.1637994280620359
+"gemm16x16_mfma_f32_packedW_batched_scatter_bias(hip_bfloat16 const*, float const*, float*, hip_bfloat16 const*, int, int, int, int, int, int const*, int, int)",3600,809520629,224866,0.12721624287495925
+"flash_attention_kernel_optimized_batched(float const*, float const*, float const*, hip_bfloat16 const*, float*, float const*, int, int, int, int, int, int, int, int const*, bool, int, int, int, int const*, int)",1200,164577215,137147,0.025863324793819906
+"gather_pack_x_fp32_to_fp32_kernel(float const*, float*, int, int, int, int, int const*)",4800,36756502,7657,0.005776287741354057
+"rmsnorm_kernel_float_batched(float*, float*, hip_bfloat16 const*, float const*, int, int, int, int const*)",2400,36686268,15285,0.005765250461657902
+"topk_softmax_batched_kernel_float(float const*, int, int, float*, int*, int, int, int const*, int)",1200,35652504,29710,0.005602794351970067
+"apply_rotary_emb_kernel_float_batched(float*, float const*, float const*, int, int, int, int, int, int const*)",2400,11596485,4831,0.001822388706855081
+"build_padded_offsets_kernel(int const*, int*, int, int)",1200,7489127,6240,0.0011769170114050483
+"convert_fp32_to_bf16_kernel(float const*, hip_bfloat16*, int)",19,6769124,356269,0.0010637684723346509
+"histogram_eid_counts_kernel(int const*, int, int*, int)",1200,5997601,4998,0.0009425235604256584
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::KVWriterV::run(float const*, float*, int, int, int, int, int, int, unsigned long, int const*, int const*)",1200,5928161,4940,0.0009316110579040738
+"gather_topk_pairs_kernel(float const*, int const*, int const*, int, int, float*, int*, int*)",1200,5925922,4938,0.0009312591988437941
+"zero_selected_slots_kernel_float(float*, int, int const*, int)",1200,5912960,4927,0.0009292222193264441
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::KVWriterK::run(float const*, float*, int, int, int, int, int, int, unsigned long, int const*, int const*)",1200,5863042,4885,0.0009213776009383039
+"fill_padding_and_blocks_kernel(int const*, int const*, int, int, int*, int*, int*, float*, int*)",1200,5261765,4384,0.0008268868639182757
+"scatter_sorted_real_kernel(int const*, int const*, float const*, int, int const*, int*, int*, int*, int*, float*)",1200,4802561,4002,0.0007547229121912929
+"sample_argmax_kernel_optimized(float const*, int*, int, int)",50,2923040,58460,0.00045935601052264337
+"iota_kernel(int*, int)",1200,2752482,2293,0.0004325528048043771
+"rmsnorm_final_batched_kernel(float*, hip_bfloat16 const*, int, int, int const*)",50,940001,18800,0.00014772124543191174
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::KernelCS::run(float*, float*, int const*, int const*, int, float, int, float, float, float, float, int)",50,462400,9248,7.266620342714102e-05
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::'lambda'()::operator()(",50,334080,6681,5.2500703375733724e-05
