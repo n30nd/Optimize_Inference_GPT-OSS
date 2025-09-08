@@ -1192,6 +1192,140 @@ __global__ void iota_kernel(int* a, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) a[i] = i;
 }
+// Fused GEMM (W_mlp1 * Xpack) + bias + SwiGLU + scatter to gate_up_all.
+// - W_packed: BF16 packed 16x16 tiles (Mpad x Kpad), Mout = 2*I
+// - Xpack:    FP32 [K x Bpad], ta xử lý Be cột liên tiếp (đã align BLOCK_B)
+// - gate_up_out: FP32 [B_global x I] (ở đây ta scatter theo "column id" toàn cục)
+// - slot_ids: ánh xạ cột local (0..Be-1) -> column id toàn cục (d_col_ids + c0)
+// Mỗi block: 64 threads (16x4) tính 1 tile 16x16 (M x N).
+__global__ __launch_bounds__(64)
+void gemm16x16_mlp1_fused_swiglu_scatter(
+    const hip_bfloat16* __restrict__ W_packed,
+    const float*        __restrict__ Xpack,          // base cho đoạn cột [c0, c1)
+    float*              __restrict__ gate_up_out,    // scatter theo column id
+    const hip_bfloat16* __restrict__ bias,           // [Mout], nullable
+    // Kích thước logic
+    int Mout, int K, int Be, int Bpad,
+    // Ghi ra I = Mout/2 phần tử theo "row_half"
+    int out_stride,                                   // = intermediate_dim
+    const int* __restrict__ slot_ids,                // ánh xạ cột local -> col_id toàn cục
+    // padding
+    int Mpad, int Kpad,
+    float swiglu_limit)
+{
+  const int tx = threadIdx.x;   // 0..15 (N trong tile)
+  const int ty = threadIdx.y;   // 0..3
+  const int lane = ty*16 + tx;  // 0..63
+
+  const int tile_m  = blockIdx.x;     // theo M (rows)
+  const int tile_n  = blockIdx.y;     // theo N (cols)
+  const int row0    = tile_m * 16;
+  const int col0    = tile_n * 16;
+
+  if (col0 >= Be) return;
+
+  // LDS tiles
+  __shared__ __align__(16) hip_bfloat16 sWb[16*16];
+  __shared__ __align__(16) float        sWf[16*16];
+  __shared__ __align__(16) float        sX [16*16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v acc = {0.f,0.f,0.f,0.f};
+
+  // W base (đã chọn đúng (layer,e) ở caller)
+  const int Ktiles = (Kpad + 15)/16;
+  const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+  // X base (đã offset c0 ở caller): stride theo Bpad
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    // 512B W tile → 32 lanes * 16B
+    if (lane < 32) {
+      const size_t w_tile = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      const hip_bfloat16* src = W_packed + w_tile;
+      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(src)[lane];
+    }
+    // X: 16x16 floats
+    if (lane < 64) {
+      const int r  = lane % 16;
+      const int c4 = (lane / 16) * 4;          // 0,4,8,12
+      const int k_row = kk*16 + r;
+      float* dst = sX + r*16 + c4;
+      const bool in_k = (k_row < K);
+      const bool in_b = (col0 + c4) < Be;
+      if (in_k && in_b) {
+        const float* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)col0 + (size_t)c4;
+        reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+      } else {
+        reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+      }
+    }
+    __syncthreads();
+
+    // BF16->FP32 cho W trong LDS
+    {
+      int i4 = lane*4;
+      if (i4 < 256) {
+        sWf[i4+0] = bfloat16_to_float(sWb[i4+0]);
+        sWf[i4+1] = bfloat16_to_float(sWb[i4+1]);
+        sWf[i4+2] = bfloat16_to_float(sWb[i4+2]);
+        sWf[i4+3] = bfloat16_to_float(sWb[i4+3]);
+      }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const int k4 = ty + 4*t;           // 0..15
+      float a = sWf[tx*16 + k4];         // A(M,K)
+      float b = sX [k4*16 + tx];         // B(K,N)
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a, b, acc, 0,0,0);
+    }
+    __syncthreads();
+  }
+
+  // Epilogue fused: (2I) → I (SwiGLU) và scatter theo column id
+const int col = col0 + tx;
+if (col >= Be) return;
+
+const float alpha = 1.702f;
+const int   I     = Mout >> 1;
+
+// Lấy column-id toàn cục để scatter
+const int col_id = slot_ids[col];
+float* out_base  = gate_up_out + (size_t)col_id * (size_t)out_stride;
+
+// Helper đọc phần tử acc theo chỉ số (tránh lấy địa chỉ phần tử vector)
+auto comp4 = [&](int idx) __device__ -> float {
+  // acc là float4v: {x,y,z,w}
+  return (idx == 0) ? acc.x :
+         (idx == 1) ? acc.y :
+         (idx == 2) ? acc.z : acc.w;
+};
+
+// Mỗi thread có 4 hàng liên tiếp: (ty*4 + i), i=0..3
+// Cặp even/odd luôn nằm trong cùng thread: (0,1) và (2,3).
+#pragma unroll
+for (int i = 0; i < 4; i += 2) {                     // i = 0, 2
+  const int r  = row0 + (ty*4 + i);                  // even row
+  const int rp = r + 1;                              // odd row (cặp với r)
+  if (r < Mout && rp < Mout) {
+    float gate = comp4(i);
+    float up   = comp4(i + 1);
+    if (bias) {
+      gate += bfloat16_to_float(bias[r]);
+      up   += bfloat16_to_float(bias[rp]);
+    }
+    // clamp nhẹ để ổn định số học
+    gate = fminf( swiglu_limit, gate);
+    up   = fminf( swiglu_limit, fmaxf(-swiglu_limit, up));
+    // SwiGLU: σ(α·gate) * gate * (up + 1)
+    gate *= (1.f / (1.f + expf(-alpha * gate)));
+    const int row_half = r >> 1;                     // 0..I-1
+    if (row_half < I) {
+      out_base[row_half] = gate * (up + 1.f);
+    }
+  }
+}
+}
+
 
 
 
@@ -1600,58 +1734,51 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           gpu_ctx->state.sorted_sids   // cột b → sid = sorted_sids[b]
       );
     }
-        // 7'') GEMM MLP1 per-expert (B theo expert đã căn block)
+        // 7'') GEMM MLP1 per-expert (fused epilogue SwiGLU → ghi thẳng gate_up_all)
     {
-      int Mout = 2 * p->intermediate_dim;
-      int Mpad_mlp1 = round_up16(Mout);
-      int Kpad_mlp1 = round_up16(p->hidden_dim);
+      const int Mout       = 2 * p->intermediate_dim;
+      const int I         = p->intermediate_dim;
+      const int Mpad_mlp1 = round_up16(Mout);
+      const int Kpad_mlp1 = round_up16(p->hidden_dim);
 
-      // Lấy padded_offsets về host để biết [c0, c1) từng expert
       std::vector<int> h_padded(p->n_experts + 1);
       HIP_CHECK(hipMemcpyAsync(h_padded.data(),
-                               gpu_ctx->state.padded_offsets,
-                               (size_t)(p->n_experts + 1) * sizeof(int),
-                               hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
+                              gpu_ctx->state.padded_offsets,
+                              (size_t)(p->n_experts + 1) * sizeof(int),
+                              hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
       HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
 
-      // Với mỗi expert e, xử lý đoạn cột [c0, c1)
       for (int e = 0; e < p->n_experts; ++e) {
         int c0 = h_padded[e];
         int c1 = h_padded[e+1];
-        int Be = c1 - c0;                  // đã là bội BLOCK_B
+        int Be = c1 - c0;
         if (Be <= 0) continue;
 
-        // Grid theo N: ceil(Be/16)
         dim3 blockG(16, 4, 1);
         dim3 gridG((unsigned)((Mpad_mlp1 + 15) / 16),
-                   (unsigned)((Be + 15) / 16));
+                  (unsigned)((Be + 15) / 16));
 
         hipStream_t es = gpu_ctx->expert_streams[
             (gpu_ctx->num_expert_streams > 0) ? (e % gpu_ctx->num_expert_streams) : 0];
 
-        // trọng số per (layer,e)
         const size_t per_mat_elems = (size_t)Mpad_mlp1 * (size_t)Kpad_mlp1;
         const size_t mat_index = (size_t)l * (size_t)p->n_experts + (size_t)e;
         const hip_bfloat16* W = gpu_ctx->weights.w_mlp1_packed16 + mat_index * per_mat_elems;
         const hip_bfloat16* B = gpu_ctx->weights.b_mlp1          + mat_index * (size_t)Mout;
 
-        // Quan trọng:
-        // - Xpack dùng Bpad_total (stride theo toàn bộ pack),
-        // - Offset cột bằng cách cộng (xpack + c0),
-        // - slot_ids = d_col_ids + c0 để scatter output ra mlp1_Ypack theo cột toàn cục.
-        gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, es>>>(
+        gemm16x16_mlp1_fused_swiglu_scatter<<<gridG, blockG, 0, es>>>(
             /*W_packed*/ W,
-            /*Xpack*/    gpu_ctx->state.xpack_f32 + (size_t)c0,
-            /*dst*/      gpu_ctx->state.mlp1_Ypack,
-            /*bias*/     B,
-            /*M=*/Mout, /*K=*/p->hidden_dim,
-            /*B=*/Be,   /*Bpad=*/Bpad_total,
-            /*out_stride=*/Mout,
-            /*slot_ids=*/gpu_ctx->state.d_col_ids + c0,
-            /*Mpad=*/Mpad_mlp1, /*Kpad=*/Kpad_mlp1);
+            /*Xpack   */ gpu_ctx->state.xpack_f32 + (size_t)c0,
+            /*dst     */ gpu_ctx->state.gate_up_all,
+            /*bias    */ B,
+            /*Mout,K,Be,Bpad*/ Mout, p->hidden_dim, Be, Bpad_total,
+            /*out_stride(I)  */ I,
+            /*slot_ids*/ gpu_ctx->state.d_col_ids + c0,
+            /*pads*/     Mpad_mlp1, Kpad_mlp1,
+            /*limit*/    p->swiglu_limit);
       }
 
-      // Đồng bộ expert streams về batch_stream như bạn đang làm cho matvec cũ
+      // Đồng bộ các expert-streams về batch_stream
       std::vector<hipEvent_t> evts(gpu_ctx->num_expert_streams);
       for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
         evts[s] = nullptr;
@@ -1668,16 +1795,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       }
     }
 
-      // 7''') SwiGLU: Ypack [2I] -> gate_up_all [I] cho toàn bộ total_post_pad cột
-    {
-      dim3 blockS(256), gridS((p->intermediate_dim + 255) / 256, total_post_pad);
-      swiglu_grouped_kernel_float<<<gridS, blockS, 0, gpu_ctx->batch_stream>>>(
-          gpu_ctx->state.gate_up_all,
-          gpu_ctx->state.mlp1_Ypack,
-          total_post_pad,
-          p->intermediate_dim,
-          p->swiglu_limit);
-    }
+    // [BỎ HẲN] 7''') swiglu_grouped_kernel_float(...)
+        
     }
 
     // // 8) Grouped MLP2 and accumulate into e_agg per slot with expert weights (using grouped selections)
