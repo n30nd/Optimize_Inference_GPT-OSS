@@ -1209,8 +1209,9 @@ __global__ void residual_connection_kernel_float_batched(float *x, const float *
 // threads stride across hidden_dim for coalesced access; in-block reduction in shared memory.
 __global__ __launch_bounds__(256) void rmsnorm_kernel_float_batched(
     float *__restrict__ out,                 // [slots, hidden_dim]
-    const float *__restrict__ x,             // [slots, hidden_dim]
+    float *__restrict__ x,                  // [slots, hidden_dim] (may be updated if residual != nullptr)
     const hip_bfloat16 *__restrict__ weight, // [hidden_dim]
+    const float *__restrict__ residual,     // optional [slots, hidden_dim]; if not null: x += residual (in-place)
     int hidden_dim,
     int batch,
     int stride,                 // per-slot stride == hidden_dim
@@ -1220,15 +1221,21 @@ __global__ __launch_bounds__(256) void rmsnorm_kernel_float_batched(
   if (b >= batch) return;
 
   int sid = slot_ids[b];
-  const float *x_slot = x + (size_t)sid * (size_t)stride;
+  float *x_slot = x + (size_t)sid * (size_t)stride;
   float *out_slot = out + (size_t)sid * (size_t)stride;
+  const float *r_slot = residual ? (residual + (size_t)sid * (size_t)stride) : nullptr;
 
   extern __shared__ float s_reduce[]; // size = blockDim.x
 
-  // 1) Compute sum of squares across hidden_dim with thread striding
+  // 1) Compute sum of squares across hidden_dim with thread striding.
+  //    If residual provided, add it in-place (x_slot[j] += r_slot[j]).
   float ss = 0.0f;
   for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
     float v = x_slot[j];
+    if (r_slot) {
+      v += r_slot[j];
+      x_slot[j] = v; // in-place residual update
+    }
     ss += v * v;
   }
   s_reduce[threadIdx.x] = ss;
@@ -1966,7 +1973,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 block_norm(256), grid_norm(1, batch);
       size_t shared_mem_norm = block_norm.x * sizeof(float);
       rmsnorm_kernel_float_batched<<<grid_norm, block_norm, shared_mem_norm, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.t, gpu_ctx->state.x, rms_attn_w,
+        gpu_ctx->state.t, gpu_ctx->state.x, rms_attn_w, /*residual=*/nullptr,
         hidden_dim, batch, hidden_dim, gpu_ctx->d_slot_ids);
     }
 
@@ -2061,24 +2068,18 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         Mwo, Kow, batch, Bpad2, Mwo, gpu_ctx->d_slot_ids, Mpad2, Kpad2);
     }
 
-    // Residual add: x += tb2
-    {
-      dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
-      residual_connection_kernel_float_batched<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.x, gpu_ctx->state.tb2, hidden_dim, batch, hidden_dim, gpu_ctx->d_slot_ids);
-    }
-
-    // -------- MoE batched & grouped across slots and experts --------
+    // Residual add and FFN RMSNorm fused: t = RMSNorm(x += tb2)
     const hip_bfloat16 *rms_ffn_w = gpu_ctx->weights.rms_ffn_w + (size_t)l * (size_t)hidden_dim;
-    const hip_bfloat16 *b_router = gpu_ctx->weights.b_router + (size_t)l * (size_t)p->n_experts;
-    // 1) FFN RMSNorm (batched across slots)
     {
       dim3 block_norm(256), grid_norm(1, batch);
       size_t shared_mem_norm = block_norm.x * sizeof(float);
       rmsnorm_kernel_float_batched<<<grid_norm, block_norm, shared_mem_norm, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.t, gpu_ctx->state.x, rms_ffn_w,
+        gpu_ctx->state.t, gpu_ctx->state.x, rms_ffn_w, /*residual=*/gpu_ctx->state.tb2,
         hidden_dim, batch, hidden_dim, gpu_ctx->d_slot_ids);
     }
+
+    // -------- MoE batched & grouped across slots and experts --------
+    const hip_bfloat16 *b_router = gpu_ctx->weights.b_router + (size_t)l * (size_t)p->n_experts;
     // 2) Router matmul + bias (batched across slots) via packed BF16 GEMM
     {
       int Mr = p->n_experts;
