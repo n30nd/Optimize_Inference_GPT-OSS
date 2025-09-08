@@ -80,8 +80,7 @@ typedef struct {
   hip_bfloat16 *w_o_packed16;     // [n_layers][Mpad * Kpad]
   hip_bfloat16 *w_router_packed16;// [n_layers][Mpad * Kpad]
   hip_bfloat16 *w_mlp1_packed16;  // [n_layers*n_experts][Mpad * Kpad]
-  hip_bfloat16 *w_mlp2_packed16;  // NEW: MLP2 packed 16x16 (H x I)
-
+  hip_bfloat16 *w_mlp2_packed16;  // [n_layers*n_experts][Mpad * Kpad] for GEMM-based MLP2
 } GPUTransformerWeights;
 
 typedef struct {
@@ -353,7 +352,232 @@ void mlp1_swiglu_grouped_mfma_matvec_kernel(
     }
   }
 }
+// Grouped MLP2 matvec using MFMA and packed BF16 weights with accumulation into e_agg.
+// For each selection m (sid,eid), compute y = W_mlp2[layer,eid] @ gate_up_all[m] + b_mlp2[layer,eid]
+// then atomically accumulate e_agg[sid] += sel_w[m] * y.
+// W is packed as 16x16 BF16 tiles (Mpad x Kpad). Accumulate in FP32.
+// Implementation replicates the input vector across 16 columns; only tx==0 stores results.
+__global__ __launch_bounds__(64)
+void mlp2_grouped_mfma_matvec_accum_kernel(
+    float* __restrict__ e_agg,               // [slots][hidden_dim]
+    const float* __restrict__ gate_up_all,   // [Btotal][intermediate_dim] (sorted/padded columns)
+    const hip_bfloat16* __restrict__ w_packed_mlp2, // [n_layers*n_experts][Mpad*Kpad]
+    const hip_bfloat16* __restrict__ b_mlp2,        // [n_layers*n_experts][hidden_dim]
+    const int*   __restrict__ sorted_sids,   // [Btotal]
+    const int*   __restrict__ sorted_eids,   // [Btotal]
+    const float* __restrict__ sorted_w,      // [Btotal]
+    const int*   __restrict__ sorted_indices,// [Btotal], -1 for padding
+    int Btotal,
+    int hidden_dim, int intermediate_dim,
+    int layer, int n_experts,
+    int eagg_stride,
+    int Mpad, int Kpad)
+{
+  const int tx = threadIdx.x;  // 0..15 (columns)
+  const int ty = threadIdx.y;  // 0..3  (row groups)
+  const int lane = ty * 16 + tx; // 0..63
 
+  const int tile_m = blockIdx.x;  // along hidden_dim
+  const int msel   = blockIdx.y;  // global column id in sorted/padded arrays
+  if (msel >= Btotal) return;
+
+  const int base_row = tile_m * 16;
+
+  // Resolve selection sid/eid and expert weight (skip padding columns)
+  const int valid_idx = sorted_indices[msel];
+  if (valid_idx < 0) return; // padding
+  const int sid = sorted_sids[msel];
+  const int eid = sorted_eids[msel];
+  const float ew = sorted_w[msel];
+
+  // Per-(layer,eid) base pointers
+  const size_t per_mat_elems = (size_t)Mpad * (size_t)Kpad;
+  const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
+  const hip_bfloat16* __restrict__ W = w_packed_mlp2 + mat_index * per_mat_elems;
+  const hip_bfloat16* __restrict__ B = b_mlp2 + mat_index * (size_t)hidden_dim;
+
+  // Shared tiles
+  __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
+  __shared__ __align__(16) float        sWf[16 * 16];
+  __shared__ __align__(16) float        sX[16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v dmn = {0.f, 0.f, 0.f, 0.f};
+
+  const int K = intermediate_dim;
+  const int Ktiles = (Kpad + 15) / 16;
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    // Load W tile [16x16] from packed BF16 storage
+    if (lane < 32) {
+      const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256; // 256 elements (bf16)
+      const hip_bfloat16* w_src = W + w_tile_base;
+      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+    }
+
+    // Load X tile by replicating scalar gate values across 16 columns
+    if (lane < 64) {
+      const int r   = lane % 16;          // row within tile
+      const int c4  = (lane / 16) * 4;    // column block of 4 floats: 0,4,8,12
+      const int k_row = kk * 16 + r;      // actual K row
+
+      float* dst_vec = sX + r * 16 + c4;
+      float val = 0.0f;
+      if (k_row < K) {
+        const float* g = gate_up_all + (size_t)msel * (size_t)intermediate_dim;
+        val = g[k_row];
+      }
+      float4v vrep = {val, val, val, val};
+      reinterpret_cast<float4v*>(dst_vec)[0] = vrep;
+    }
+
+    __syncthreads();
+
+    // Convert W tile BF16 -> FP32 in shared memory (64 lanes x 4 elems)
+    {
+      int idx4 = lane * 4;
+      if (idx4 < 256) {
+        sWf[idx4 + 0] = bfloat16_to_float(sWb[idx4 + 0]);
+        sWf[idx4 + 1] = bfloat16_to_float(sWb[idx4 + 1]);
+        sWf[idx4 + 2] = bfloat16_to_float(sWb[idx4 + 2]);
+        sWf[idx4 + 3] = bfloat16_to_float(sWb[idx4 + 3]);
+      }
+    }
+
+    // 4 micro-steps across the 16-wide K tile
+    #pragma unroll
+    for (int t4 = 0; t4 < 4; ++t4) {
+      const int k4 = ty + 4 * t4; // 0..15
+      float amk = sWf[tx * 16 + k4];   // A: row=tx, col=k4
+      float bkn = sX[k4 * 16 + tx];    // B: row=k4, col=tx
+      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    }
+
+    __syncthreads();
+  }
+
+  // Store only for tx==0 (column 0) and atomically accumulate into e_agg
+  if (tx == 0) {
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = base_row + (ty * 4 + i);
+      if (row < hidden_dim) {
+        const float biasv = B ? bfloat16_to_float(B[row]) : 0.f;
+        float y = dmn[i] + biasv;
+        atomicAdd(&e_agg[(size_t)sid * (size_t)eagg_stride + (size_t)row], ew * y);
+      }
+    }
+  }
+}
+
+// Same as above, but atomically accumulates directly into x (residual add fused).
+__global__ __launch_bounds__(64)
+void mlp2_grouped_mfma_matvec_residual_kernel(
+    float* __restrict__ x,                    // [slots][hidden_dim] — destination (residual fused)
+    const float* __restrict__ gate_up_all,    // [Btotal][intermediate_dim]
+    const hip_bfloat16* __restrict__ w_packed_mlp2,
+    const hip_bfloat16* __restrict__ b_mlp2,
+    const int*   __restrict__ sorted_sids,
+    const int*   __restrict__ sorted_eids,
+    const float* __restrict__ sorted_w,
+    const int*   __restrict__ sorted_indices,
+    int Btotal,
+    int hidden_dim, int intermediate_dim,
+    int layer, int n_experts,
+    int x_stride,
+    int Mpad, int Kpad)
+{
+  const int tx = threadIdx.x;  // 0..15 (columns)
+  const int ty = threadIdx.y;  // 0..3  (row groups)
+  const int lane = ty * 16 + tx; // 0..63
+
+  const int tile_m = blockIdx.x;  // along hidden_dim
+  const int msel   = blockIdx.y;  // column id in sorted/padded arrays
+  if (msel >= Btotal) return;
+
+  const int base_row = tile_m * 16;
+
+  // Resolve selection sid/eid and expert weight; skip padding
+  const int valid_idx = sorted_indices[msel];
+  if (valid_idx < 0) return;
+  const int sid = sorted_sids[msel];
+  const int eid = sorted_eids[msel];
+  const float ew = sorted_w[msel];
+
+  // Pointers per (layer,eid)
+  const size_t per_mat_elems = (size_t)Mpad * (size_t)Kpad;
+  const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
+  const hip_bfloat16* __restrict__ W = w_packed_mlp2 + mat_index * per_mat_elems;
+  const hip_bfloat16* __restrict__ B = b_mlp2 + mat_index * (size_t)hidden_dim;
+
+  __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
+  __shared__ __align__(16) float        sWf[16 * 16];
+  __shared__ __align__(16) float        sX[16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v dmn = {0.f, 0.f, 0.f, 0.f};
+
+  const int K = intermediate_dim;
+  const int Ktiles = (Kpad + 15) / 16;
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    if (lane < 32) {
+      const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      const hip_bfloat16* w_src = W + w_tile_base;
+      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+    }
+
+    if (lane < 64) {
+      const int r   = lane % 16;
+      const int c4  = (lane / 16) * 4;    // 0,4,8,12
+      const int k_row = kk * 16 + r;
+      float* dst_vec = sX + r * 16 + c4;
+      float val = 0.0f;
+      if (k_row < K) {
+        const float* g = gate_up_all + (size_t)msel * (size_t)intermediate_dim;
+        val = g[k_row];
+      }
+      float4v vrep = {val, val, val, val};
+      reinterpret_cast<float4v*>(dst_vec)[0] = vrep;
+    }
+
+    __syncthreads();
+
+    int idx4 = lane * 4;
+    if (idx4 < 256) {
+      sWf[idx4 + 0] = bfloat16_to_float(sWb[idx4 + 0]);
+      sWf[idx4 + 1] = bfloat16_to_float(sWb[idx4 + 1]);
+      sWf[idx4 + 2] = bfloat16_to_float(sWb[idx4 + 2]);
+      sWf[idx4 + 3] = bfloat16_to_float(sWb[idx4 + 3]);
+    }
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int t4 = 0; t4 < 4; ++t4) {
+      const int k4 = ty + 4 * t4;
+      float amk = sWf[tx * 16 + k4];
+      float bkn = sX[k4 * 16 + tx];
+      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    }
+
+    __syncthreads();
+  }
+
+  if (tx == 0) {
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = base_row + (ty * 4 + i);
+      if (row < hidden_dim) {
+        const float biasv = B ? bfloat16_to_float(B[row]) : 0.f;
+        float y = dmn[i] + biasv;
+        atomicAdd(&x[(size_t)sid * (size_t)x_stride + (size_t)row], ew * y);
+      }
+    }
+  }
+}
 
 // ========================= FLOAT KERNELS =========================
 
@@ -1948,117 +2172,29 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         
     }
 
-    // // 8) Grouped MLP2 and accumulate into e_agg per slot with expert weights (using grouped selections)
-    // {
-    //   dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, M);
-    //   mlp2_accum_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-    //     gpu_ctx->state.e_agg,
-    //     gpu_ctx->state.gate_up_all,
-    //     gpu_ctx->weights.w_mlp2, gpu_ctx->weights.b_mlp2,
-    //     gpu_ctx->state.sel_sids_grouped, gpu_ctx->state.sel_eids_grouped, gpu_ctx->state.sel_w_grouped,
-    //     M, hidden_dim, p->intermediate_dim,
-    //     l, p->n_experts, hidden_dim);
-    // }
-    // 8') MLP2 grouped GEMM (per-expert) + fused scatter-accum into e_agg
+    // 8) Grouped MLP2 via MFMA matvec (packed) with in-kernel accumulation
     {
-      const int H = p->hidden_dim;
-      const int I = p->intermediate_dim;
-      const int Mpad_mlp2 = round_up16(H);
-      const int Kpad_mlp2 = round_up16(I);
-
-      // Lấy padded_offsets về host
-      std::vector<int> h_padded2(p->n_experts + 1);
-      HIP_CHECK(hipMemcpyAsync(h_padded2.data(),
-                              gpu_ctx->state.padded_offsets,
-                              (size_t)(p->n_experts + 1) * sizeof(int),
-                              hipMemcpyDeviceToHost, gpu_ctx->batch_stream));
-      HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
-
-      // Tính Be_max của batch này để làm bank_stride cho mỗi stream
-      int Be_max = 0;
-      for (int e = 0; e < p->n_experts; ++e) {
-        int Be = h_padded2[e+1] - h_padded2[e];
-        if (Be > Be_max) Be_max = Be;
-      }
-      const int Bpad_bank = ((Be_max + 15) / 16) * 16;
-      const size_t bank_stride = (size_t)I * (size_t)Bpad_bank; // số phần tử float / bank
-
-      // (tùy chọn) assert dung lượng xpack_f32 đủ lớn cho num_expert_streams bank
-      // if ((size_t)gpu_ctx->num_expert_streams * bank_stride > prealloc_xpack_capacity) fallback...
-
-      for (int e = 0; e < p->n_experts; ++e) {
-        int c0 = h_padded2[e];
-        int c1 = h_padded2[e+1];
-        int Be = c1 - c0;
-        if (Be <= 0) continue;
-
-        const int Bpad_e = ((Be + 15) / 16) * 16;
-
-        // chọn stream & bank theo stream
-        const int sidx = (gpu_ctx->num_expert_streams > 0) ? (e % gpu_ctx->num_expert_streams) : 0;
-        hipStream_t es = gpu_ctx->expert_streams[sidx];
-
-        float* Xbank = gpu_ctx->state.xpack_f32 + (size_t)sidx * bank_stride;
-
-        // 1) PACK gate_up_all[:, c0:c1) -> Xbank (I x Bpad_e) *** chạy TRÊN es ***
-        {
-          size_t total = (size_t)I * (size_t)Bpad_e;
-          dim3 block(256), grid((unsigned)((total + block.x - 1) / block.x));
-          pack_gateup_to_xpack_kernel<<<grid, block, 0, es>>>(
-              gpu_ctx->state.gate_up_all, // [total_post_pad x I]
-              Xbank,                      // bank riêng cho stream sidx
-              I, Be, Bpad_e, c0);
-        }
-
-        // 2) GEMM (H x I) * (I x Be) với W_packed của (l,e) *** cùng stream es ***
-        {
-          const size_t per_mat = (size_t)Mpad_mlp2 * (size_t)Kpad_mlp2;
-          const size_t idx     = (size_t)l * (size_t)p->n_experts + (size_t)e;
-          const hip_bfloat16* W = gpu_ctx->weights.w_mlp2_packed16 + idx * per_mat;
-          const hip_bfloat16* B = gpu_ctx->weights.b_mlp2 +
-                                  ((size_t)l * (size_t)p->n_experts + (size_t)e) * (size_t)H;
-
-          dim3 blockG(16,4,1);
-          dim3 gridG((unsigned)((Mpad_mlp2 + 15)/16),
-                    (unsigned)((Bpad_e     + 15)/16));
-
-          gemm16x16_mlp2_f32_scatter_accum<<<gridG, blockG, 0, es>>>(
-              W,
-              Xbank,                             // đọc đúng bank
-              gpu_ctx->state.e_agg,              // accumulate
-              B,
-              gpu_ctx->state.sorted_w   + c0,    // ew per column
-              gpu_ctx->state.sorted_sids + c0,   // col→sid
-              H, I, Be, Bpad_e, H,
-              Mpad_mlp2, Kpad_mlp2);
-        }
-      }
-
-      // Đồng bộ các expert streams về batch_stream (giữ nguyên như bạn đã làm)
-      std::vector<hipEvent_t> evts2(gpu_ctx->num_expert_streams);
-      for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
-        evts2[s] = nullptr;
-        if (gpu_ctx->expert_streams[s]) {
-          HIP_CHECK(hipEventCreateWithFlags(&evts2[s], hipEventDisableTiming));
-          HIP_CHECK(hipEventRecord(evts2[s], gpu_ctx->expert_streams[s]));
-        }
-      }
-      for (int s = 0; s < gpu_ctx->num_expert_streams; ++s) {
-        if (evts2[s]) {
-          HIP_CHECK(hipStreamWaitEvent(gpu_ctx->batch_stream, evts2[s], 0));
-          HIP_CHECK(hipEventDestroy(evts2[s]));
-        }
-      }
+      int Mpad_mlp2 = ((hidden_dim + 15) / 16) * 16;
+      int Kpad_mlp2 = ((p->intermediate_dim + 15) / 16) * 16;
+      dim3 blockG2(16, 4, 1);
+      // Use total_post_pad (Btotal) columns produced by fused MLP1 scatter
+      int Btotal = total_post_pad;
+      dim3 gridG2((unsigned int)((Mpad_mlp2 + 15) / 16), (unsigned int)Btotal);
+      mlp2_grouped_mfma_matvec_residual_kernel<<<gridG2, blockG2, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.x,
+        gpu_ctx->state.gate_up_all,
+        gpu_ctx->weights.w_mlp2_packed16,
+        gpu_ctx->weights.b_mlp2,
+        gpu_ctx->state.sorted_sids,
+        gpu_ctx->state.sorted_eids,
+        gpu_ctx->state.sorted_w,
+        gpu_ctx->state.sorted_indices,
+        Btotal, hidden_dim, p->intermediate_dim,
+        l, p->n_experts, hidden_dim,
+        Mpad_mlp2, Kpad_mlp2);
     }
 
-
-
-    // 9) Residual x += e_agg for selected slots
-    {
-      dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
-      residual_connection_kernel_float_batched<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.x, gpu_ctx->state.e_agg, hidden_dim, batch, hidden_dim, gpu_ctx->d_slot_ids);
-    }
+    // 9) Residual fused in step 8 (mlp2 kernel accumulates directly into x)
   }
 
   // Fully batched final RMSNorm and logits computation
@@ -2685,66 +2821,53 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   size_t mlp1_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)2 * (size_t)intermediate_dim;
   copy_and_convert(cpu_w->b_mlp1, &gpu_w->b_mlp1, mlp1_b_count);
 
-  // size_t mlp2_w_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim * (size_t)intermediate_dim;
-  // copy_and_convert(cpu_w->w_mlp2, &gpu_w->w_mlp2, mlp2_w_count);
-    printf("[GPU#%d] Pack MLP2 (layers=%d, experts=%d)...\n", dev, n_layers, n_experts);
+  // Pack MLP2 per (layer,expert) into 16x16 BF16 tiles: [hidden_dim x intermediate_dim]
+  int M_mlp2 = hidden_dim;
+  int K_mlp2 = intermediate_dim;
   {
-    int M_mlp2 = hidden_dim;          // H
-    int K_mlp2 = intermediate_dim;    // I
-
-    // giống nhánh pack MLP1 ngay phía trên, chỉ đổi kích thước M/K và nguồn
-    hipError_t pin_ret_mlp2 = hipHostRegister((void*)cpu_w->w_mlp2,
-        (size_t)n_layers * (size_t)n_experts * (size_t)M_mlp2 * (size_t)K_mlp2 * sizeof(float), 0);
-
+    int layers_flat = n_layers * n_experts;
     int Mpad = round_up16(M_mlp2);
     int Kpad = round_up16(K_mlp2);
     size_t per_mat_elems = (size_t)Mpad * (size_t)Kpad;
-    HIP_CHECK(hipMalloc(&gpu_w->w_mlp2_packed16,
-        (size_t)n_layers * (size_t)n_experts * per_mat_elems * sizeof(hip_bfloat16)));
-    HIP_CHECK(hipMemset(gpu_w->w_mlp2_packed16, 0,
-        (size_t)n_layers * (size_t)n_experts * per_mat_elems * sizeof(hip_bfloat16)));
+    HIP_CHECK(hipMalloc(&gpu_w->w_mlp2_packed16, (size_t)layers_flat * per_mat_elems * sizeof(hip_bfloat16)));
+    HIP_CHECK(hipMemset(gpu_w->w_mlp2_packed16, 0, (size_t)layers_flat * per_mat_elems * sizeof(hip_bfloat16)));
 
-    hipStream_t stream; HIP_CHECK(hipStreamCreate(&stream));
+    hipStream_t stream;
+    HIP_CHECK(hipStreamCreate(&stream));
     const size_t STAGING_BYTES = (size_t)512 * 1024 * 1024;
     size_t staging_elems = std::max((size_t)1, STAGING_BYTES / sizeof(float));
     const size_t INT_MAX_ELEMS = (size_t)std::numeric_limits<int>::max() - 1024;
     if (staging_elems > INT_MAX_ELEMS) staging_elems = INT_MAX_ELEMS;
-    size_t max_rows = staging_elems / (size_t)K_mlp2; if (max_rows < 1) max_rows = 1;
-
+    size_t max_rows = staging_elems / (size_t)K_mlp2;
+    if (max_rows < 1) max_rows = 1;
     float *d_stage_fp32 = nullptr;
     HIP_CHECK(hipMalloc(&d_stage_fp32, (size_t)max_rows * (size_t)K_mlp2 * sizeof(float)));
     const dim3 block(256);
-
     for (int l = 0; l < n_layers; ++l) {
       for (int e = 0; e < n_experts; ++e) {
         int idx = l * n_experts + e;
-        const float *src = cpu_w->w_mlp2
-            + (size_t)l * (size_t)n_experts * (size_t)M_mlp2 * (size_t)K_mlp2
-            + (size_t)e * (size_t)M_mlp2 * (size_t)K_mlp2;
+        const float *src = cpu_w->w_mlp2 + (size_t)l * (size_t)n_experts * (size_t)M_mlp2 * (size_t)K_mlp2
+                                         + (size_t)e * (size_t)M_mlp2 * (size_t)K_mlp2;
         hip_bfloat16 *dst = gpu_w->w_mlp2_packed16 + (size_t)idx * per_mat_elems;
-
         for (int row_off = 0; row_off < M_mlp2; row_off += (int)max_rows) {
           int rows = std::min((int)max_rows, M_mlp2 - row_off);
           size_t tile_bytes = (size_t)rows * (size_t)K_mlp2 * sizeof(float);
           HIP_CHECK(hipMemcpyAsync(d_stage_fp32, src + (size_t)row_off * (size_t)K_mlp2,
                                    tile_bytes, hipMemcpyHostToDevice, stream));
           size_t total = (size_t)rows * (size_t)K_mlp2;
-          dim3 grid((unsigned)((total + block.x - 1) / block.x));
+          dim3 grid((unsigned int)((total + block.x - 1) / block.x));
           pack_convert_fp32_to_bf16_tiles16_kernel<<<grid, block, 0, stream>>>(
               d_stage_fp32, row_off, rows, M_mlp2, K_mlp2, dst, Mpad, Kpad);
           HIP_CHECK(hipGetLastError());
         }
       }
     }
-
     HIP_CHECK(hipStreamSynchronize(stream));
     HIP_CHECK(hipFree(d_stage_fp32));
     HIP_CHECK(hipStreamDestroy(stream));
-    if (pin_ret_mlp2 == hipSuccess) hipHostUnregister((void*)cpu_w->w_mlp2);
-
-    // (tùy chọn) bỏ con trỏ w_mlp2 cũ, vì không còn dùng đường dot-product:
-    gpu_w->w_mlp2 = nullptr;
   }
+  size_t mlp2_w_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim * (size_t)intermediate_dim;
+  copy_and_convert(cpu_w->w_mlp2, &gpu_w->w_mlp2, mlp2_w_count);
 
   size_t mlp2_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim;
   copy_and_convert(cpu_w->b_mlp2, &gpu_w->b_mlp2, mlp2_b_count);
