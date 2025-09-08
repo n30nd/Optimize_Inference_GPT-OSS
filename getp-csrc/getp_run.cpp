@@ -51,29 +51,8 @@
 #endif
 
 
-// 4 x float (accumulator fragment per lane)
-using v4f = __attribute__((ext_vector_type(4))) float;
-// 4 x u16 (bf16 bit-patterns per lane)
-using v4u16 = __attribute__((ext_vector_type(4))) unsigned short;
-// 8 x u16 (để load 16B = 8 * bf16)
-using v8u16 = __attribute__((ext_vector_type(8))) unsigned short;
 // 128-bit alias cho load/stor 16B
 using u32x4 = __attribute__((ext_vector_type(4))) unsigned int;
-
-__device__ __forceinline__ int lane_id()
-{
-  // wave64
-  return threadIdx.x & 63;
-}
-
-__device__ __forceinline__ v4u16 ld_bf16x4(const hip_bfloat16* p)
-{
-  // nạp 8 byte (4 * bf16) an toàn bằng 32-bit loads (hợp lệ vì hipMalloc trả pointer >= 16B aligned)
-  v4u16 v;
-  const unsigned short* s = reinterpret_cast<const unsigned short*>(p);
-  v[0] = s[0]; v[1] = s[1]; v[2] = s[2]; v[3] = s[3];
-  return v;
-}
 
 
 
@@ -201,11 +180,6 @@ __global__ void convert_fp32_to_bf16_kernel(const float *fp32_data, hip_bfloat16
   if (tid < size) bf16_data[tid] = float_to_bfloat16(fp32_data[tid]);
 }
 
-// BF16 -> FP32 (device)
-__global__ void convert_bf16_to_fp32_kernel(const hip_bfloat16 *bf16_data, float *fp32_data, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < size) fp32_data[tid] = bfloat16_to_float(bf16_data[tid]);
-}
 
 // Pack X: gather FP32 inputs per-slot and pack to [K x Bpad] (FP32)
 __global__ void gather_pack_x_fp32_to_fp32_kernel(const float *x, float *xpack,
@@ -367,214 +341,6 @@ void mlp1_swiglu_grouped_mfma_matvec_kernel(
   }
 }
 
-__global__ void rmsnorm_kernel_bf16(hip_bfloat16 *o, const hip_bfloat16 *x, const hip_bfloat16 *weight, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  __shared__ float shared_ss;
-  if (threadIdx.x == 0) {
-    float ss = 0.0f;
-    for (int j = 0; j < size; j++) {
-      float xv = bfloat16_to_float(x[j]);
-      ss += xv * xv;
-    }
-    ss = ss / size + 1e-5f;
-    shared_ss = 1.0f / sqrtf(ss);
-  }
-  __syncthreads();
-  if (tid < size) {
-    float xv = bfloat16_to_float(x[tid]);
-    float wv = bfloat16_to_float(weight[tid]);
-    o[tid] = float_to_bfloat16(wv * (shared_ss * xv));
-  }
-}
-
-__global__ void matmul_kernel_bf16(hip_bfloat16 *xout, const hip_bfloat16 *x, const hip_bfloat16 *w, int n, int d) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x; // row
-  if (i < d) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) {
-      float wv = bfloat16_to_float(w[i * n + j]);
-      float xv = bfloat16_to_float(x[j]);
-      val += wv * xv;
-    }
-    xout[i] = float_to_bfloat16(val);
-  }
-}
-
-__global__ void add_bias_kernel_bf16(hip_bfloat16 *output, const hip_bfloat16 *bias, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < size) {
-    float ov = bfloat16_to_float(output[tid]);
-    float bv = bfloat16_to_float(bias[tid]);
-    output[tid] = float_to_bfloat16(ov + bv);
-  }
-}
-
-__global__ void copy_kernel_bf16(hip_bfloat16 *dst, const hip_bfloat16 *src, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < size) dst[tid] = src[tid];
-}
-
-// NOTE: serial softmax (thread 0). OK for small sizes; simple & safe.
-__global__ void softmax_kernel_bf16(hip_bfloat16 *x, int size) {
-  __shared__ float max_val;
-  __shared__ float sum_val;
-  if (threadIdx.x == 0) {
-    if (size <= 0) return;
-    max_val = bfloat16_to_float(x[0]);
-    for (int i = 1; i < size; i++) {
-      float v = bfloat16_to_float(x[i]);
-      if (v > max_val) max_val = v;
-    }
-    sum_val = 0.0f;
-    for (int i = 0; i < size; i++) {
-      float v = expf(bfloat16_to_float(x[i]) - max_val);
-      x[i] = float_to_bfloat16(v);
-      sum_val += v;
-    }
-    float inv = 1.0f / sum_val;
-    for (int i = 0; i < size; i++) {
-      float v = bfloat16_to_float(x[i]) * inv;
-      x[i] = float_to_bfloat16(v);
-    }
-  }
-}
-
-__global__ void compute_cos_sin_kernel_bf16(hip_bfloat16 *cos_out, hip_bfloat16 *sin_out, int pos,
-                                            float base, int head_dim, float scaling_factor,
-                                            float initial_context_length, float ntk_beta, float ntk_alpha) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int d_half = head_dim / 2;
-  if (tid < d_half) {
-    float freq = powf(base, ((float)(2 * tid)) / (float)head_dim);
-    float inv_freq;
-    if (scaling_factor > 1.0f) {
-      float low  = d_half * logf(initial_context_length / (ntk_beta  * 2.0f * M_PI)) / logf(base);
-      float high = d_half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(base);
-      float interpolation = 1.0f / (scaling_factor * freq);
-      float extrapolation = 1.0f / freq;
-      float ramp = ((float)tid - low) / (high - low);
-      if (ramp < 0) ramp = 0;
-      if (ramp > 1) ramp = 1;
-      float mask = 1.0f - ramp;
-      inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
-    } else {
-      inv_freq = 1.0f / freq;
-    }
-    float concentration = (scaling_factor > 1.0f) ? (0.1f * logf(scaling_factor) + 1.0f) : 1.0f;
-    float val = (float)pos * inv_freq;
-    cos_out[tid] = float_to_bfloat16(cosf(val) * concentration);
-    sin_out[tid] = float_to_bfloat16(sinf(val) * concentration);
-  }
-}
-
-__global__ void apply_rotary_emb_kernel_bf16(hip_bfloat16 *x, const hip_bfloat16 *cos, const hip_bfloat16 *sin,
-                                             int n_heads, int head_dim) {
-  int h = blockIdx.x;
-  int i = threadIdx.x;
-  int half = head_dim / 2;
-  if (h < n_heads && i < half) {
-    float x1 = bfloat16_to_float(x[h * head_dim + i]);
-    float x2 = bfloat16_to_float(x[h * head_dim + half + i]);
-    float c  = bfloat16_to_float(cos[i]);
-    float s  = bfloat16_to_float(sin[i]);
-    float o1 = x1 * c - x2 * s;
-    float o2 = x2 * c + x1 * s;
-    x[h * head_dim + i]           = float_to_bfloat16(o1);
-    x[h * head_dim + half + i]    = float_to_bfloat16(o2);
-  }
-}
-
-__global__ void attention_scores_kernel_bf16(hip_bfloat16 *att, const hip_bfloat16 *q, const hip_bfloat16 *key_cache,
-                                             int head_dim, int loff, int kv_dim, int kv_mul,
-                                             int h, int pos, int seq_len, const hip_bfloat16 *mask) {
-  int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t <= pos) {
-    const hip_bfloat16 *k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
-    float score = 0.0f;
-    for (int i = 0; i < head_dim; i++) {
-      float qv = bfloat16_to_float(q[i]);
-      float kv = bfloat16_to_float(k[i]);
-      score += qv * kv;
-    }
-    score /= sqrtf((float)head_dim);
-    if (mask != NULL) {
-      float mv = bfloat16_to_float(mask[pos * seq_len + t]);
-      score += mv;
-    }
-    att[t] = float_to_bfloat16(score);
-  }
-}
-
-__global__ void attention_weighted_sum_kernel_bf16(hip_bfloat16 *tb, const hip_bfloat16 *att, const hip_bfloat16 *value_cache,
-                                                   int head_dim, int loff, int kv_dim, int kv_mul,
-                                                   int h, int pos) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < head_dim) {
-    float sum = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-      const hip_bfloat16 *v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
-      float a  = bfloat16_to_float(att[t]);
-      float vv = bfloat16_to_float(v[i]);
-      sum += a * vv;
-    }
-    tb[h * head_dim + i] = float_to_bfloat16(sum);
-  }
-}
-
-__global__ void swiglu_kernel_bf16(hip_bfloat16 *gate_up, const hip_bfloat16 *gate, const hip_bfloat16 *up,
-                                   int intermediate_dim, float swiglu_limit) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < intermediate_dim) {
-    float val   = bfloat16_to_float(gate[tid]);
-    float upval = bfloat16_to_float(up[tid]);
-    if (val   >  swiglu_limit) val   =  swiglu_limit;
-    if (upval >  swiglu_limit) upval =  swiglu_limit;
-    if (upval < -swiglu_limit) upval = -swiglu_limit;
-    const float alpha = 1.702f;
-    val *= (1.0f / (1.0f + expf(-alpha * val)));
-    val *= (upval + 1.0f);
-    gate_up[tid] = float_to_bfloat16(val);
-  }
-}
-
-__global__ void split_gate_up_kernel_bf16(hip_bfloat16 *gate, hip_bfloat16 *up, const hip_bfloat16 *mlp1_out, int intermediate_dim) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < intermediate_dim) {
-    gate[tid] = mlp1_out[2 * tid];
-    up[tid]   = mlp1_out[2 * tid + 1];
-  }
-}
-
-__global__ void weighted_sum_kernel_bf16(hip_bfloat16 *e_agg, const hip_bfloat16 *tb2, float expert_w, int hidden_dim) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < hidden_dim) {
-    float agg = bfloat16_to_float(e_agg[tid]);
-    float add = bfloat16_to_float(tb2[tid]);
-    e_agg[tid] = float_to_bfloat16(agg + add * expert_w);
-  }
-}
-
-__global__ void residual_connection_kernel_bf16(hip_bfloat16 *x, const hip_bfloat16 *residual, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < size) {
-    float xv  = bfloat16_to_float(x[tid]);
-    float rv  = bfloat16_to_float(residual[tid]);
-    x[tid] = float_to_bfloat16(xv + rv);
-  }
-}
-
-// Final output: W (BF16) * x (FP32) -> logits (FP32); avoid big w_out_fp32 buffer
-__global__ void matvec_wbf16_xfp32_outfp32(float *out, const float *x,
-                                           const hip_bfloat16 *w, int n, int d) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x; // row
-  if (i < d) {
-    float sum = 0.0f;
-    for (int j = 0; j < n; ++j) {
-      sum += (float)w[i * n + j] * x[j];
-    }
-    out[i] = sum;
-  }
-}
 
 // ========================= FLOAT KERNELS =========================
 // New kernels for float RunState buffers
@@ -599,235 +365,8 @@ __global__ void rmsnorm_kernel_float(float *o, const float *x, const hip_bfloat1
   }
 }
 
-__global__ void matmul_kernel_float(float *xout, const float *x, const hip_bfloat16 *w, int n, int d) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x; // row
-  if (i < d) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) {
-      float wv = bfloat16_to_float(w[i * n + j]);
-      float xv = x[j];
-      val += wv * xv;
-    }
-    xout[i] = val;
-  }
-}
-
-// Batched variant: same weights across batch, different inputs/outputs
-__global__ void matmul_kernel_float_batched(float *xout, const float *x,
-                                            const hip_bfloat16 *w, int n, int d,
-                                            int batch, int out_stride, int in_stride,
-                                            const int *slot_ids) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x; // row
-  int b = blockIdx.y; // batch index
-  if (i < d && b < batch) {
-    float val = 0.0f;
-    int sid = slot_ids[b];
-    const float *x_b = x + (size_t)sid * (size_t)in_stride;
-    for (int j = 0; j < n; j++) {
-      float wv = bfloat16_to_float(w[i * n + j]);
-      float xv = x_b[j];
-      val += wv * xv;
-    }
-    float *out_s = xout + (size_t)sid * (size_t)out_stride;
-    out_s[i] = val;
-  }
-}
 
 // ------------------------- New BF16 GEMM path (packed 16x16) -------------------------
-
-// Gather/pack X (FP32) from strided per-slot inputs to contiguous BF16 [K x Bpad]
-__global__ void gather_pack_x_fp32_to_bf16_kernel(const float *x, hip_bfloat16 *xpack,
-                                                 int K, int B, int Bpad, int in_stride,
-                                                 const int *slot_ids) {
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t total = (size_t)K * (size_t)Bpad;
-  if (idx >= total) return;
-  int k = (int)(idx / Bpad);
-  int b = (int)(idx % Bpad);
-  if (b < B) {
-    int sid = slot_ids[b];
-    float v = x[(size_t)sid * (size_t)in_stride + (size_t)k];
-    xpack[(size_t)k * (size_t)Bpad + (size_t)b] = float_to_bfloat16(v);
-  } else {
-    xpack[(size_t)k * (size_t)Bpad + (size_t)b] = float_to_bfloat16(0.0f);
-  }
-}
-
-// // GEMM: W_packed [Mpad x Kpad] (tiles 16x16), Xpack [K x Bpad] -> scatter to dst per-slot
-// // Accumulate in FP32, add bias per-row in epilogue, scatter columns via slot_ids
-// __global__ void gemm16x16_bf16_packedW_batched_scatter_bias(
-//     const hip_bfloat16 *W_packed,
-//     const hip_bfloat16 *Xpack,
-//     float *dst,
-//     const hip_bfloat16 *bias,
-//     int M, int K, int B, int Bpad,
-//     int out_stride,
-//     const int *slot_ids,
-//     int Mpad, int Kpad) {
-
-//   // Tile indices
-//   int tile_m = blockIdx.x; // along M
-//   int tile_n = blockIdx.y; // along B
-//   int ty = threadIdx.y;    // [0..15] row within tile
-//   int tx = threadIdx.x;    // [0..15] col within tile
-
-//   int row = tile_m * 16 + ty;
-//   int col = tile_n * 16 + tx;
-
-//   const int Ktiles = (Kpad + 15) / 16;
-
-//   __shared__ hip_bfloat16 sW[16][16];
-//   __shared__ hip_bfloat16 sX[16][16];
-
-//   float acc = 0.0f;
-
-//   for (int kk = 0; kk < Ktiles; ++kk) {
-//     // Load W tile [16x16] for this block row and kk
-//     size_t w_tile_base = ((size_t)tile_m * (size_t)Ktiles + (size_t)kk) * (size_t)256;
-//     sW[ty][tx] = W_packed[w_tile_base + (size_t)ty * 16 + (size_t)tx];
-//     // Load X tile [16x16] for this kk and block col (K-major layout)
-//     int k_base = kk * 16;
-//     int b_base = tile_n * 16;
-//     hip_bfloat16 xv = float_to_bfloat16(0.0f);
-//     if (k_base + ty < Kpad && b_base + tx < Bpad) {
-//       // Safe to read from Xpack (padded with zeros in K/B as needed)
-//       xv = Xpack[(size_t)(k_base + ty) * (size_t)Bpad + (size_t)(b_base + tx)];
-//     }
-//     sX[ty][tx] = xv;
-//     __syncthreads();
-
-//     // Compute 16-way FMA in registers
-//     #pragma unroll
-//     for (int k = 0; k < 16; ++k) {
-//       float wv = bfloat16_to_float(sW[ty][k]);
-//       float xv2 = bfloat16_to_float(sX[k][tx]);
-//       acc += wv * xv2;
-//     }
-//     __syncthreads();
-//   }
-
-//   if (row < M && col < B) {
-//     if (bias) acc += bfloat16_to_float(bias[row]);
-//     int sid = slot_ids[col];
-//     float *out_s = dst + (size_t)sid * (size_t)out_stride;
-//     out_s[row] = acc;
-//   }
-// }
-// GEMM MFMA: W_packed [Mpad x Kpad] (tile 16x16, liên tục), Xpack [K x Bpad] (row-major theo K, stride = Bpad)
-// Accumulate FP32, cộng bias, scatter về từng slot (cột) qua slot_ids.
-// Mỗi block = 1 wave (64 thread) cho 1 ô 16x16 (tile_m, tile_n).
-using v4s = __attribute__((ext_vector_type(4))) short;
-__global__ __launch_bounds__(64)
-void gemm16x16_mfma_bf16_packedW_batched_scatter_bias(
-    const hip_bfloat16* __restrict__ W_packed,   // [Mpad x Kpad] packed dạng tile 16x16, liên tục 256 elems/tile
-    const hip_bfloat16* __restrict__ Xpack,      // [K x Bpad], stride = Bpad
-    float* __restrict__ dst,                     // scatter theo slot
-    const hip_bfloat16* __restrict__ bias,       // [M] hoặc nullptr
-    int M, int K, int B, int Bpad,
-    int out_stride,                              // = M
-    const int* __restrict__ slot_ids,
-    int Mpad, int Kpad)
-{
-  const int lane = threadIdx.x & 63;
-  if (blockDim.x != 64 || blockDim.y != 1) return;
-
-  // Tile chỉ số theo M (hàng) và B (cột)
-  const int tile_m = blockIdx.x;     // tile theo M
-  const int tile_n = blockIdx.y;     // tile theo B
-  const int base_row = tile_m * 16;  // hàng bắt đầu của tile
-  const int base_col = tile_n * 16;  // cột  bắt đầu của tile
-
-  // Lane mapping CHUẨN cho MFMA 16x16x16bf16_1k
-  const int Ai   = lane % 16;           // hàng của A dùng để load
-  const int Aj0  = (lane / 16) * 4;     // 4 cột liên tiếp của A
-  const int Bj   = lane % 16;           // cột của B
-  const int Bk0  = (lane / 16) * 4;     // 4 hàng liên tiếp của B
-
-  const int Dc   = lane % 16;           // cột của D mà lane này phụ trách (trong tile)
-  const int Dr0  = (lane / 16) * 4;     // 4 hàng của D mà lane này phụ trách (trong tile)
-
-  const int Ktiles = (Kpad + 15) / 16;
-
-  // Shared: 1 tile W (16x16) + 1 tile X (16x16)
-  __shared__ __align__(16) hip_bfloat16 sW[16 * 16];
-  __shared__ __align__(16) hip_bfloat16 sX[16 * 16];
-
-  v4f acc = {0.f, 0.f, 0.f, 0.f};
-
-  for (int kk = 0; kk < Ktiles; ++kk) {
-    // ---- Tải W tile (liên tục 512B): dùng 32 lane đầu, mỗi lane copy 16B
-    if (lane < 32) {
-      const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
-      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256; // 256 = 16*16
-      const hip_bfloat16* w_src = W_packed + w_tile_base;
-      reinterpret_cast<u32x4*>(sW)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
-    }
-
-    // ---- Tải X tile (16x16, stride Bpad): dùng 32 lane còn lại, mỗi lane copy nửa hàng (16B)
-    if (lane >= 32) {
-      const int vec = lane - 32;           // 0..31
-      const int r   = (vec >> 1);          // 0..15 (mỗi hàng 2 nửa: 0..7 và 8..15)
-      const int c8  = (vec & 1) * 8;       // 0 hoặc 8
-
-      const int k_row = kk * 16 + r;
-      hip_bfloat16* dst_row = sX + r * 16 + c8;
-
-      const bool in_k = (k_row < Kpad);
-      const bool in_b = (base_col + c8) < Bpad;
-
-      if (in_k && in_b) {
-        const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
-        reinterpret_cast<u32x4*>(dst_row)[0] = reinterpret_cast<const u32x4*>(src)[0]; // 16B
-      } else {
-        reinterpret_cast<u32x4*>(dst_row)[0] = u32x4{0u,0u,0u,0u};
-      }
-    }
-
-    __syncthreads();
-
-    // ---- Tạo a4 và b4 đúng mapping:
-    // A: hàng Ai, cột Aj0..Aj0+3 (LIÊN TIẾP)
-    v4s a4;
-    {
-      const short* rowptr = reinterpret_cast<const short*>(&sW[Ai * 16]);
-      a4[0] = rowptr[Aj0 + 0];
-      a4[1] = rowptr[Aj0 + 1];
-      a4[2] = rowptr[Aj0 + 2];
-      a4[3] = rowptr[Aj0 + 3];
-    }
-    // B: hàng Bk0..Bk0+3, cột Bj
-    v4s b4;
-    {
-      const short* sx = reinterpret_cast<const short*>(sX);
-      b4[0] = sx[(Bk0 + 0) * 16 + Bj];
-      b4[1] = sx[(Bk0 + 1) * 16 + Bj];
-      b4[2] = sx[(Bk0 + 2) * 16 + Bj];
-      b4[3] = sx[(Bk0 + 3) * 16 + Bj];
-    }
-
-    // MFMA: acc = A(4) * B(4) + acc
-    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a4, b4, acc, 0, 0, 0);
-
-    __syncthreads();
-  }
-
-  // ---- Epilogue: cộng bias và scatter về slot theo cột "col = base_col + Dc"
-  const int col = base_col + Dc;
-  if (col < B) {
-    const int sid = slot_ids[col];
-    float* out_s = dst + (size_t)sid * (size_t)out_stride;
-
-    // Mỗi lane ghi 4 HÀNG: row = base_row + (Dr0 + r)
-    #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-      const int row = base_row + (Dr0 + r);
-      if (row < M) {
-        const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
-        out_s[row] = acc[r] + biasv;
-      }
-    }
-  }
-}
 
 
 
@@ -859,7 +398,6 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias(
 
   const int Ktiles = (Kpad + 15) / 16;
 
-  extern __shared__ unsigned char s_mem[]; // not used; keep static allocation
   __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
   __shared__ __align__(16) float sWf[16 * 16];
   __shared__ __align__(16) float sX[16 * 16];
@@ -960,25 +498,6 @@ __global__ void pack_convert_fp32_to_bf16_tiles16_kernel(
   dst_packed[dst_index] = float_to_bfloat16(src_fp32[(size_t)r * (size_t)K + (size_t)c]);
 }
 
-// Pack FP32 row-major [M x K] into FP32 16x16 tiles with zero padding
-__global__ void pack_convert_fp32_to_fp32_tiles16_kernel(
-    const float *src_fp32, int row_offset, int rows,
-    int M, int K,
-    float *dst_packed, int Mpad, int Kpad) {
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t total = (size_t)rows * (size_t)K;
-  if (idx >= total) return;
-  int r = (int)(idx / K);
-  int c = (int)(idx % K);
-  int m = row_offset + r;
-  int tile_m = m / 16;
-  int tile_k = c / 16;
-  int im = m % 16;
-  int ik = c % 16;
-  size_t tiles_per_row = (size_t)(Kpad + 15) / 16;
-  size_t dst_index = ((size_t)tile_m * tiles_per_row + (size_t)tile_k) * (size_t)256 + (size_t)im * 16 + (size_t)ik;
-  dst_packed[dst_index] = src_fp32[(size_t)r * (size_t)K + (size_t)c];
-}
 
 // Grouped MLP1 matvec using MFMA and packed BF16 weights.
 // For each selection m (sid,eid), compute y = W[layer,eid] @ x[sid] + b[layer,eid]
@@ -1093,130 +612,7 @@ void mlp1_grouped_mfma_matvec_kernel(
   }
 }
 
-__global__ void add_bias_kernel_float(float *output, const hip_bfloat16 *bias, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < size) {
-    float ov = output[tid];
-    float bv = bfloat16_to_float(bias[tid]);
-    output[tid] = ov + bv;
-  }
-}
 
-__global__ void add_bias_kernel_float_batched(float *output, const hip_bfloat16 *bias,
-                                              int size, int batch, int out_stride,
-                                              const int *slot_ids) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int b = blockIdx.y;
-  if (tid < size && b < batch) {
-    int sid = slot_ids[b];
-    float *out_s = output + (size_t)sid * (size_t)out_stride;
-    float ov = out_s[tid];
-    float bv = bfloat16_to_float(bias[tid]);
-    out_s[tid] = ov + bv;
-  }
-}
-
-__global__ void copy_kernel_float(float *dst, const float *src, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < size) dst[tid] = src[tid];
-}
-
-__global__ void softmax_kernel_float(float *x, int size) {
-  __shared__ float max_val;
-  __shared__ float sum_val;
-  if (threadIdx.x == 0) {
-    if (size <= 0) return;
-    max_val = x[0];
-    for (int i = 1; i < size; i++) {
-      float v = x[i];
-      if (v > max_val) max_val = v;
-    }
-    sum_val = 0.0f;
-    for (int i = 0; i < size; i++) {
-      float v = expf(x[i] - max_val);
-      x[i] = v;
-      sum_val += v;
-    }
-    float inv = 1.0f / sum_val;
-    for (int i = 0; i < size; i++) {
-      x[i] *= inv;
-    }
-  }
-}
-
-// Serial top-k selection on device for a single vector of length n.
-// Keeps K best (value, index) pairs in descending order.
-__global__ void topk_kernel_float(const float *scores, int n, int k, float *topv, int *topi) {
-  if (threadIdx.x != 0) return;
-  // Initialize outputs
-  for (int i = 0; i < k; ++i) {
-    topv[i] = -INFINITY;
-    topi[i] = -1;
-  }
-  // One-pass insertion into top-k buffers
-  for (int j = 0; j < n; ++j) {
-    float v = scores[j];
-    // find position where v should be inserted among current topk
-    int pos = -1;
-    for (int t = 0; t < k; ++t) {
-      if (v > topv[t]) { pos = t; break; }
-    }
-    if (pos >= 0) {
-      // shift down [pos..k-2] -> [pos+1..k-1]
-      for (int t = k - 1; t > pos; --t) {
-        topv[t] = topv[t - 1];
-        topi[t] = topi[t - 1];
-      }
-      topv[pos] = v;
-      topi[pos] = j;
-    }
-  }
-}
-
-__global__ void compute_cos_sin_kernel_float(float *cos_out, float *sin_out, int pos,
-                                            float base, int head_dim, float scaling_factor,
-                                            float initial_context_length, float ntk_beta, float ntk_alpha) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int d_half = head_dim / 2;
-  if (tid < d_half) {
-    float freq = powf(base, ((float)(2 * tid)) / (float)head_dim);
-    float inv_freq;
-    if (scaling_factor > 1.0f) {
-      float low  = d_half * logf(initial_context_length / (ntk_beta  * 2.0f * M_PI)) / logf(base);
-      float high = d_half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(base);
-      float interpolation = 1.0f / (scaling_factor * freq);
-      float extrapolation = 1.0f / freq;
-      float ramp = ((float)tid - low) / (high - low);
-      if (ramp < 0) ramp = 0;
-      if (ramp > 1) ramp = 1;
-      float mask = 1.0f - ramp;
-      inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
-    } else {
-      inv_freq = 1.0f / freq;
-    }
-    float concentration = (scaling_factor > 1.0f) ? (0.1f * logf(scaling_factor) + 1.0f) : 1.0f;
-    float val = (float)pos * inv_freq;
-    cos_out[tid] = cosf(val) * concentration;
-    sin_out[tid] = sinf(val) * concentration;
-  }
-}
-
-__global__ void apply_rotary_emb_kernel_float(float *x, const float *cos, const float *sin,
-                                             int n_heads, int head_dim) {
-  int h = blockIdx.x;
-  int i = threadIdx.x;
-  int half = head_dim / 2;
-  if (h < n_heads && i < half) {
-    float x1 = x[h * head_dim + i];
-    float x2 = x[h * head_dim + half + i];
-    float c  = cos[i];
-    float s  = sin[i];
-    float o1 = x1 * c - x2 * s;
-    float o2 = x2 * c + x1 * s;
-    x[h * head_dim + i]           = o1;
-    x[h * head_dim + half + i]    = o2;
-  }
-}
 
 // Batched RoPE: x is [B, n_heads*head_dim], cos/sin per batch
 __global__ void apply_rotary_emb_kernel_float_batched(float *x, const float *cos, const float *sin,
@@ -1242,103 +638,7 @@ __global__ void apply_rotary_emb_kernel_float_batched(float *x, const float *cos
   }
 }
 
-__global__ void attention_scores_kernel_float(float *att, const float *q, const float *key_cache,
-                                             int head_dim, int loff, int kv_dim, int kv_mul,
-                                             int h, int pos, int seq_len, const float *mask) {
-  int t = blockIdx.x * blockDim.x + threadIdx.x;
-  if (t <= pos) {
-    const float *k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
-    float score = 0.0f;
-    for (int i = 0; i < head_dim; i++) {
-      float qv = q[i];
-      float kv = k[i];
-      score += qv * kv;
-    }
-    score /= sqrtf((float)head_dim);
-    if (mask != NULL) {
-      float mv = mask[pos * seq_len + t];
-      score += mv;
-    }
-    att[t] = score;
-  }
-}
 
-__global__ void attention_weighted_sum_kernel_float(float *tb, const float *att, const float *value_cache,
-                                                   int head_dim, int loff, int kv_dim, int kv_mul,
-                                                   int h, int pos) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < head_dim) {
-    float sum = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-      const float *v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_dim;
-      float a  = att[t];
-      float vv = v[i];
-      sum += a * vv;
-    }
-    tb[h * head_dim + i] = sum;
-  }
-}
-
-// Write attention sink value directly on device: reads BF16 sink and writes float
-__global__ void add_attn_sink_from_bf16_kernel_float(float *att, int write_index,
-                                                     const hip_bfloat16 *attn_sinks,
-                                                     int layer, int n_attn_heads, int head) {
-  if (threadIdx.x == 0) {
-    size_t sink_idx = (size_t)layer * (size_t)n_attn_heads + (size_t)head;
-    att[write_index] = bfloat16_to_float(attn_sinks[sink_idx]);
-  }
-}
-
-__global__ void swiglu_kernel_float(float *gate_up, const float *gate, const float *up,
-                                   int intermediate_dim, float swiglu_limit) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < intermediate_dim) {
-    float val   = gate[tid];
-    float upval = up[tid];
-    if (val   >  swiglu_limit) val   =  swiglu_limit;
-    if (upval >  swiglu_limit) upval =  swiglu_limit;
-    if (upval < -swiglu_limit) upval = -swiglu_limit;
-    const float alpha = 1.702f;
-    val *= (1.0f / (1.0f + expf(-alpha * val)));
-    val *= (upval + 1.0f);
-    gate_up[tid] = val;
-  }
-}
-
-__global__ void split_gate_up_kernel_float(float *gate, float *up, const float *mlp1_out, int intermediate_dim) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < intermediate_dim) {
-    gate[tid] = mlp1_out[2 * tid];
-    up[tid]   = mlp1_out[2 * tid + 1];
-  }
-}
-
-__global__ void weighted_sum_kernel_float(float *e_agg, const float *tb2, float expert_w, int hidden_dim) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < hidden_dim) {
-    float agg = e_agg[tid];
-    float add = tb2[tid];
-    e_agg[tid] = agg + add * expert_w;
-  }
-}
-
-// Atomic variant for parallel accumulation across experts/streams
-__global__ void weighted_sum_atomic_kernel_float(float *e_agg, const float *tb2, float expert_w, int hidden_dim) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < hidden_dim) {
-    float add = tb2[tid] * expert_w;
-    atomicAdd(&e_agg[tid], add);
-  }
-}
-
-__global__ void residual_connection_kernel_float(float *x, const float *residual, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < size) {
-    float xv  = x[tid];
-    float rv  = residual[tid];
-    x[tid] = xv + rv;
-  }
-}
 
 __global__ void residual_connection_kernel_float_batched(float *x, const float *residual, int size,
                                                          int batch, int stride, const int *slot_ids) {
@@ -1530,88 +830,6 @@ __global__ void mlp2_accum_grouped_kernel_float(float *e_agg,
 }
 
 
-__global__ void bf16_to_float_kernel(float *out, const hip_bfloat16 *in, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (tid < size) {
-    out[tid] = bfloat16_to_float(in[tid]);
-  }
-}
-
-// FlashAttention-like single-sample kernel (used for testing/reference)
-__global__ void flash_attention_kernel_optimized(
-    const float *all_q,           // Q cho tất cả heads [n_heads * head_dim]
-    const float *key_cache,       // K cache [layers * seq_len * kv_dim]
-    const float *value_cache,     // V cache [layers * seq_len * kv_dim]
-    const hip_bfloat16 *attn_sinks, // Attention sinks [layers * n_heads]
-    float *all_output,            // Output [n_heads * head_dim]
-    const float *mask,            // Sliding window mask (optional)
-    int head_dim, int loff, int kv_dim, int kv_mul,
-    int n_heads, int pos, int seq_len, int layer,
-    bool can_add_sink,
-    int tile_size) {              // Unused for now
-
-  int h = blockIdx.y;  // Head index
-  if (h >= n_heads) return;
-
-  const float *q_head = all_q + (size_t)h * (size_t)head_dim;
-  float *output = all_output + (size_t)h * (size_t)head_dim;
-
-  // Shared memory buffer for attention scores
-  extern __shared__ float shared_att[];
-  
-  // Phase 1: Compute attention scores
-  for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
-    const float *k = key_cache + (size_t)loff + (size_t)t * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
-    float score = 0.0f;
-    for (int i = 0; i < head_dim; i++) {
-      score += q_head[i] * k[i];
-    }
-    score /= sqrtf((float)head_dim);
-    if (mask != NULL) {
-      score += mask[(size_t)pos * (size_t)seq_len + (size_t)t];
-    }
-    shared_att[t] = score;
-  }
-  __syncthreads();
-
-  // Phase 2: Add attention sink
-  if (threadIdx.x == 0 && can_add_sink && (pos + 1) < seq_len) {
-    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
-    shared_att[pos + 1] = bfloat16_to_float(attn_sinks[sink_idx]);
-  }
-  __syncthreads();
-
-  // Phase 3: Softmax
-  if (threadIdx.x == 0) {
-    int len = can_add_sink ? (pos + 2) : (pos + 1);
-    if (len > 0) {
-      float max_val = shared_att[0];
-      for (int i = 1; i < len; i++) max_val = fmaxf(max_val, shared_att[i]);
-      float sum_val = 0.0f;
-      for (int i = 0; i < len; i++) { 
-        float v = expf(shared_att[i] - max_val); 
-        shared_att[i] = v; 
-        sum_val += v; 
-      }
-      float inv = 1.0f / (sum_val + 1e-8f); // Add epsilon for stability
-      for (int i = 0; i < len; i++) shared_att[i] *= inv;
-    }
-  }
-  __syncthreads();
-
-  // Phase 4: Weighted sum with values
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    float sum = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-      const float *v = value_cache + (size_t)loff + (size_t)t * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
-      sum += shared_att[t] * v[i];
-    }
-    output[i] = sum;
-  }
-
-
-}
-
 // Batched FlashAttention-like kernel (simplified for reliability)
 __global__ void flash_attention_kernel_optimized_batched(
     const float *all_q,           // [B, n_heads*head_dim]
@@ -1697,10 +915,8 @@ __global__ void flash_attention_kernel_optimized_batched(
 
 
 }
-// (Fallback multi-head attention and env-based FlashAttention config removed to simplify code.)
 
 
-#define VOCAB_SIZE 201088
 #define WARP_SIZE 64  // AMD wavefront size
 #define BLOCK_SIZE 256
 #define UNROLL_FACTOR 8
@@ -1896,26 +1112,7 @@ __global__ void logits_final_batched_kernel(const float *x,
 }
 
 
-// ------------------------- CPU top-k -------------------------
 
-void topk_cpu(float *topk_values, int *topk_indices, const float *router_score, int num_experts, int experts_per_token) {
-  struct Pair { float value; int index; };
-  Pair *pairs = (Pair*)malloc(num_experts * sizeof(Pair));
-  for (int i = 0; i < num_experts; ++i) {
-    pairs[i].value = router_score[i];
-    pairs[i].index = i;
-  }
-  for (int i = 0; i < experts_per_token; i++) {
-    int max_idx = i;
-    for (int j = i + 1; j < num_experts; j++) {
-      if (pairs[j].value > pairs[max_idx].value) max_idx = j;
-    }
-    if (max_idx != i) { Pair t = pairs[i]; pairs[i] = pairs[max_idx]; pairs[max_idx] = t; }
-    topk_values[i]  = pairs[i].value;
-    topk_indices[i] = pairs[i].index;
-  }
-  free(pairs);
-}
 
 // ------------------------- Alloc/Free run state -------------------------
 void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch);
@@ -2724,10 +1921,6 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   auto copy_and_convert = [&](const float *cpu_data, hip_bfloat16 **gpu_data, size_t count) {
     const size_t bf16_size = count * sizeof(hip_bfloat16);
     HIP_CHECK(hipMalloc(gpu_data, bf16_size));
-
-    auto toGB = [](size_t bytes){ return (double)bytes / GB; };
-    // printf("BF16 SIZE: %.2f GB\n", toGB(bf16_size));
-    // printf("FP32 SIZE: %.2f GB\n", toGB(count * sizeof(float)));
 
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
