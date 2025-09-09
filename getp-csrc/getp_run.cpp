@@ -37,6 +37,17 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// Global BLOCK_B: configurable via environment variable GETP_MOE_BLOCK.
+// Falls back to 16 if not set or invalid.
+static int read_BLOCK_B_env() {
+  const char* s = getenv("GETP_MOE_BLOCK");
+  if (!s || !*s) return 16;
+  int v = atoi(s);
+  if (v <= 0) return 16;
+  return v;
+}
+static const int BLOCK_B = read_BLOCK_B_env();
+
 #define HIP_CHECK(cmd) \
   do { \
     hipError_t error = cmd; \
@@ -2023,8 +2034,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 blockH(256), gridH((M + blockH.x - 1) / blockH.x);
       histogram_eid_counts_kernel<<<gridH, blockH, 0, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.sel_eids, M, gpu_ctx->state.eid_counts, p->n_experts);
-      // 6') Xây prefix-sum đã đệm theo BLOCK_B
-      const int BLOCK_B = (getenv("GETP_MOE_BLOCK") ? std::max(1, atoi(getenv("GETP_MOE_BLOCK"))) : 16);
+      // 6') Xây prefix-sum đã đệm theo BLOCK_B (global)
       build_padded_offsets_kernel<<<1,1,0,gpu_ctx->batch_stream>>>(
           gpu_ctx->state.eid_counts,
           gpu_ctx->state.padded_offsets,
@@ -2121,7 +2131,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
             /*stride*/  I,
             /*col_ids*/ gpu_ctx->state.d_col_ids,
             /*blk→eid*/ gpu_ctx->state.block_expert_ids,
-            /*BLOCK_B*/ 16,
+            /*BLOCK_B*/ BLOCK_B,
             /*nexp,l*/  p->n_experts, l,
             /*pads*/    Mpad_mlp1, Kpad_mlp1,
             /*limit*/   p->swiglu_limit);
@@ -2485,8 +2495,6 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->eid_offsets, ((size_t)p->n_experts + 1) * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->eid_cursors,  (size_t)p->n_experts * sizeof(int)));
 
-
-  const int BLOCK_B = (getenv("GETP_MOE_BLOCK") ? std::max(1, atoi(getenv("GETP_MOE_BLOCK"))) : 16);
 
   int Bpad_batch = ((max_batch + 15) / 16) * 16;  // cho QKV/W_O/Router
   // size_t Mmax      = (size_t)max_batch * (size_t)p->experts_per_token;               // B tối đa của selections
