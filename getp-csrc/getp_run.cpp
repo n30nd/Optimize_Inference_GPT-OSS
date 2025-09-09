@@ -53,18 +53,6 @@
 
 // 128-bit alias cho load/stor 16B
 using u32x4 = __attribute__((ext_vector_type(4))) unsigned int;
-// Optional: fast SwiGLU path (set GETP_FAST_SWIGLU=1 at compile time to enable)
-#ifndef GETP_FAST_SWIGLU
-#define GETP_FAST_SWIGLU 0
-#endif
-__device__ __forceinline__ float sigmoid_approx(float x) {
-#if GETP_FAST_SWIGLU
-  // Use fast exp for speed; acceptable small numerical drift
-  return 1.0f / (1.0f + __expf(-x));
-#else
-  return 1.0f / (1.0f + expf(-x));
-#endif
-}
 
 
 
@@ -1314,7 +1302,7 @@ void gemm16x16_mlp1_fused_swiglu_scatter(
       gate = fminf( swiglu_limit, gate);
       up   = fminf( swiglu_limit, fmaxf(-swiglu_limit, up));
       // SwiGLU: σ(α·gate) * gate * (up + 1)
-      gate *= sigmoid_approx(alpha * gate);
+      gate *= (1.f / (1.f + __expf(-alpha * gate)));
       const int row_half = r >> 1;                     // 0..I-1
       if (row_half < I) {
         out_base[row_half] = gate * (up + 1.f);
@@ -1451,7 +1439,7 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
       }
       gate = fminf(swiglu_limit, gate);
       up   = fminf(swiglu_limit, fmaxf(-swiglu_limit, up));
-      gate *= sigmoid_approx(alpha * gate);
+      gate *= (1.f / (1.f + __expf(-alpha * gate)));
       const int row_half = r >> 1;
       if (row_half < I) {
         out_base[row_half] = gate * (up + 1.f);
