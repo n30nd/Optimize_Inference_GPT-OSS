@@ -263,7 +263,6 @@ void mlp1_swiglu_grouped_mfma_matvec_kernel(
   const hip_bfloat16* __restrict__ B = b_mlp1 + mat_index * (size_t)out_dim;
 
   __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
-  __shared__ __align__(16) float        sWf[16 * 16];
   __shared__ __align__(16) float        sX[16 * 16];
   __shared__ __align__(16) float        sY[16];       // store accumulated rows for this 16x1 tile
 
@@ -298,25 +297,23 @@ void mlp1_swiglu_grouped_mfma_matvec_kernel(
 
     __syncthreads();
 
-    // Convert W BF16 -> FP32 in shared
-    {
-      int idx4 = lane * 4;
-      if (idx4 < 256) {
-        sWf[idx4 + 0] = bfloat16_to_float(sWb[idx4 + 0]);
-        sWf[idx4 + 1] = bfloat16_to_float(sWb[idx4 + 1]);
-        sWf[idx4 + 2] = bfloat16_to_float(sWb[idx4 + 2]);
-        sWf[idx4 + 3] = bfloat16_to_float(sWb[idx4 + 3]);
-      }
-    }
-
-    // 4 micro-steps across the 16-wide K tile
-    #pragma unroll
-    for (int t4 = 0; t4 < 4; ++t4) {
-      const int k4 = ty + 4 * t4; // 0..15
-      float amk = sWf[tx * 16 + k4];   // A: row=tx, col=k4
-      float bkn = sX[k4 * 16 + tx];    // B: row=k4, col=tx
-      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
-    }
+    // 4 micro-steps across the 16-wide K tile (convert BF16 A on-the-fly to registers)
+    const int k0 = ty +  0;  // 0..3
+    const int k1 = ty +  4;  // 4..7
+    const int k2 = ty +  8;  // 8..11
+    const int k3 = ty + 12;  // 12..15
+    float a0 = bfloat16_to_float(sWb[tx*16 + k0]);
+    float a1 = bfloat16_to_float(sWb[tx*16 + k1]);
+    float a2 = bfloat16_to_float(sWb[tx*16 + k2]);
+    float a3 = bfloat16_to_float(sWb[tx*16 + k3]);
+    float b0 = sX[k0*16 + tx];
+    float b1 = sX[k1*16 + tx];
+    float b2 = sX[k2*16 + tx];
+    float b3 = sX[k3*16 + tx];
+    dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(a0, b0, dmn, 0, 0, 0);
+    dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(a1, b1, dmn, 0, 0, 0);
+    dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(a2, b2, dmn, 0, 0, 0);
+    dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(a3, b3, dmn, 0, 0, 0);
 
     __syncthreads();
   }
@@ -546,14 +543,23 @@ void mlp1_grouped_mfma_matvec_kernel(
 
   // Shared tiles
   __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
-  __shared__ __align__(16) float        sWf[16 * 16];
   __shared__ __align__(16) float        sX[16 * 16];
+  __shared__ __align__(16) float        sBias[16];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   float4v dmn = {0.f, 0.f, 0.f, 0.f};
 
   const int K = hidden_dim;
   const int Ktiles = (Kpad + 15) / 16;
+
+  // Cache bias for this tile once if present
+  if (B) {
+    if (lane < 16) {
+      const int r = base_row + lane;
+      sBias[lane] = (r < out_dim) ? bfloat16_to_float(B[r]) : 0.f;
+    }
+    __syncthreads();
+  }
 
   for (int kk = 0; kk < Ktiles; ++kk) {
     // Load W tile [16x16] from packed BF16 storage
@@ -581,25 +587,23 @@ void mlp1_grouped_mfma_matvec_kernel(
 
     __syncthreads();
 
-    // Convert W BF16 -> FP32 in shared
-    {
-      int idx4 = lane * 4;
-      if (idx4 < 256) {
-        sWf[idx4 + 0] = bfloat16_to_float(sWb[idx4 + 0]);
-        sWf[idx4 + 1] = bfloat16_to_float(sWb[idx4 + 1]);
-        sWf[idx4 + 2] = bfloat16_to_float(sWb[idx4 + 2]);
-        sWf[idx4 + 3] = bfloat16_to_float(sWb[idx4 + 3]);
-      }
-    }
-
-    // 4 micro-steps across the 16-wide K tile
-    #pragma unroll
-    for (int t4 = 0; t4 < 4; ++t4) {
-      const int k4 = ty + 4 * t4; // 0..15
-      float amk = sWf[tx * 16 + k4];   // A: row=tx, col=k4
-      float bkn = sX[k4 * 16 + tx];    // B: row=k4, col=tx
-      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
-    }
+    // 4 micro-steps across the 16-wide K tile (convert BF16 A on-the-fly)
+    const int k0 = ty +  0;  // 0..3
+    const int k1 = ty +  4;  // 4..7
+    const int k2 = ty +  8;  // 8..11
+    const int k3 = ty + 12;  // 12..15
+    float a0 = bfloat16_to_float(sWb[tx*16 + k0]);
+    float a1 = bfloat16_to_float(sWb[tx*16 + k1]);
+    float a2 = bfloat16_to_float(sWb[tx*16 + k2]);
+    float a3 = bfloat16_to_float(sWb[tx*16 + k3]);
+    float b0 = sX[k0*16 + tx];
+    float b1 = sX[k1*16 + tx];
+    float b2 = sX[k2*16 + tx];
+    float b3 = sX[k3*16 + tx];
+    dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(a0, b0, dmn, 0, 0, 0);
+    dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(a1, b1, dmn, 0, 0, 0);
+    dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(a2, b2, dmn, 0, 0, 0);
+    dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(a3, b3, dmn, 0, 0, 0);
 
     __syncthreads();
   }
@@ -609,9 +613,10 @@ void mlp1_grouped_mfma_matvec_kernel(
     float* out_vec = mlp1_out_all + (size_t)msel * (size_t)out_dim;
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      const int row = base_row + (ty * 4 + i);
+      const int rloc = ty * 4 + i;
+      const int row = base_row + rloc;
       if (row < out_dim) {
-        const float biasv = B ? bfloat16_to_float(B[row]) : 0.f;
+        const float biasv = B ? sBias[rloc] : 0.f;
         out_vec[row] = dmn[i] + biasv;
       }
     }
@@ -1289,8 +1294,8 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
   const hip_bfloat16* __restrict__ B = b_mlp2 + mat_index * (size_t)hidden_dim;
 
   __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
-  __shared__ __align__(16) float        sWf[16 * 16];
   __shared__ __align__(16) float        sX[16 * 16];
+  __shared__ __align__(16) float        sBias[16];   // cache bias for this 16-row tile
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   float4v acc = {0.f, 0.f, 0.f, 0.f};
@@ -1298,6 +1303,15 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
   const int K = intermediate_dim;
   const int Ktiles = (Kpad + 15) / 16;
   const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+
+  // Cache bias for this tile once if present
+  if (B) {
+    if (lane < 16) {
+      const int r = base_row + lane;
+      sBias[lane] = (r < hidden_dim) ? bfloat16_to_float(B[r]) : 0.f;
+    }
+    __syncthreads();
+  }
 
   for (int kk = 0; kk < Ktiles; ++kk) {
     // Load W tile (shared across the 16 selections in this block)
@@ -1333,25 +1347,23 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
 
     __syncthreads();
 
-    // Convert BF16 W to FP32 in shared memory
-    int idx4 = lane * 4;
-    if (idx4 < 256) {
-      sWf[idx4 + 0] = bfloat16_to_float(sWb[idx4 + 0]);
-      sWf[idx4 + 1] = bfloat16_to_float(sWb[idx4 + 1]);
-      sWf[idx4 + 2] = bfloat16_to_float(sWb[idx4 + 2]);
-      sWf[idx4 + 3] = bfloat16_to_float(sWb[idx4 + 3]);
-    }
-
-    __syncthreads();
-
-    // MFMA accumulate
-    #pragma unroll
-    for (int t4 = 0; t4 < 4; ++t4) {
-      const int k4 = ty + 4 * t4;
-      float amk = sWf[tx * 16 + k4];
-      float bkn = sX[k4 * 16 + tx];
-      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, acc, 0, 0, 0);
-    }
+    // Pre-convert four A scalars from BF16 to FP32 in registers and MFMA accumulate
+    const int k0 = ty +  0;  // 0..3
+    const int k1 = ty +  4;  // 4..7
+    const int k2 = ty +  8;  // 8..11
+    const int k3 = ty + 12;  // 12..15
+    float a0 = bfloat16_to_float(sWb[tx*16 + k0]);
+    float a1 = bfloat16_to_float(sWb[tx*16 + k1]);
+    float a2 = bfloat16_to_float(sWb[tx*16 + k2]);
+    float a3 = bfloat16_to_float(sWb[tx*16 + k3]);
+    float b0 = sX[k0*16 + tx];
+    float b1 = sX[k1*16 + tx];
+    float b2 = sX[k2*16 + tx];
+    float b3 = sX[k3*16 + tx];
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0, b0, acc, 0, 0, 0);
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a1, b1, acc, 0, 0, 0);
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a2, b2, acc, 0, 0, 0);
+    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a3, b3, acc, 0, 0, 0);
 
     __syncthreads();
   }
@@ -1370,10 +1382,10 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
       const int sid = sorted_sids[msel];
       #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const int row = base_row + (ty * 4 + i);
+        const int rloc = (ty * 4 + i);
+        const int row = base_row + rloc;
         if (row < hidden_dim) {
-          const float biasv = B ? bfloat16_to_float(B[row]) : 0.f;
-          float y = comp4(i) + biasv;
+          float y = comp4(i) + (B ? sBias[rloc] : 0.f);
           atomicAdd(&x[(size_t)sid * (size_t)x_stride + (size_t)row], ew * y);
         }
       }
