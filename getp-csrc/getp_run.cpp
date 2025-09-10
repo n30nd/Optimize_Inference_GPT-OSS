@@ -104,15 +104,8 @@ typedef struct {
   float *router_score;
   float *topk_v;
   int *topk_i;
-  float *mlp1_out;
-  float *gate;
-  float *up;
-  float *gate_up;
   float *e_agg;
   float *qkv;
-  float *q;
-  float *k;
-  float *v;
   float *logits;      // (unused for final FP32 logits, but kept)
   float *key_cache;
   float *value_cache;
@@ -124,12 +117,6 @@ typedef struct {
   float *logits_fp32;        // final logits
   // Packed input buffer for GEMM (FP32), size: K_max x Bpad
   float *xpack_f32;
-  // Per-stream scratch buffers for expert parallelization
-  float *mlp1_out_s;   // [MAX_EXPERT_STREAMS][2 * intermediate_dim]
-  float *gate_s;       // [MAX_EXPERT_STREAMS][intermediate_dim]
-  float *up_s;         // [MAX_EXPERT_STREAMS][intermediate_dim]
-  float *gate_up_s;    // [MAX_EXPERT_STREAMS][intermediate_dim]
-  float *tb2_s;        // [MAX_EXPERT_STREAMS][hidden_dim]
   // Batched MoE staging (for grouped GEMMs across slots/experts)
   int   *sel_sids;        // [max_batch * experts_per_token]
   int   *sel_eids;        // [max_batch * experts_per_token]
@@ -151,8 +138,6 @@ typedef struct {
   int   *padded_offsets;     // [n_experts + 1] prefix-sum sau khi align block
   int   *block_expert_ids;   // [M_pad / BLOCK_B] expert id cho mỗi block  (BLOCK_B=16)
   int   *d_col_ids;          // [M_pad]  iota: 0..M_pad-1 dùng để scatter output theo cột
-  float *mlp1_Ypack;         // [M_out x M_pad] với M_out = 2*intermediate_dim (layout: col-major theo "slot_id")
-
 } GPURunState;
 
 // Per-GPU device context
@@ -1875,6 +1860,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 // ------------------------- Warm-up & Finish -------------------------
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
+  transformer->config.seq_len = 1024; // override max seq len to 1024
   int device_count = 0;
   HIP_CHECK(hipGetDeviceCount(&device_count));
   if (device_count <= 0) {
@@ -2108,16 +2094,10 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->topk_v,            B * (size_t)p->experts_per_token * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->topk_i,            B * (size_t)p->experts_per_token * sizeof(int)));
 
-  HIP_CHECK(hipMalloc(&s->mlp1_out, B * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate,     B * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->up,       B * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up,  B * (size_t)p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->e_agg,    B * (size_t)p->hidden_dim * sizeof(float)));
 
+  // (commented out unused separate q/k/v buffers; fused qkv used only)
   HIP_CHECK(hipMalloc(&s->qkv, B * (size_t)p->head_dim * (size_t)(p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->q,   B * (size_t)p->n_attn_heads * (size_t)p->head_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->k,   B * (size_t)p->n_kv_heads   * (size_t)p->head_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->v,   B * (size_t)p->n_kv_heads   * (size_t)p->head_dim * sizeof(float)));
 
   // Allocate KV cache per-slot for continuous batching
   size_t kv_cache_elems = (size_t)max_batch * (size_t)p->n_layers * (size_t)p->seq_len * (size_t)kv_dim;
@@ -2137,13 +2117,6 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   // Note: acc_buffer no longer needed since we use float state directly
   s->acc_buffer = nullptr;
   HIP_CHECK(hipMalloc(&s->logits_fp32, B * (size_t)p->vocab_size * sizeof(float)));
-
-  // Per-stream expert scratch buffers
-  HIP_CHECK(hipMalloc(&s->mlp1_out_s, MAX_EXPERT_STREAMS * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_s,     MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->up_s,       MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up_s,  MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->tb2_s,      MAX_EXPERT_STREAMS * (size_t)p->hidden_dim * sizeof(float)));
 
   // Grouped MoE staging buffers
   size_t Mmax = (size_t)max_batch * (size_t)p->experts_per_token;
@@ -2166,10 +2139,6 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   int Bpad_mlp1    = (int)round_up16((int)Mmax_pad);                                  // cho pack MLP1
   int Bpad_pack    = std::max(Bpad_batch, Bpad_mlp1);
 
-  // size_t Kmax_xpack = std::max(
-  //     (size_t)p->hidden_dim,
-  //     (size_t)p->head_dim * (size_t)p->n_attn_heads
-  // );
     size_t Kmax_xpack = std::max({
       (size_t)p->hidden_dim,
       (size_t)p->head_dim * (size_t)p->n_attn_heads,
@@ -2177,8 +2146,6 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   });
 
   HIP_CHECK(hipMalloc(&s->xpack_f32, Kmax_xpack * (size_t)Bpad_pack * sizeof(float)));
-  // HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  // HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax_pad * 2 * (size_t)p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax_pad * (size_t)p->intermediate_dim * sizeof(float)));
 
@@ -2192,9 +2159,6 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->d_col_ids,        Mmax_pad * sizeof(int)));
 
   size_t Mout = 2 * (size_t)p->intermediate_dim;
-  HIP_CHECK(hipMalloc(&s->mlp1_Ypack, Mout * Mmax_pad * sizeof(float)));
-
-
 }
 
 
@@ -2206,16 +2170,8 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->router_score));
   HIP_CHECK(hipFree(s->topk_v));
   HIP_CHECK(hipFree(s->topk_i));
-  HIP_CHECK(hipFree(s->mlp1_out));
-  HIP_CHECK(hipFree(s->gate));
-  HIP_CHECK(hipFree(s->up));
-  HIP_CHECK(hipFree(s->gate_up));
   HIP_CHECK(hipFree(s->e_agg));
   HIP_CHECK(hipFree(s->qkv));
-  HIP_CHECK(hipFree(s->q));
-  HIP_CHECK(hipFree(s->k));
-  HIP_CHECK(hipFree(s->v));
-  HIP_CHECK(hipFree(s->key_cache));
   HIP_CHECK(hipFree(s->value_cache));
   HIP_CHECK(hipFree(s->logits));
   HIP_CHECK(hipFree(s->mask));
@@ -2223,12 +2179,6 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->sin_vals));
   if (s->acc_buffer) HIP_CHECK(hipFree(s->acc_buffer));  // acc_buffer may be nullptr
   HIP_CHECK(hipFree(s->logits_fp32));
-  HIP_CHECK(hipFree(s->mlp1_out_s));
-  HIP_CHECK(hipFree(s->gate_s));
-  HIP_CHECK(hipFree(s->up_s));
-  HIP_CHECK(hipFree(s->gate_up_s));
-  HIP_CHECK(hipFree(s->tb2_s));
-  // Grouped MoE staging buffers
   HIP_CHECK(hipFree(s->sel_sids));
   HIP_CHECK(hipFree(s->sel_eids));
   HIP_CHECK(hipFree(s->sel_w));
@@ -2248,7 +2198,6 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->padded_offsets));
   HIP_CHECK(hipFree(s->block_expert_ids));
   HIP_CHECK(hipFree(s->d_col_ids));
-  HIP_CHECK(hipFree(s->mlp1_Ypack));
 
 }
 
