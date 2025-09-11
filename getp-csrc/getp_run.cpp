@@ -975,31 +975,41 @@ __global__ void paged_flash_attention_kernel_batched(
 
   // Simple shared memory for attention scores (allocate enough for sliding window)
   extern __shared__ float shared_att_paged[];
+  __shared__ int s_att_len;
   int att_len = end_pos - start_pos + 1;
   // Capacity (tokens) for this layer's cache (without sink). We allocate +1 slot in shared mem via host launch.
   int layer_capacity = (cache_data->get_layer_type(layer) == SLIDING_WINDOW) ? cache_data->sliding_window_size : seq_len;
+  if (threadIdx.x == 0) s_att_len = att_len;
+  __syncthreads();
   
-  // Phase 1: Compute attention scores
+  // Phase 1: Compute attention scores with vectorized BF16->FP32 conversion
+  const float inv_sqrt_d = rsqrtf((float)head_dim);
   for (int idx = threadIdx.x; idx < att_len; idx += blockDim.x) {
     int t = start_pos + idx;
+    float score = -INFINITY;
     if (t <= pos) {
-      // Handle sliding window cache position mapping
       int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
       if (cache_pos >= 0) {
         const hip_bfloat16 *k_bf16 = key_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
-        float score = 0.0f;
-        for (int i = 0; i < head_dim; i++) {
-          float ki = bfloat16_to_float(k_bf16[i]);
-          score += q_head[i] * ki;
+        float acc = 0.0f;
+        int i = 0;
+        // Unrolled dot in chunks of 4 elements
+        for (; i + 3 < head_dim; i += 4) {
+          float4 k4 = bfloat16_to_float4(k_bf16 + i);
+          float q0 = q_head[i + 0];
+          float q1 = q_head[i + 1];
+          float q2 = q_head[i + 2];
+          float q3 = q_head[i + 3];
+          acc += q0 * k4.x + q1 * k4.y + q2 * k4.z + q3 * k4.w;
         }
-        score /= sqrtf((float)head_dim);
-        shared_att_paged[idx] = score;
-      } else {
-        shared_att_paged[idx] = -INFINITY;
+        // Tail
+        for (; i < head_dim; ++i) {
+          acc += q_head[i] * bfloat16_to_float(k_bf16[i]);
+        }
+        score = acc * inv_sqrt_d;
       }
-    } else {
-      shared_att_paged[idx] = -INFINITY;
     }
+    shared_att_paged[idx] = score;
   }
   __syncthreads();
 
@@ -1009,52 +1019,107 @@ __global__ void paged_flash_attention_kernel_batched(
   if (threadIdx.x == 0 && can_add_sink && (pos + 1) < seq_len) {
     size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
     // We allocated shared memory for (layer_capacity + 1) scores; only append if space.
-    if (att_len < layer_capacity + 1) {
-      shared_att_paged[att_len] = bfloat16_to_float(attn_sinks[sink_idx]);
-      att_len++;
+    if (s_att_len < layer_capacity + 1) {
+      shared_att_paged[s_att_len] = bfloat16_to_float(attn_sinks[sink_idx]);
+      s_att_len++;
     }
   }
   __syncthreads();
+  const int len = s_att_len;
 
-  // Phase 3: Softmax
-  if (threadIdx.x == 0) {
-    if (att_len > 0) {
-      float max_val = shared_att_paged[0];
-      for (int i = 1; i < att_len; i++) {
-        if (shared_att_paged[i] != -INFINITY) {
-          max_val = fmaxf(max_val, shared_att_paged[i]);
-        }
-      }
-      float sum_val = 0.0f;
-      for (int i = 0; i < att_len; i++) {
-        if (shared_att_paged[i] != -INFINITY) {
-          float v = expf(shared_att_paged[i] - max_val);
-          shared_att_paged[i] = v;
-          sum_val += v;
-        } else {
-          shared_att_paged[i] = 0.0f;
-        }
-      }
-      float inv = 1.0f / (sum_val + 1e-8f);
-      for (int i = 0; i < att_len; i++) shared_att_paged[i] *= inv;
-    }
+  // Phase 3: Softmax (parallel across threads)
+  // Compute max
+  float local_max = -INFINITY;
+  for (int i = threadIdx.x; i < len; i += blockDim.x) {
+    local_max = fmaxf(local_max, shared_att_paged[i]);
+  }
+  // Reduce max across block using shuffles then shared memory scalars in last warp
+  // Warp reduce
+  const int W = 64;
+  for (int offset = W/2; offset > 0; offset >>= 1) {
+    float other = __shfl_down(local_max, offset, W);
+    local_max = fmaxf(local_max, other);
+  }
+  // Write warp results to shared, then have warp 0 reduce them
+  __shared__ float warp_max[4];
+  const int lane = threadIdx.x & (W-1);
+  const int wid  = threadIdx.x / W; // 64-thread wavefronts
+  if (lane == 0) warp_max[wid] = local_max;
+  __syncthreads();
+  float max_val = -INFINITY;
+  if (wid == 0) {
+    int warps = blockDim.x / W;
+    float val = (lane < warps) ? warp_max[lane] : -INFINITY;
+    for (int offset = W/2; offset > 0; offset >>= 1) val = fmaxf(val, __shfl_down(val, offset, W));
+    if (lane == 0) warp_max[0] = val;
+  }
+  __syncthreads();
+  max_val = warp_max[0];
+
+  // Compute exp and sum
+  float local_sum = 0.0f;
+  for (int i = threadIdx.x; i < len; i += blockDim.x) {
+    float v = shared_att_paged[i];
+    v = (v == -INFINITY) ? 0.0f : expf(v - max_val);
+    shared_att_paged[i] = v;
+    local_sum += v;
+  }
+  // Warp reduce sum
+  for (int offset = W/2; offset > 0; offset >>= 1) {
+    local_sum += __shfl_down(local_sum, offset, W);
+  }
+  __shared__ float warp_sum[4];
+  if (lane == 0) warp_sum[wid] = local_sum;
+  __syncthreads();
+  float sum_val = 0.0f;
+  if (wid == 0) {
+    int warps = blockDim.x / W;
+    float val = (lane < warps) ? warp_sum[lane] : 0.0f;
+    for (int offset = W/2; offset > 0; offset >>= 1) val += __shfl_down(val, offset, W);
+    if (lane == 0) warp_sum[0] = val;
+  }
+  __syncthreads();
+  sum_val = warp_sum[0];
+  const float inv_sum = 1.0f / (sum_val + 1e-8f);
+  __syncthreads();
+  for (int i = threadIdx.x; i < len; i += blockDim.x) {
+    shared_att_paged[i] *= inv_sum;
   }
   __syncthreads();
 
-  // Phase 4: Weighted sum with values
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    float sum = 0.0f;
-    for (int idx = 0; idx < att_len; idx++) {
+  // Phase 4: Weighted sum with values (vectorized over 4 dims)
+  for (int i0 = threadIdx.x * 4; i0 < head_dim; i0 += blockDim.x * 4) {
+    float4 acc4 = {0.f, 0.f, 0.f, 0.f};
+    for (int idx = 0; idx < len; idx++) {
       int t = start_pos + idx;
-      if (t <= pos && shared_att_paged[idx] > 0.0f) {
-        int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
-        if (cache_pos >= 0) {
-          const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
-          sum += shared_att_paged[idx] * bfloat16_to_float(v_bf16[i]);
+      if (t <= pos) {
+        float p = shared_att_paged[idx];
+        if (p > 0.f) {
+          int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
+          if (cache_pos >= 0) {
+            const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim + i0;
+            int rem = head_dim - i0;
+            if (rem >= 4) {
+              float4 v4 = bfloat16_to_float4(v_bf16);
+              acc4.x += p * v4.x;
+              acc4.y += p * v4.y;
+              acc4.z += p * v4.z;
+              acc4.w += p * v4.w;
+            } else {
+              // tail scalars
+              if (rem >= 1) acc4.x += p * bfloat16_to_float(v_bf16[0]);
+              if (rem >= 2) acc4.y += p * bfloat16_to_float(v_bf16[1]);
+              if (rem >= 3) acc4.z += p * bfloat16_to_float(v_bf16[2]);
+            }
+          }
         }
       }
     }
-    output[i] = sum;
+    int rem = head_dim - i0;
+    if (rem >= 1) output[i0 + 0] = acc4.x;
+    if (rem >= 2) output[i0 + 1] = acc4.y;
+    if (rem >= 3) output[i0 + 2] = acc4.z;
+    if (rem >= 4) output[i0 + 3] = acc4.w;
   }
 }
 
