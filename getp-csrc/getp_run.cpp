@@ -941,19 +941,18 @@ __global__ void flash_attention_kernel_optimized_batched(
 }
 
 // New paged attention kernel that works with KVCacheManager
-__global__ void paged_flash_attention_kernel_batched(
-    const float *all_q,           // [B, n_heads*head_dim]
-    KVCacheDeviceData *cache_data, // Paged cache manager device data
-    const hip_bfloat16 *attn_sinks, // [layers * n_heads]
-    float *all_output,            // [B, n_heads*head_dim]
-    const float *mask,            // Sliding window mask (optional)
+__global__ __launch_bounds__(256)
+void paged_flash_attention_kernel_batched(
+    const float * __restrict__ all_q,           // [B, n_heads*head_dim]
+    KVCacheDeviceData * __restrict__ cache_data, // Paged cache manager device data
+    const hip_bfloat16 * __restrict__ attn_sinks, // [layers * n_heads]
+    float * __restrict__ all_output,            // [B, n_heads*head_dim]
     int head_dim, int kv_dim, int kv_mul,
     int n_heads, int seq_len, int layer,
-    const int *pos_list,          // [B]
-    bool can_add_sink,
+    const int * __restrict__ pos_list,          // [B]
     int batch,
     int q_stride,
-    const int *slot_ids) {
+    const int * __restrict__ slot_ids) {
 
   int h = blockIdx.y;   // head index
   int b = blockIdx.z;   // batch index
@@ -975,36 +974,45 @@ __global__ void paged_flash_attention_kernel_batched(
 
   // Simple shared memory for attention scores (allocate enough for sliding window)
   extern __shared__ float shared_att_paged[];
+  __shared__ float sQ[512]; // cache per-head query (supports head_dim <= 512)
   __shared__ int s_att_len;
   int att_len = end_pos - start_pos + 1;
   // Capacity (tokens) for this layer's cache (without sink). We allocate +1 slot in shared mem via host launch.
   int layer_capacity = (cache_data->get_layer_type(layer) == SLIDING_WINDOW) ? cache_data->sliding_window_size : seq_len;
   if (threadIdx.x == 0) s_att_len = att_len;
   __syncthreads();
+  // Preload q_head into shared memory (cached once per head)
+  for (int i = threadIdx.x; i < head_dim && i < 512; i += blockDim.x) {
+    sQ[i] = q_head[i];
+  }
+  __syncthreads();
   
   // Phase 1: Compute attention scores with vectorized BF16->FP32 conversion
   const float inv_sqrt_d = rsqrtf((float)head_dim);
+  const int head_base = (h / kv_mul) * head_dim;
   for (int idx = threadIdx.x; idx < att_len; idx += blockDim.x) {
     int t = start_pos + idx;
     float score = -INFINITY;
     if (t <= pos) {
       int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
       if (cache_pos >= 0) {
-        const hip_bfloat16 *k_bf16 = key_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
+        const hip_bfloat16 *k_bf16 = key_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)head_base;
         float acc = 0.0f;
         int i = 0;
         // Unrolled dot in chunks of 4 elements
+        #pragma unroll 16
         for (; i + 3 < head_dim; i += 4) {
           float4 k4 = bfloat16_to_float4(k_bf16 + i);
-          float q0 = q_head[i + 0];
-          float q1 = q_head[i + 1];
-          float q2 = q_head[i + 2];
-          float q3 = q_head[i + 3];
+          float q0 = sQ[i + 0];
+          float q1 = sQ[i + 1];
+          float q2 = sQ[i + 2];
+          float q3 = sQ[i + 3];
           acc += q0 * k4.x + q1 * k4.y + q2 * k4.z + q3 * k4.w;
         }
         // Tail
+        #pragma unroll
         for (; i < head_dim; ++i) {
-          acc += q_head[i] * bfloat16_to_float(k_bf16[i]);
+          acc += sQ[i] * bfloat16_to_float(k_bf16[i]);
         }
         score = acc * inv_sqrt_d;
       }
@@ -1016,7 +1024,7 @@ __global__ void paged_flash_attention_kernel_batched(
   // Phase 2: Add attention sink (match baseline behavior: add for all layers if space and within seq_len)
   // Baseline always injects sink at position pos+1 (even for sliding-window masked layers) and includes it in softmax
   // but excludes it from value accumulation, effectively reserving probability mass for the sink. We replicate that.
-  if (threadIdx.x == 0 && can_add_sink && (pos + 1) < seq_len) {
+  if (threadIdx.x == 0 && (pos + 1) < seq_len) {
     size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
     // We allocated shared memory for (layer_capacity + 1) scores; only append if space.
     if (s_att_len < layer_capacity + 1) {
@@ -1087,39 +1095,24 @@ __global__ void paged_flash_attention_kernel_batched(
   }
   __syncthreads();
 
-  // Phase 4: Weighted sum with values (vectorized over 4 dims)
-  for (int i0 = threadIdx.x * 4; i0 < head_dim; i0 += blockDim.x * 4) {
-    float4 acc4 = {0.f, 0.f, 0.f, 0.f};
-    for (int idx = 0; idx < len; idx++) {
-      int t = start_pos + idx;
-      if (t <= pos) {
+  // Phase 4: Weighted sum with values (one dim per thread; ideal for head_dim=64)
+  {
+    int i = threadIdx.x;
+    if (i < head_dim) {
+      float acc = 0.0f;
+      for (int idx = 0; idx < len; idx++) {
+        int t = start_pos + idx;
         float p = shared_att_paged[idx];
-        if (p > 0.f) {
+        if (t <= pos && p > 0.f) {
           int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
           if (cache_pos >= 0) {
-            const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim + i0;
-            int rem = head_dim - i0;
-            if (rem >= 4) {
-              float4 v4 = bfloat16_to_float4(v_bf16);
-              acc4.x += p * v4.x;
-              acc4.y += p * v4.y;
-              acc4.z += p * v4.z;
-              acc4.w += p * v4.w;
-            } else {
-              // tail scalars
-              if (rem >= 1) acc4.x += p * bfloat16_to_float(v_bf16[0]);
-              if (rem >= 2) acc4.y += p * bfloat16_to_float(v_bf16[1]);
-              if (rem >= 3) acc4.z += p * bfloat16_to_float(v_bf16[2]);
-            }
+            const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)head_base;
+            acc += p * bfloat16_to_float(v_bf16[i]);
           }
         }
       }
+      output[i] = acc;
     }
-    int rem = head_dim - i0;
-    if (rem >= 1) output[i0 + 0] = acc4.x;
-    if (rem >= 2) output[i0 + 1] = acc4.y;
-    if (rem >= 3) output[i0 + 2] = acc4.z;
-    if (rem >= 4) output[i0 + 3] = acc4.w;
   }
 }
 
@@ -1934,19 +1927,17 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     {
       dim3 block(256);
       dim3 grid(1, p->n_attn_heads, batch);
-      bool can_add_sink = true;
-
       // Use shared memory for attention scores: use sliding window size for paged attention
-  int max_attention_length = (p->sliding_window > 0 && (l % 2 == 0)) ? p->sliding_window : p->seq_len;
-  // Allocate +1 element to store optional attention sink (baseline behavior) even for sliding-window layers.
-  size_t shared_mem_bytes = (size_t)(max_attention_length + 1) * sizeof(float);
+      int max_attention_length = (p->sliding_window > 0 && (l % 2 == 0)) ? p->sliding_window : p->seq_len;
+      // Allocate +1 element to store optional attention sink (baseline behavior) even for sliding-window layers.
+      size_t shared_mem_bytes = (size_t)(max_attention_length + 1) * sizeof(float);
       
       // Use the new paged attention kernel that handles different layer types
-      // No mask needed since sliding window is handled by cache compaction
+      // Sliding window is handled by cache compaction (no explicit mask)
       paged_flash_attention_kernel_batched<<<grid, block, shared_mem_bytes, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.qkv, gpu_ctx->state.kv_cache_manager->get_device_data(), gpu_ctx->weights.attn_sinks,
-        gpu_ctx->state.tb, nullptr, head_dim, kv_dim, kv_mul,
-        p->n_attn_heads, p->seq_len, l, gpu_ctx->d_pos_list, can_add_sink, batch,
+        gpu_ctx->state.tb, head_dim, kv_dim, kv_mul,
+        p->n_attn_heads, p->seq_len, l, gpu_ctx->d_pos_list, batch,
         qkv_out_dim, gpu_ctx->d_slot_ids);
     }
 
