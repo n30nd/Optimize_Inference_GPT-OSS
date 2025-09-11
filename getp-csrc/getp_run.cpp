@@ -941,7 +941,9 @@ __global__ void flash_attention_kernel_optimized_batched(
 }
 
 // New paged attention kernel that works with KVCacheManager
-__global__ __launch_bounds__(256)
+// Optimized: use MFMA BF16xBF16->FP32 for Q·K^T score computation in 16-token tiles.
+// Each block uses 64 threads (16x4) to feed 16x16x16bf16 MFMA and reduce rows → 1x16 scores.
+__global__ __launch_bounds__(64)
 void paged_flash_attention_kernel_batched(
     const float * __restrict__ all_q,           // [B, n_heads*head_dim]
     KVCacheDeviceData * __restrict__ cache_data, // Paged cache manager device data
@@ -974,52 +976,104 @@ void paged_flash_attention_kernel_batched(
 
   // Simple shared memory for attention scores (allocate enough for sliding window)
   extern __shared__ float shared_att_paged[];
-  __shared__ float sQ[512]; // cache per-head query (supports head_dim <= 512)
   __shared__ int s_att_len;
   int att_len = end_pos - start_pos + 1;
   // Capacity (tokens) for this layer's cache (without sink). We allocate +1 slot in shared mem via host launch.
   int layer_capacity = (cache_data->get_layer_type(layer) == SLIDING_WINDOW) ? cache_data->sliding_window_size : seq_len;
   if (threadIdx.x == 0) s_att_len = att_len;
   __syncthreads();
-  // Preload q_head into shared memory (cached once per head)
-  for (int i = threadIdx.x; i < head_dim && i < 512; i += blockDim.x) {
-    sQ[i] = q_head[i];
-  }
-  __syncthreads();
   
-  // Phase 1: Compute attention scores with vectorized BF16->FP32 conversion
+  // Phase 1: Compute attention scores using MFMA BF16×BF16→FP32 in 16-token tiles.
+  // Map 64 threads as (tx: 0..15 columns, ty: 0..3 row-groups) like other MFMA kernels.
+  const int lane_id = threadIdx.x;         // 0..63
+  const int tx   = lane_id & 15;           // column within 16-token tile
+  const int ty   = (lane_id >> 4) & 3;     // row group (4 rows per lane)
   const float inv_sqrt_d = rsqrtf((float)head_dim);
   const int head_base = (h / kv_mul) * head_dim;
-  for (int idx = threadIdx.x; idx < att_len; idx += blockDim.x) {
-    int t = start_pos + idx;
-    float score = -INFINITY;
-    if (t <= pos) {
-      int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
-      if (cache_pos >= 0) {
-        const hip_bfloat16 *k_bf16 = key_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)head_base;
-        float acc = 0.0f;
-        int i = 0;
-        // Unrolled dot in chunks of 4 elements
-        #pragma unroll 16
-        for (; i + 3 < head_dim; i += 4) {
-          float4 k4 = bfloat16_to_float4(k_bf16 + i);
-          float q0 = sQ[i + 0];
-          float q1 = sQ[i + 1];
-          float q2 = sQ[i + 2];
-          float q3 = sQ[i + 3];
-          acc += q0 * k4.x + q1 * k4.y + q2 * k4.z + q3 * k4.w;
-        }
-        // Tail
-        #pragma unroll
-        for (; i < head_dim; ++i) {
-          acc += sQ[i] * bfloat16_to_float(k_bf16[i]);
-        }
-        score = acc * inv_sqrt_d;
+
+  // Shared helpers for MFMA tiling
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  using short4v = __attribute__((ext_vector_type(4))) short;
+  __shared__ short sQbf16[16];       // Q tile (16 bf16 packed to i16)
+  __shared__ int   sColPos[16];      // cache positions for 16 tokens in this tile (-1 if invalid)
+  __shared__ float sColSum[16];      // accumulate partial sums across rows for each column
+
+  // Iterate over attention columns (positions) in tiles of 16
+  for (int col0 = 0; col0 < att_len; col0 += 16) {
+    const int col = col0 + tx;
+    const bool col_in_range = (col < att_len);
+
+    // Compute cache position for each column once
+    if (ty == 0 && tx < 16) {
+      if (col_in_range) {
+        const int t = start_pos + col;
+        const int cp = (t <= pos) ? cache_data->get_cache_position(sid, layer, t, pos) : -1;
+        sColPos[tx] = cp;
+      } else {
+        sColPos[tx] = -1;
       }
+      sColSum[tx] = 0.0f;
     }
-    shared_att_paged[idx] = score;
+    __syncthreads();
+
+    // Accumulator for this 16-column tile
+    float4v acc = {0.f, 0.f, 0.f, 0.f};
+
+    // Walk K dimension in tiles of 16
+    const int Ktiles = (head_dim + 15) / 16;
+    for (int kk = 0; kk < Ktiles; ++kk) {
+      // Preload 16 Q scalars for this K tile, convert to bf16 once
+      if (ty == 0 && tx < 16) {
+        const int k_row = kk * 16 + tx;
+        unsigned short qbits = 0u;
+        if (k_row < head_dim) {
+          union { hip_bfloat16 b; unsigned short u; } uq;
+          uq.b = float_to_bfloat16(q_head[k_row]);
+          qbits = uq.u;
+        }
+        sQbf16[tx] = (short)qbits;
+      }
+      __syncthreads();
+
+      // Build A and B operands for MFMA from 4 k-rows handled by this lane
+      const int kbase = ty * 4;  // rows within 16
+      short4v Areg, Breg;
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int kij = kbase + j;                    // 0..15
+        // A tile is diagonal with Q[kij] on (kij,kij); encode directly without shared memory writes.
+        Areg[j] = (tx == kij) ? sQbf16[kij] : (short)0;
+        // Breg pulls K at column 'tx' (one position) and row kij of this K tile, if valid
+        short kval = 0;
+        const int cp = sColPos[tx];
+        const int k_abs = kk * 16 + kij;
+        if (cp >= 0 && k_abs < head_dim) {
+          const hip_bfloat16 *kb = key_cache_layer + (size_t)cp * (size_t)kv_dim + (size_t)head_base + (size_t)k_abs;
+          union { hip_bfloat16 b; unsigned short u; } uk;
+          uk.b = *kb;
+          kval = (short)uk.u;
+        }
+        Breg[j] = kval;
+      }
+
+      // MFMA accumulate 16x16x16 (bf16) into FP32 registers
+      acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
+      __syncthreads();
+    }
+
+    // Reduce 16 rows → 1 value per column: sum 4 rows in this lane, then shfl-xor across ty groups.
+    float partial = acc.x + acc.y + acc.z + acc.w;
+    // Sum across lanes with same tx but different ty: toggle bit 4 (16) and 5 (32)
+    partial += __shfl_xor(partial, 16, 64);
+    partial += __shfl_xor(partial, 32, 64);
+
+    // Write normalized scores to shared buffer (one lane per column)
+    if (ty == 0 && col_in_range) {
+      float score = (sColPos[tx] >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
+      shared_att_paged[col] = score;
+    }
+    __syncthreads();
   }
-  __syncthreads();
 
   // Phase 2: Add attention sink (match baseline behavior: add for all layers if space and within seq_len)
   // Baseline always injects sink at position pos+1 (even for sliding-window masked layers) and includes it in softmax
@@ -1095,16 +1149,15 @@ void paged_flash_attention_kernel_batched(
   }
   __syncthreads();
 
-  // Phase 4: Weighted sum with values (one dim per thread; ideal for head_dim=64)
+  // Phase 4: Weighted sum with values (threads stride across dims)
   {
-    int i = threadIdx.x;
-    if (i < head_dim) {
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
       float acc = 0.0f;
       for (int idx = 0; idx < len; idx++) {
-        int t = start_pos + idx;
-        float p = shared_att_paged[idx];
+        const int t = start_pos + idx;
+        const float p = shared_att_paged[idx];
         if (t <= pos && p > 0.f) {
-          int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
+          const int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
           if (cache_pos >= 0) {
             const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)head_base;
             acc += p * bfloat16_to_float(v_bf16[i]);
@@ -1925,7 +1978,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
     // Attention computation (FlashAttention-like, always enabled) -> tb
     {
-      dim3 block(256);
+      dim3 block(64);
       dim3 grid(1, p->n_attn_heads, batch);
       // Use shared memory for attention scores: use sliding window size for paged attention
       int max_attention_length = (p->sliding_window > 0 && (l % 2 == 0)) ? p->sliding_window : p->seq_len;
