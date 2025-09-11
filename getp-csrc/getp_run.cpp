@@ -66,7 +66,293 @@ static const int BLOCK_B = read_BLOCK_B_env();
 using u32x4 = __attribute__((ext_vector_type(4))) unsigned int;
 using u32x2 = __attribute__((ext_vector_type(2))) unsigned int;
 
+// ------------------------- Utility: GPU Memory Logging -------------------------
+static inline void log_gpu_mem(int device_id, const char* tag) {
+  HIP_CHECK(hipSetDevice(device_id));
+  size_t free_b = 0, total_b = 0;
+  hipError_t st = hipMemGetInfo(&free_b, &total_b);
+  if (st != hipSuccess) {
+    fprintf(stderr, "[GPU#%d][%s] hipMemGetInfo failed: %s\n", device_id, tag, hipGetErrorString(st));
+    return;
+  }
+  size_t used_b = total_b - free_b;
+  double used_g = (double)used_b / GB;
+  double free_g = (double)free_b / GB;
+  double total_g = (double)total_b / GB;
+  printf("[GPU#%d][%s] Memory used %.2f GB | free %.2f GB | total %.2f GB\n", device_id, tag, used_g, free_g, total_g);
+  fflush(stdout);
+}
 
+
+// ------------------------- KV Cache Management -------------------------
+
+enum LayerType {
+  FULL_ATTENTION = 0,
+  SLIDING_WINDOW = 1
+};
+
+struct KVCacheSlot {
+  hip_bfloat16 *key_ptr;
+  hip_bfloat16 *value_ptr;
+  size_t allocated_tokens;  // Number of tokens allocated for this slot
+  int current_pos;          // Current position in the cache
+  LayerType layer_type;     // Type of layer this slot serves
+};
+
+// Device-side KV cache management data structure
+struct KVCacheDeviceData {
+  hip_bfloat16 *key_cache_base;
+  hip_bfloat16 *value_cache_base;
+  KVCacheSlot *slots;  // Device pointer to slots data [max_batch][n_layers]
+  size_t kv_dim;
+  int max_batch;
+  int n_layers;
+  int seq_len;
+  int sliding_window_size;
+  
+  __device__ LayerType get_layer_type(int layer) const {
+    // Even layers use sliding window, odd layers use full attention
+    return (sliding_window_size > 0 && (layer % 2 == 0)) ? SLIDING_WINDOW : FULL_ATTENTION;
+  }
+  
+  __device__ void get_cache_ptrs(int slot_id, int layer, hip_bfloat16 **key_ptr, hip_bfloat16 **value_ptr, size_t *cache_size) const {
+    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
+    *key_ptr = slot.key_ptr;
+    *value_ptr = slot.value_ptr;
+    *cache_size = slot.allocated_tokens * kv_dim;
+  }
+  
+  __device__ int get_write_position(int slot_id, int layer, int pos) const {
+    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
+    if (slot.layer_type == SLIDING_WINDOW) {
+      return pos % sliding_window_size;
+    }
+    return pos;
+  }
+  
+  __device__ int get_cache_position(int slot_id, int layer, int logical_pos, int current_pos) const {
+    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
+    if (slot.layer_type == SLIDING_WINDOW) {
+      // For sliding window, we need to map logical position to cache position
+      // maintaining the sliding window invariant
+      if (current_pos < sliding_window_size) {
+        // Still filling the initial window
+        return logical_pos;
+      } else {
+        // Window is full, map to circular buffer position
+        // The cache contains positions [current_pos - sliding_window_size + 1, current_pos]
+        // mapped to cache positions [0, sliding_window_size - 1]
+        int window_start = current_pos - sliding_window_size + 1;
+        if (logical_pos < window_start) {
+          // Position is outside the sliding window, should not happen in correct usage
+          return -1;
+        }
+        int offset_in_window = logical_pos - window_start;
+        int cache_start_offset = window_start % sliding_window_size;
+        return (cache_start_offset + offset_in_window) % sliding_window_size;
+      }
+    }
+    return logical_pos;
+  }
+  
+  __device__ void get_attention_range(int slot_id, int layer, int current_pos, int *start_pos, int *end_pos) const {
+    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
+    if (slot.layer_type == SLIDING_WINDOW) {
+      *start_pos = max(0, current_pos - sliding_window_size + 1);
+      *end_pos = current_pos;
+    } else {
+      *start_pos = 0;
+      *end_pos = current_pos;
+    }
+  }
+};
+
+class KVCacheManager {
+private:
+  hip_bfloat16 *key_cache_base;
+  hip_bfloat16 *value_cache_base;
+  std::vector<std::vector<KVCacheSlot>> slots; // [max_batch][n_layers]
+  KVCacheSlot *d_slots; // Device copy of slots data
+  KVCacheDeviceData *d_device_data; // Device copy of device data structure
+  size_t kv_dim;
+  int max_batch;
+  int n_layers;
+  int seq_len;
+  int sliding_window_size;
+  size_t total_allocated_elements;
+
+public:
+  KVCacheManager(int max_batch, int n_layers, int seq_len, size_t kv_dim, int sliding_window_size)
+    : max_batch(max_batch), n_layers(n_layers), seq_len(seq_len), kv_dim(kv_dim), 
+      sliding_window_size(sliding_window_size), total_allocated_elements(0), d_slots(nullptr), d_device_data(nullptr) {
+    
+    slots.resize(max_batch);
+    for (int batch_idx = 0; batch_idx < max_batch; batch_idx++) {
+      slots[batch_idx].resize(n_layers);
+    }
+    
+    // Calculate total memory needed
+    size_t total_elements = 0;
+    for (int batch_idx = 0; batch_idx < max_batch; batch_idx++) {
+      for (int layer = 0; layer < n_layers; layer++) {
+        LayerType layer_type = get_layer_type(layer);
+        size_t layer_tokens = (layer_type == SLIDING_WINDOW) ? sliding_window_size : seq_len;
+        total_elements += layer_tokens * kv_dim;
+      }
+    }
+    
+    // Allocate base memory
+  HIP_CHECK(hipMalloc(&key_cache_base, total_elements * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&value_cache_base, total_elements * sizeof(hip_bfloat16)));
+    
+  // Setup slot pointers
+  hip_bfloat16 *key_offset = key_cache_base;
+  hip_bfloat16 *value_offset = value_cache_base;
+    
+    for (int batch_idx = 0; batch_idx < max_batch; batch_idx++) {
+      for (int layer = 0; layer < n_layers; layer++) {
+        LayerType layer_type = get_layer_type(layer);
+        size_t layer_tokens = (layer_type == SLIDING_WINDOW) ? sliding_window_size : seq_len;
+        size_t layer_size = layer_tokens * kv_dim;
+        
+        slots[batch_idx][layer].key_ptr = key_offset;
+        slots[batch_idx][layer].value_ptr = value_offset;
+        slots[batch_idx][layer].allocated_tokens = layer_tokens;
+        slots[batch_idx][layer].current_pos = 0;
+        slots[batch_idx][layer].layer_type = layer_type;
+        
+        key_offset += layer_size;
+        value_offset += layer_size;
+      }
+    }
+    
+    // Copy slots data to device
+    size_t slots_size = max_batch * n_layers * sizeof(KVCacheSlot);
+    HIP_CHECK(hipMalloc(&d_slots, slots_size));
+    
+    // Flatten slots for device copy
+    std::vector<KVCacheSlot> flat_slots;
+    for (int batch_idx = 0; batch_idx < max_batch; batch_idx++) {
+      for (int layer = 0; layer < n_layers; layer++) {
+        flat_slots.push_back(slots[batch_idx][layer]);
+      }
+    }
+    HIP_CHECK(hipMemcpy(d_slots, flat_slots.data(), slots_size, hipMemcpyHostToDevice));
+    
+    // Create and copy device data structure
+    HIP_CHECK(hipMalloc(&d_device_data, sizeof(KVCacheDeviceData)));
+  KVCacheDeviceData device_data;
+    device_data.key_cache_base = key_cache_base;
+    device_data.value_cache_base = value_cache_base;
+    device_data.slots = d_slots;
+    device_data.kv_dim = kv_dim;
+    device_data.max_batch = max_batch;
+    device_data.n_layers = n_layers;
+    device_data.seq_len = seq_len;
+    device_data.sliding_window_size = sliding_window_size;
+    HIP_CHECK(hipMemcpy(d_device_data, &device_data, sizeof(KVCacheDeviceData), hipMemcpyHostToDevice));
+    
+    total_allocated_elements = total_elements;
+    
+  printf("KVCacheManager allocated: %.2f GB (BF16, optimized per-layer)\n", 
+       (float)(2 * total_elements * sizeof(hip_bfloat16)) / (1024.0f * 1024.0f * 1024.0f));
+    printf("  - Full attention layers: %d tokens per slot\n", seq_len);
+    printf("  - Sliding window layers: %d tokens per slot\n", sliding_window_size);
+  }
+  
+  ~KVCacheManager() {
+    if (key_cache_base) HIP_CHECK(hipFree(key_cache_base));
+    if (value_cache_base) HIP_CHECK(hipFree(value_cache_base));
+  }
+  
+  LayerType get_layer_type(int layer) const {
+    // Even layers use sliding window, odd layers use full attention
+    // This matches the existing logic: (l % 2 == 0) for sliding window
+    return (sliding_window_size > 0 && (layer % 2 == 0)) ? SLIDING_WINDOW : FULL_ATTENTION;
+  }
+  
+  // Get device data pointer for kernels
+  KVCacheDeviceData* get_device_data() const { return d_device_data; }
+  
+  // Get cache pointers for a specific slot and layer
+  void get_cache_ptrs(int slot_id, int layer, hip_bfloat16 **key_ptr, hip_bfloat16 **value_ptr, size_t *cache_size) const {
+    const KVCacheSlot &slot = slots[slot_id][layer];
+    *key_ptr = slot.key_ptr;
+    *value_ptr = slot.value_ptr;
+    *cache_size = slot.allocated_tokens * kv_dim;
+  }
+  
+  // Get the effective cache position for writing (handles sliding window wraparound)
+  int get_write_position(int slot_id, int layer, int pos) const {
+    const KVCacheSlot &slot = slots[slot_id][layer];
+    if (slot.layer_type == SLIDING_WINDOW) {
+      return pos % sliding_window_size;
+    }
+    return pos;
+  }
+  
+  // Get the cache position for reading a specific logical position
+  int get_cache_position(int slot_id, int layer, int logical_pos, int current_pos) const {
+    const KVCacheSlot &slot = slots[slot_id][layer];
+    if (slot.layer_type == SLIDING_WINDOW) {
+      // For sliding window, we need to map logical position to cache position
+      // maintaining the sliding window invariant
+      if (current_pos < sliding_window_size) {
+        // Still filling the initial window
+        return logical_pos;
+      } else {
+        // Window is full, map to circular buffer position
+        // The cache contains positions [current_pos - sliding_window_size + 1, current_pos]
+        // mapped to cache positions [0, sliding_window_size - 1]
+        int window_start = current_pos - sliding_window_size + 1;
+        if (logical_pos < window_start) {
+          // Position is outside the sliding window, should not happen in correct usage
+          return -1;
+        }
+        int offset_in_window = logical_pos - window_start;
+        int cache_start_offset = window_start % sliding_window_size;
+        return (cache_start_offset + offset_in_window) % sliding_window_size;
+      }
+    }
+    return logical_pos;
+  }
+  
+  // Get the range of valid positions for attention computation
+  void get_attention_range(int slot_id, int layer, int current_pos, int *start_pos, int *end_pos) const {
+    const KVCacheSlot &slot = slots[slot_id][layer];
+    if (slot.layer_type == SLIDING_WINDOW) {
+      *start_pos = std::max(0, current_pos - sliding_window_size + 1);
+      *end_pos = current_pos;
+    } else {
+      *start_pos = 0;
+      *end_pos = current_pos;
+    }
+  }
+  
+  // Legacy compatibility: get base pointers (for existing code)
+  hip_bfloat16 *get_key_cache_base() const { return key_cache_base; }
+  hip_bfloat16 *get_value_cache_base() const { return value_cache_base; }
+  
+  // Get the block size for a specific slot (for existing KV access patterns)
+  size_t get_kv_block_size(int slot_id) const {
+    size_t total_size = 0;
+    for (int layer = 0; layer < n_layers; layer++) {
+      total_size += slots[slot_id][layer].allocated_tokens * kv_dim;
+    }
+    return total_size;
+  }
+  
+  // Get layer offset within a slot's cache block
+  size_t get_layer_offset(int slot_id, int layer) const {
+    size_t offset = 0;
+    for (int l = 0; l < layer; l++) {
+      offset += slots[slot_id][l].allocated_tokens * kv_dim;
+    }
+    return offset;
+  }
+  
+  size_t get_total_allocated_elements() const { return total_allocated_elements; }
+};
 
 // ------------------------- GPU weights & run state -------------------------
 
@@ -108,8 +394,8 @@ typedef struct {
   float *e_agg;
   float *qkv;
   float *logits;      // (unused for final FP32 logits, but kept)
-  float *key_cache;
-  float *value_cache;
+  float *key_cache;   // Legacy pointer for backward compatibility
+  float *value_cache; // Legacy pointer for backward compatibility
   float *mask;
   float *cos_vals;
   float *sin_vals;
@@ -143,6 +429,9 @@ typedef struct {
   int   *padded_offsets;     // [n_experts + 1] prefix-sum sau khi align block
   int   *block_expert_ids;   // [M_pad / BLOCK_B] expert id cho mỗi block  (BLOCK_B=16)
   int   *d_col_ids;          // [M_pad]  iota: 0..M_pad-1 dùng để scatter output theo cột
+  
+  // New: Paged Attention KV Cache Manager
+  KVCacheManager *kv_cache_manager;
 } GPURunState;
 
 // Per-GPU device context
@@ -637,8 +926,124 @@ __global__ void flash_attention_kernel_optimized_batched(
     }
     output[i] = sum;
   }
+}
 
+// New paged attention kernel that works with KVCacheManager
+__global__ void paged_flash_attention_kernel_batched(
+    const float *all_q,           // [B, n_heads*head_dim]
+    KVCacheDeviceData *cache_data, // Paged cache manager device data
+    const hip_bfloat16 *attn_sinks, // [layers * n_heads]
+    float *all_output,            // [B, n_heads*head_dim]
+    const float *mask,            // Sliding window mask (optional)
+    int head_dim, int kv_dim, int kv_mul,
+    int n_heads, int seq_len, int layer,
+    const int *pos_list,          // [B]
+    bool can_add_sink,
+    int batch,
+    int q_stride,
+    const int *slot_ids) {
 
+  int h = blockIdx.y;   // head index
+  int b = blockIdx.z;   // batch index
+  if (h >= n_heads || b >= batch) return;
+
+  int pos = pos_list[b];
+  int sid = slot_ids[b];
+  const float *q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
+  float *output = all_output + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
+
+  // Get cache pointers for this slot and layer
+  hip_bfloat16 *key_cache_layer, *value_cache_layer;
+  size_t cache_size;
+  cache_data->get_cache_ptrs(sid, layer, &key_cache_layer, &value_cache_layer, &cache_size);
+  
+  // Get attention range for this layer type
+  int start_pos, end_pos;
+  cache_data->get_attention_range(sid, layer, pos, &start_pos, &end_pos);
+
+  // Simple shared memory for attention scores (allocate enough for sliding window)
+  extern __shared__ float shared_att_paged[];
+  int att_len = end_pos - start_pos + 1;
+  // Capacity (tokens) for this layer's cache (without sink). We allocate +1 slot in shared mem via host launch.
+  int layer_capacity = (cache_data->get_layer_type(layer) == SLIDING_WINDOW) ? cache_data->sliding_window_size : seq_len;
+  
+  // Phase 1: Compute attention scores
+  for (int idx = threadIdx.x; idx < att_len; idx += blockDim.x) {
+    int t = start_pos + idx;
+    if (t <= pos) {
+      // Handle sliding window cache position mapping
+      int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
+      if (cache_pos >= 0) {
+        const hip_bfloat16 *k_bf16 = key_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
+        float score = 0.0f;
+        for (int i = 0; i < head_dim; i++) {
+          float ki = bfloat16_to_float(k_bf16[i]);
+          score += q_head[i] * ki;
+        }
+        score /= sqrtf((float)head_dim);
+        shared_att_paged[idx] = score;
+      } else {
+        shared_att_paged[idx] = -INFINITY;
+      }
+    } else {
+      shared_att_paged[idx] = -INFINITY;
+    }
+  }
+  __syncthreads();
+
+  // Phase 2: Add attention sink (match baseline behavior: add for all layers if space and within seq_len)
+  // Baseline always injects sink at position pos+1 (even for sliding-window masked layers) and includes it in softmax
+  // but excludes it from value accumulation, effectively reserving probability mass for the sink. We replicate that.
+  if (threadIdx.x == 0 && can_add_sink && (pos + 1) < seq_len) {
+    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
+    // We allocated shared memory for (layer_capacity + 1) scores; only append if space.
+    if (att_len < layer_capacity + 1) {
+      shared_att_paged[att_len] = bfloat16_to_float(attn_sinks[sink_idx]);
+      att_len++;
+    }
+  }
+  __syncthreads();
+
+  // Phase 3: Softmax
+  if (threadIdx.x == 0) {
+    if (att_len > 0) {
+      float max_val = shared_att_paged[0];
+      for (int i = 1; i < att_len; i++) {
+        if (shared_att_paged[i] != -INFINITY) {
+          max_val = fmaxf(max_val, shared_att_paged[i]);
+        }
+      }
+      float sum_val = 0.0f;
+      for (int i = 0; i < att_len; i++) {
+        if (shared_att_paged[i] != -INFINITY) {
+          float v = expf(shared_att_paged[i] - max_val);
+          shared_att_paged[i] = v;
+          sum_val += v;
+        } else {
+          shared_att_paged[i] = 0.0f;
+        }
+      }
+      float inv = 1.0f / (sum_val + 1e-8f);
+      for (int i = 0; i < att_len; i++) shared_att_paged[i] *= inv;
+    }
+  }
+  __syncthreads();
+
+  // Phase 4: Weighted sum with values
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    float sum = 0.0f;
+    for (int idx = 0; idx < att_len; idx++) {
+      int t = start_pos + idx;
+      if (t <= pos && shared_att_paged[idx] > 0.0f) {
+        int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
+        if (cache_pos >= 0) {
+          const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
+          sum += shared_att_paged[idx] * bfloat16_to_float(v_bf16[i]);
+        }
+      }
+    }
+    output[i] = sum;
+  }
 }
 
 
@@ -1307,6 +1712,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       }
     }
   };
+  
   struct KVWriterK {
     static __global__ void run(const float *qkv, float *key_cache, int batch, int qkv_stride,
                                int k_offset, int k_size, int kv_dim, int loff,
@@ -1320,6 +1726,57 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         const float *k_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)k_offset;
         float *k_dst = key_cache + (size_t)sid * kv_block_size + (size_t)loff + (size_t)pos * (size_t)kv_dim;
         k_dst[i] = k_src[i];
+      }
+    }
+  };
+
+  // New paged attention KV writers that handle sliding window caches
+  struct PagedKVWriterV {
+    static __global__ void run(const float *qkv, KVCacheDeviceData *cache_data, int layer,
+                               int batch, int qkv_stride, int v_offset, int v_size, int kv_dim,
+                               const int *pos_list, const int *slot_ids) {
+      int i = blockIdx.x * blockDim.x + threadIdx.x;
+      int b = blockIdx.y;
+      if (i < v_size && b < batch) {
+        int sid = slot_ids[b];
+        int pos = pos_list[b];
+        
+        // Get the write position (handles sliding window wraparound)
+        int write_pos = cache_data->get_write_position(sid, layer, pos);
+        
+        // Get cache pointers for this slot and layer
+  hip_bfloat16 *key_ptr, *value_ptr;
+        size_t cache_size;
+        cache_data->get_cache_ptrs(sid, layer, &key_ptr, &value_ptr, &cache_size);
+        
+        const float *v_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)v_offset;
+  hip_bfloat16 *v_dst = value_ptr + (size_t)write_pos * (size_t)kv_dim;
+  v_dst[i] = float_to_bfloat16(v_src[i]);
+      }
+    }
+  };
+  
+  struct PagedKVWriterK {
+    static __global__ void run(const float *qkv, KVCacheDeviceData *cache_data, int layer,
+                               int batch, int qkv_stride, int k_offset, int k_size, int kv_dim,
+                               const int *pos_list, const int *slot_ids) {
+      int i = blockIdx.x * blockDim.x + threadIdx.x;
+      int b = blockIdx.y;
+      if (i < k_size && b < batch) {
+        int sid = slot_ids[b];
+        int pos = pos_list[b];
+        
+        // Get the write position (handles sliding window wraparound)
+        int write_pos = cache_data->get_write_position(sid, layer, pos);
+        
+        // Get cache pointers for this slot and layer
+  hip_bfloat16 *key_ptr, *value_ptr;
+        size_t cache_size;
+        cache_data->get_cache_ptrs(sid, layer, &key_ptr, &value_ptr, &cache_size);
+        
+        const float *k_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)k_offset;
+  hip_bfloat16 *k_dst = key_ptr + (size_t)write_pos * (size_t)kv_dim;
+  k_dst[i] = float_to_bfloat16(k_src[i]);
       }
     }
   };
@@ -1362,11 +1819,14 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         qkv_out_dim, Kqkv, batch, Bpad, qkv_out_dim, gpu_ctx->d_slot_ids, Mpad, Kpad);
     }
 
-    // Write V to cache (before RoPE)
+    // Write V to cache (before RoPE) - Use paged cache manager
     {
       dim3 block(256), grid((v_size + block.x - 1) / block.x, batch);
-      KVWriterV::run<<<grid, block, 0, gpu_ctx->batch_stream>>>(gpu_ctx->state.qkv, gpu_ctx->state.value_cache,
-        batch, qkv_out_dim, q_size + k_size, v_size, kv_dim, loff, kv_block_size, gpu_ctx->d_pos_list, gpu_ctx->d_slot_ids);
+      // Use the new paged KV writer that handles different layer types
+      PagedKVWriterV::run<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.qkv, gpu_ctx->state.kv_cache_manager->get_device_data(), l,
+        batch, qkv_out_dim, q_size + k_size, v_size, kv_dim, 
+        gpu_ctx->d_pos_list, gpu_ctx->d_slot_ids);
     }
 
     // Apply RoPE to Q and K (batched)
@@ -1383,11 +1843,14 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       p->n_kv_heads, head_dim, batch, qkv_out_dim, head_dim/2, gpu_ctx->d_slot_ids);
     }
 
-    // Write K (after RoPE)
+    // Write K (after RoPE) - Use paged cache manager
     {
       dim3 block(256), grid((k_size + block.x - 1) / block.x, batch);
-      KVWriterK::run<<<grid, block, 0, gpu_ctx->batch_stream>>>(gpu_ctx->state.qkv, gpu_ctx->state.key_cache,
-        batch, qkv_out_dim, q_size, k_size, kv_dim, loff, kv_block_size, gpu_ctx->d_pos_list, gpu_ctx->d_slot_ids);
+      // Use the new paged KV writer that handles different layer types
+      PagedKVWriterK::run<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.qkv, gpu_ctx->state.kv_cache_manager->get_device_data(), l,
+        batch, qkv_out_dim, q_size, k_size, kv_dim,
+        gpu_ctx->d_pos_list, gpu_ctx->d_slot_ids);
     }
 
     // Attention computation (FlashAttention-like, always enabled) -> tb
@@ -1395,15 +1858,19 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 block(256);
       dim3 grid(1, p->n_attn_heads, batch);
       bool can_add_sink = true;
-      const float *layer_mask = (p->sliding_window > 0 && (l % 2 == 0)) ? gpu_ctx->state.mask : NULL;
 
-      // Use shared memory only for attention scores: seq_len floats
-      size_t shared_mem_bytes = (size_t)p->seq_len * sizeof(float);
-      flash_attention_kernel_optimized_batched<<<grid, block, shared_mem_bytes, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.qkv, gpu_ctx->state.key_cache, gpu_ctx->state.value_cache, gpu_ctx->weights.attn_sinks,
-        gpu_ctx->state.tb, layer_mask, head_dim, loff, kv_dim, kv_mul,
+      // Use shared memory for attention scores: use sliding window size for paged attention
+  int max_attention_length = (p->sliding_window > 0 && (l % 2 == 0)) ? p->sliding_window : p->seq_len;
+  // Allocate +1 element to store optional attention sink (baseline behavior) even for sliding-window layers.
+  size_t shared_mem_bytes = (size_t)(max_attention_length + 1) * sizeof(float);
+      
+      // Use the new paged attention kernel that handles different layer types
+      // No mask needed since sliding window is handled by cache compaction
+      paged_flash_attention_kernel_batched<<<grid, block, shared_mem_bytes, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.qkv, gpu_ctx->state.kv_cache_manager->get_device_data(), gpu_ctx->weights.attn_sinks,
+        gpu_ctx->state.tb, nullptr, head_dim, kv_dim, kv_mul,
         p->n_attn_heads, p->seq_len, l, gpu_ctx->d_pos_list, can_add_sink, batch,
-        qkv_out_dim, kv_block_size, gpu_ctx->d_slot_ids, 0);
+        qkv_out_dim, gpu_ctx->d_slot_ids);
     }
 
     // Output projection W_o (batched) via packed BF16 GEMM: tb2 = tb @ W_o + b_o
@@ -1693,8 +2160,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     const char *env_mb = getenv("GETP_MAX_BATCH");
     int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 8;
     gpu_contexts[d].max_batch = mb;
+    log_gpu_mem(d, "[GPU] Before memory allocation on device:");
     gpu_copy_weights(&gpu_contexts[d].weights, &transformer->weights, &transformer->config);
+    log_gpu_mem(d, "[GPU] After weight allocation on device:");
     gpu_malloc_run_state(&gpu_contexts[d].state, &transformer->config, gpu_contexts[d].max_batch);
+    log_gpu_mem(d, "[GPU] After run state allocation on device:");
     // Create per-slot persistent streams
     gpu_contexts[d].slot_streams.resize(gpu_contexts[d].max_batch);
     for (int s = 0; s < gpu_contexts[d].max_batch; ++s) {
@@ -1907,17 +2377,13 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   // (commented out unused separate q/k/v buffers; fused qkv used only)
   HIP_CHECK(hipMalloc(&s->qkv, B * (size_t)p->head_dim * (size_t)(p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float)));
 
-  // Allocate KV cache per-slot for continuous batching
-  size_t kv_cache_elems = (size_t)max_batch * (size_t)p->n_layers * (size_t)p->seq_len * (size_t)kv_dim;
-  HIP_CHECK(hipMalloc(&s->key_cache,   kv_cache_elems * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->value_cache, kv_cache_elems * sizeof(float)));
+  // Initialize new KV Cache Manager with paged attention support
+  s->kv_cache_manager = new KVCacheManager(max_batch, p->n_layers, p->seq_len, kv_dim, p->sliding_window);
+  
   HIP_CHECK(hipMalloc(&s->logits,      B * (size_t)p->vocab_size * sizeof(float)));
 
-  if (p->sliding_window > 0) {
-    HIP_CHECK(hipMalloc(&s->mask, p->seq_len * p->seq_len * sizeof(float)));
-  } else {
-    s->mask = NULL;
-  }
+  // Mask not needed for paged attention path; keep null to avoid large alloc
+  s->mask = NULL;
 
   HIP_CHECK(hipMalloc(&s->cos_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->sin_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
@@ -1959,7 +2425,8 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   // HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
   // HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
 
-  HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax_pad * 2 * (size_t)p->intermediate_dim * sizeof(float)));
+  // mlp1_out_all is unused in fused path; skip allocation to save memory
+  s->mlp1_out_all = nullptr;
   HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax_pad * (size_t)p->intermediate_dim * sizeof(float)));
 
   // --- New: block-aligned staging buffers ---
@@ -1985,7 +2452,19 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->topk_i));
   HIP_CHECK(hipFree(s->e_agg));
   HIP_CHECK(hipFree(s->qkv));
-  HIP_CHECK(hipFree(s->value_cache));
+  
+  // Clean up KV Cache Manager (also frees key_cache and value_cache)
+  if (s->kv_cache_manager) {
+    delete s->kv_cache_manager;
+    s->kv_cache_manager = nullptr;
+    s->key_cache = nullptr;    // These were pointing to the cache manager's memory
+    s->value_cache = nullptr;  // These were pointing to the cache manager's memory
+  } else {
+    // Fallback for legacy code path
+    if (s->key_cache) HIP_CHECK(hipFree(s->key_cache));
+    if (s->value_cache) HIP_CHECK(hipFree(s->value_cache));
+  }
+  
   HIP_CHECK(hipFree(s->logits));
   HIP_CHECK(hipFree(s->mask));
   HIP_CHECK(hipFree(s->cos_vals));
@@ -1995,7 +2474,7 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->sel_sids));
   HIP_CHECK(hipFree(s->sel_eids));
   HIP_CHECK(hipFree(s->sel_w));
-  HIP_CHECK(hipFree(s->mlp1_out_all));
+  if (s->mlp1_out_all) HIP_CHECK(hipFree(s->mlp1_out_all));
   HIP_CHECK(hipFree(s->gate_up_all));
   HIP_CHECK(hipFree(s->sel_sids_grouped));
   HIP_CHECK(hipFree(s->sel_eids_grouped));
@@ -2012,7 +2491,6 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->padded_offsets));
   HIP_CHECK(hipFree(s->block_expert_ids));
   HIP_CHECK(hipFree(s->d_col_ids));
-
 }
 
 void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
