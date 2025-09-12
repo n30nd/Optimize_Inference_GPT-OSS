@@ -2686,6 +2686,16 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     int K_out = hidden_dim;
     pack_weights_fp32_rowmajor_to_bf16_tiles16(cpu_w->out, &gpu_w->w_out_packed16, 1, M_out, K_out);
   }
+  // Print memory usage for embeddings and output weights
+  size_t embed_out_bytes = token_embed_count * sizeof(hip_bfloat16) * 2; // token_embed + out
+  int M_out_pad = round_up16(vocab_size);
+  int K_out_pad = round_up16(hidden_dim);
+  size_t out_packed_bytes = (size_t)M_out_pad * (size_t)K_out_pad * sizeof(hip_bfloat16);
+  printf("[GPU#%d] Embedding + Output weights: %.2f MB (embed: %.2f MB, out: %.2f MB, out_packed: %.2f MB)\n", 
+         dev, (float)(embed_out_bytes + out_packed_bytes) / (1024.0f * 1024.0f),
+         (float)(token_embed_count * sizeof(hip_bfloat16)) / (1024.0f * 1024.0f),
+         (float)(token_embed_count * sizeof(hip_bfloat16)) / (1024.0f * 1024.0f),
+         (float)out_packed_bytes / (1024.0f * 1024.0f));
 
   size_t rms_count = (size_t)n_layers * (size_t)hidden_dim;
   printf("[GPU#%d] Copy RMS weights...\n", dev);
@@ -2694,6 +2704,13 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
   size_t rms_out_count = (size_t)hidden_dim;
   copy_and_convert(cpu_w->rms_out_w,  &gpu_w->rms_out_w,  rms_out_count);
+  // Print memory usage for RMS weights
+  size_t rms_total_bytes = (rms_count * 2 + rms_out_count) * sizeof(hip_bfloat16);
+  printf("[GPU#%d] RMS weights: %.2f MB (attn: %.2f MB, ffn: %.2f MB, out: %.2f MB)\n", 
+         dev, (float)rms_total_bytes / (1024.0f * 1024.0f),
+         (float)(rms_count * sizeof(hip_bfloat16)) / (1024.0f * 1024.0f),
+         (float)(rms_count * sizeof(hip_bfloat16)) / (1024.0f * 1024.0f),
+         (float)(rms_out_count * sizeof(hip_bfloat16)) / (1024.0f * 1024.0f));
 
   // Pack selected projection weights (QKV, W_O, Router) into 16x16 BF16 tiles
   printf("[GPU#%d] Pack QKV...\n", dev);
@@ -2704,6 +2721,15 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   size_t qkv_b_count = (size_t)n_layers *
                        ((size_t)head_dim * (size_t)n_attn_heads + (size_t)2 * (size_t)head_dim * (size_t)n_kv_heads);
   copy_and_convert(cpu_w->b_qkv, &gpu_w->b_qkv, qkv_b_count);
+  // Print memory usage for QKV weights
+  int M_qkv_pad = round_up16(M_qkv);
+  int K_qkv_pad = round_up16(K_qkv);
+  size_t qkv_packed_bytes = (size_t)n_layers * (size_t)M_qkv_pad * (size_t)K_qkv_pad * sizeof(hip_bfloat16);
+  size_t qkv_bias_bytes = qkv_b_count * sizeof(hip_bfloat16);
+  printf("[GPU#%d] QKV weights: %.2f MB (packed: %.2f MB, bias: %.2f MB)\n", 
+         dev, (float)(qkv_packed_bytes + qkv_bias_bytes) / (1024.0f * 1024.0f),
+         (float)qkv_packed_bytes / (1024.0f * 1024.0f),
+         (float)qkv_bias_bytes / (1024.0f * 1024.0f));
 
   printf("[GPU#%d] Pack W_O...\n", dev);
   int M_o = hidden_dim;
@@ -2712,10 +2738,23 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
   size_t o_b_count = (size_t)n_layers * (size_t)hidden_dim;
   copy_and_convert(cpu_w->b_o, &gpu_w->b_o, o_b_count);
+  // Print memory usage for W_O weights
+  int M_o_pad = round_up16(M_o);
+  int K_o_pad = round_up16(K_o);
+  size_t o_packed_bytes = (size_t)n_layers * (size_t)M_o_pad * (size_t)K_o_pad * sizeof(hip_bfloat16);
+  size_t o_bias_bytes = o_b_count * sizeof(hip_bfloat16);
+  printf("[GPU#%d] W_O weights: %.2f MB (packed: %.2f MB, bias: %.2f MB)\n", 
+         dev, (float)(o_packed_bytes + o_bias_bytes) / (1024.0f * 1024.0f),
+         (float)o_packed_bytes / (1024.0f * 1024.0f),
+         (float)o_bias_bytes / (1024.0f * 1024.0f));
 
   printf("[GPU#%d] Copy attn sinks...\n", dev);
   size_t attn_sinks_count = (size_t)n_layers * (size_t)n_attn_heads;
   copy_and_convert(cpu_w->attn_sinks, &gpu_w->attn_sinks, attn_sinks_count);
+  // Print memory usage for attention sinks
+  size_t attn_sinks_bytes = attn_sinks_count * sizeof(hip_bfloat16);
+  printf("[GPU#%d] Attention sinks: %.2f MB\n", 
+         dev, (float)attn_sinks_bytes / (1024.0f * 1024.0f));
 
   printf("[GPU#%d] Pack Router...\n", dev);
   int M_router = n_experts;
@@ -2724,6 +2763,15 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
   size_t router_b_count = (size_t)n_layers * (size_t)n_experts;
   copy_and_convert(cpu_w->b_router, &gpu_w->b_router, router_b_count);
+  // Print memory usage for Router weights
+  int M_router_pad = round_up16(M_router);
+  int K_router_pad = round_up16(K_router);
+  size_t router_packed_bytes = (size_t)n_layers * (size_t)M_router_pad * (size_t)K_router_pad * sizeof(hip_bfloat16);
+  size_t router_bias_bytes = router_b_count * sizeof(hip_bfloat16);
+  printf("[GPU#%d] Router weights: %.2f MB (packed: %.2f MB, bias: %.2f MB)\n", 
+         dev, (float)(router_packed_bytes + router_bias_bytes) / (1024.0f * 1024.0f),
+         (float)router_packed_bytes / (1024.0f * 1024.0f),
+         (float)router_bias_bytes / (1024.0f * 1024.0f));
 
   // Pack MLP1 per (layer,expert) into 16x16 BF16 tiles
   printf("[GPU#%d] Pack MLP1 (layers=%d, experts=%d)...\n", dev, n_layers, n_experts);
@@ -2783,6 +2831,15 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
   size_t mlp1_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)2 * (size_t)intermediate_dim;
   copy_and_convert(cpu_w->b_mlp1, &gpu_w->b_mlp1, mlp1_b_count);
+  // Print memory usage for MLP1 weights
+  int M_mlp1_pad = round_up16(2 * intermediate_dim);
+  int K_mlp1_pad = round_up16(hidden_dim);
+  size_t mlp1_packed_bytes = (size_t)n_layers * (size_t)n_experts * (size_t)M_mlp1_pad * (size_t)K_mlp1_pad * sizeof(hip_bfloat16);
+  size_t mlp1_bias_bytes = mlp1_b_count * sizeof(hip_bfloat16);
+  printf("[GPU#%d] MLP1 weights: %.2f MB (packed: %.2f MB, bias: %.2f MB)\n", 
+         dev, (float)(mlp1_packed_bytes + mlp1_bias_bytes) / (1024.0f * 1024.0f),
+         (float)mlp1_packed_bytes / (1024.0f * 1024.0f),
+         (float)mlp1_bias_bytes / (1024.0f * 1024.0f));
 
   // size_t mlp2_w_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim * (size_t)intermediate_dim;
   // copy_and_convert(cpu_w->w_mlp2, &gpu_w->w_mlp2, mlp2_w_count);
@@ -2847,6 +2904,24 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
   size_t mlp2_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim;
   copy_and_convert(cpu_w->b_mlp2, &gpu_w->b_mlp2, mlp2_b_count);
+  // Print memory usage for MLP2 weights
+  int M_mlp2_pad = round_up16(hidden_dim);
+  int K_mlp2_pad = round_up16(intermediate_dim);
+  size_t mlp2_packed_bytes = (size_t)n_layers * (size_t)n_experts * (size_t)M_mlp2_pad * (size_t)K_mlp2_pad * sizeof(hip_bfloat16);
+  size_t mlp2_bias_bytes = mlp2_b_count * sizeof(hip_bfloat16);
+  printf("[GPU#%d] MLP2 weights: %.2f MB (packed: %.2f MB, bias: %.2f MB)\n", 
+         dev, (float)(mlp2_packed_bytes + mlp2_bias_bytes) / (1024.0f * 1024.0f),
+         (float)mlp2_packed_bytes / (1024.0f * 1024.0f),
+         (float)mlp2_bias_bytes / (1024.0f * 1024.0f));
+  
+  // Print total weight memory usage
+  size_t total_weight_bytes = embed_out_bytes + out_packed_bytes + rms_total_bytes + 
+                              qkv_packed_bytes + qkv_bias_bytes + o_packed_bytes + o_bias_bytes +
+                              attn_sinks_bytes + router_packed_bytes + router_bias_bytes +
+                              mlp1_packed_bytes + mlp1_bias_bytes + mlp2_packed_bytes + mlp2_bias_bytes;
+  printf("[GPU#%d] TOTAL WEIGHTS: %.2f MB (%.2f GB)\n", 
+         dev, (float)total_weight_bytes / (1024.0f * 1024.0f),
+         (float)total_weight_bytes / (1024.0f * 1024.0f * 1024.0f));
 }
 
 void gpu_free_weights(GPUTransformerWeights *gpu_w) {
