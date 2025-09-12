@@ -57,9 +57,7 @@ static const int BLOCK_B = read_BLOCK_B_env();
     } \
   } while(0)
 
-#ifndef MAX_EXPERT_STREAMS
-#define MAX_EXPERT_STREAMS 4
-#endif
+// Removed expert stream support; batch_stream only is used for inference
 
 
 // 128-bit alias cho load/stor 16B
@@ -393,7 +391,7 @@ typedef struct {
   int *topk_i;
   float *e_agg;
   float *qkv;
-  float *logits;      // (unused for final FP32 logits, but kept)
+  // Removed legacy 'logits' buffer; we use logits_fp32 only
   float *key_cache;   // Legacy pointer for backward compatibility
   float *value_cache; // Legacy pointer for backward compatibility
   float *mask;
@@ -411,12 +409,7 @@ typedef struct {
   float *sel_w;           // [max_batch * experts_per_token]
   float *mlp1_out_all;    // [max_batch * experts_per_token][2 * intermediate_dim]
   float *gate_up_all;     // [max_batch * experts_per_token][intermediate_dim]
-  // Expert-grouped MoE staging
-  int   *sel_sids_grouped;   // grouped by expert
-  int   *sel_eids_grouped;   // grouped by expert
-  float *sel_w_grouped;      // grouped by expert
   int   *eid_counts;         // [n_experts]
-  int   *eid_offsets;        // [n_experts + 1]
   int   *eid_cursors;        // [n_experts] for scatter
   // --- New: Block-aligned MoE staging for MLP1 ---
   int   *sorted_indices;     // [M_pad]  index m gốc (hoặc -1 cho pad)
@@ -436,10 +429,7 @@ typedef struct {
   int device_id;
   GPUTransformerWeights weights;
   GPURunState state;
-  hipStream_t expert_streams[MAX_EXPERT_STREAMS];
-  int num_expert_streams;
   int max_batch; // number of concurrent slots per GPU for continuous batching
-  std::vector<hipStream_t> slot_streams; // persistent stream per slot
   hipStream_t batch_stream;              // shared stream for batched ops
   // Staging device buffers for batched indices and positions
   int *d_slot_ids;
@@ -2286,11 +2276,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     log_gpu_mem(d, "[GPU] After weight allocation on device:");
     gpu_malloc_run_state(&gpu_contexts[d].state, &transformer->config, gpu_contexts[d].max_batch);
     log_gpu_mem(d, "[GPU] After run state allocation on device:");
-    // Create per-slot persistent streams
-    gpu_contexts[d].slot_streams.resize(gpu_contexts[d].max_batch);
-    for (int s = 0; s < gpu_contexts[d].max_batch; ++s) {
-      HIP_CHECK(hipStreamCreate(&gpu_contexts[d].slot_streams[s]));
-    }
     // Create batch stream and staging device buffers
     HIP_CHECK(hipStreamCreate(&gpu_contexts[d].batch_stream));
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_slot_ids,  gpu_contexts[d].max_batch * sizeof(int)));
@@ -2306,28 +2291,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
       HIP_CHECK(hipGetLastError());
       HIP_CHECK(hipDeviceSynchronize());
     }
-    // Create expert streams (up to MAX_EXPERT_STREAMS). Allow override via GETP_NUM_EXPERT_STREAMS
-    int nes = MAX_EXPERT_STREAMS;
-    if (const char* env_es = getenv("GETP_NUM_EXPERT_STREAMS")) {
-      int v = atoi(env_es);
-      if (v > 0) nes = std::min(v, MAX_EXPERT_STREAMS);
-    }
-    gpu_contexts[d].num_expert_streams = nes;
-    for (int s = 0; s < gpu_contexts[d].num_expert_streams; ++s) {
-      HIP_CHECK(hipStreamCreate(&gpu_contexts[d].expert_streams[s]));
-    }
-
-    if (transformer->config.sliding_window > 0 && gpu_contexts[d].state.mask != NULL) {
-      int S = transformer->config.seq_len;
-      std::vector<float> cpu_mask((size_t)S * (size_t)S);
-      for (int i = 0; i < S; i++) {
-        for (int j = 0; j < S; j++) {
-          cpu_mask[(size_t)i * (size_t)S + (size_t)j] = (i - j >= transformer->config.sliding_window) ? -INFINITY : 0.0f;
-        }
-      }
-      // Copy mask directly as float (no conversion needed)
-      HIP_CHECK(hipMemcpy(gpu_contexts[d].state.mask, cpu_mask.data(), (size_t)S * (size_t)S * sizeof(float), hipMemcpyHostToDevice));
-    }
+    // Sliding window mask is not used in paged attention path; no mask allocation/copy
   }
   
   printf("[GPU] Warm-up done on %d device(s). Packed BF16 tiles for QKV/W_O/Router/MLP1/MLP2/OUT loaded.\n", max_devices);
@@ -2337,20 +2301,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
   for (auto &gpu_ctx : gpu_contexts) {
     HIP_CHECK(hipSetDevice(gpu_ctx.device_id));
-    // Destroy per-slot streams
-    for (auto &st : gpu_ctx.slot_streams) {
-      if (st != nullptr) HIP_CHECK(hipStreamDestroy(st));
-    }
-    gpu_ctx.slot_streams.clear();
     if (gpu_ctx.batch_stream) HIP_CHECK(hipStreamDestroy(gpu_ctx.batch_stream));
     if (gpu_ctx.d_slot_ids)    HIP_CHECK(hipFree(gpu_ctx.d_slot_ids));
     if (gpu_ctx.d_pos_list)    HIP_CHECK(hipFree(gpu_ctx.d_pos_list));
     if (gpu_ctx.d_token_ids)   HIP_CHECK(hipFree(gpu_ctx.d_token_ids));
     if (gpu_ctx.d_next_tokens) HIP_CHECK(hipFree(gpu_ctx.d_next_tokens));
     if (gpu_ctx.d_batch_iota)  HIP_CHECK(hipFree(gpu_ctx.d_batch_iota));
-    for (int s = 0; s < gpu_ctx.num_expert_streams; ++s) {
-      if (gpu_ctx.expert_streams[s] != nullptr) HIP_CHECK(hipStreamDestroy(gpu_ctx.expert_streams[s]));
-    }
     gpu_free_weights(&gpu_ctx.weights);
     gpu_free_run_state(&gpu_ctx.state);
   }
@@ -2501,7 +2457,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   // Initialize new KV Cache Manager with paged attention support
   s->kv_cache_manager = new KVCacheManager(max_batch, p->n_layers, p->seq_len, kv_dim, p->sliding_window);
   
-  HIP_CHECK(hipMalloc(&s->logits,      B * (size_t)p->vocab_size * sizeof(float)));
+  // Removed legacy 'logits' buffer
 
   // Mask not needed for paged attention path; keep null to avoid large alloc
   s->mask = NULL;
@@ -2520,11 +2476,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->sel_w,        Mmax * sizeof(float)));
 
   // Expert-grouped arrays and counters
-  HIP_CHECK(hipMalloc(&s->sel_sids_grouped, Mmax * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->sel_eids_grouped, Mmax * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->sel_w_grouped,    Mmax * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->eid_counts,   (size_t)p->n_experts * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->eid_offsets, ((size_t)p->n_experts + 1) * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->eid_cursors,  (size_t)p->n_experts * sizeof(int)));
 
   
@@ -2582,8 +2534,8 @@ void gpu_free_run_state(GPURunState *s) {
     if (s->value_cache) HIP_CHECK(hipFree(s->value_cache));
   }
   
-  HIP_CHECK(hipFree(s->logits));
-  HIP_CHECK(hipFree(s->mask));
+  // No legacy logits or mask buffers to free
+  if (s->mask) HIP_CHECK(hipFree(s->mask));
   HIP_CHECK(hipFree(s->cos_vals));
   HIP_CHECK(hipFree(s->sin_vals));
   if (s->acc_buffer) HIP_CHECK(hipFree(s->acc_buffer));  // acc_buffer may be nullptr
@@ -2593,11 +2545,7 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->sel_w));
   if (s->mlp1_out_all) HIP_CHECK(hipFree(s->mlp1_out_all));
   HIP_CHECK(hipFree(s->gate_up_all));
-  HIP_CHECK(hipFree(s->sel_sids_grouped));
-  HIP_CHECK(hipFree(s->sel_eids_grouped));
-  HIP_CHECK(hipFree(s->sel_w_grouped));
   HIP_CHECK(hipFree(s->eid_counts));
-  HIP_CHECK(hipFree(s->eid_offsets));
   HIP_CHECK(hipFree(s->eid_cursors));
   HIP_CHECK(hipFree(s->xpack_bf16));
   HIP_CHECK(hipFree(s->sorted_indices));
