@@ -844,6 +844,65 @@ __global__ void histogram_eid_counts_kernel(const int *sel_eids, int M, int *eid
   }
 }
 
+// Fused kernel: per-slot TopK + softmax + direct gather to sel_* + histogram (eid_counts)
+// One block handles one slot (only thread 0 used for simplicity; k is small)
+__global__ void router_fused_topk_gather_hist_kernel(
+    const float *router_scores, // [max_batch, n_experts] via sid*score_stride
+    int n_experts,              // total experts (N)
+    int k,                      // experts_per_token (Top-K)
+    const int *slot_ids,        // [batch]
+    int batch,
+    int score_stride,           // stride for router_scores per slot
+    float *sel_w,               // [batch*k]
+    int *sel_eids,              // [batch*k]
+    int *sel_sids,              // [batch*k]
+    int *eid_counts)            // [n_experts], must be zeroed before launch
+{
+  int b = blockIdx.x;
+  if (b >= batch) return;
+  if (threadIdx.x != 0) return;
+
+  int sid = slot_ids[b];
+  const float *scores = router_scores + (size_t)sid * (size_t)score_stride;
+
+  extern __shared__ unsigned char smem[];
+  float *topv = reinterpret_cast<float*>(smem);          // length = k
+  int   *topi = reinterpret_cast<int*>(topv + k);        // length = k
+
+  // init
+  for (int i = 0; i < k; ++i) { topv[i] = -INFINITY; topi[i] = -1; }
+  // top-k (simple insertion loop like baseline)
+  for (int j = 0; j < n_experts; ++j) {
+    float v = scores[j];
+    int pos = -1;
+    for (int t = 0; t < k; ++t) { if (v > topv[t]) { pos = t; break; } }
+    if (pos >= 0) {
+      for (int t = k - 1; t > pos; --t) { topv[t] = topv[t - 1]; topi[t] = topi[t - 1]; }
+      topv[pos] = v; topi[pos] = j;
+    }
+  }
+  // softmax over top-k
+  float maxv = topv[0];
+  for (int i = 1; i < k; ++i) if (topv[i] > maxv) maxv = topv[i];
+  float sum = 0.0f;
+  for (int i = 0; i < k; ++i) { topv[i] = expf(topv[i] - maxv); sum += topv[i]; }
+  float inv = 1.0f / sum;
+  for (int i = 0; i < k; ++i) topv[i] *= inv;
+
+  // write flattened selections and update histogram
+  int base = b * k;
+  for (int t = 0; t < k; ++t) {
+    int out = base + t;
+    int e = topi[t];
+    sel_w[out]    = topv[t];
+    sel_eids[out] = e;
+    sel_sids[out] = sid;
+    if (e >= 0 && e < n_experts) {
+      atomicAdd(&eid_counts[e], 1);
+    }
+  }
+}
+
 // Exclusive prefix sum for small arrays (single-thread)
 __global__ void exclusive_prefix_sum_small_kernel(const int *counts, int *offsets, int n_experts) {
   if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -2065,14 +2124,23 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         w_router_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.router_score, b_router,
         Mr, Kr, batch, Bpadr, Mr, gpu_ctx->d_slot_ids, Mpadr, Kpadr);
     }
-    // 3) Top-k + softmax on device for all slots (fused per-slot kernel)
+    // 3) Fused Router: Top-K + softmax + gather + histogram
     {
+      // Ensure eid_counts is zeroed before atomic adds in fused kernel
+      HIP_CHECK(hipMemsetAsync(gpu_ctx->state.eid_counts, 0, (size_t)p->n_experts * sizeof(int), gpu_ctx->batch_stream));
       dim3 grid(batch), block(1);
-      topk_softmax_batched_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.router_score, p->n_experts, p->experts_per_token,
-        gpu_ctx->state.topk_v, gpu_ctx->state.topk_i,
-        p->n_experts, p->experts_per_token,
-        gpu_ctx->d_slot_ids, batch);
+      size_t shared_bytes = (size_t)p->experts_per_token * (sizeof(float) + sizeof(int));
+      router_fused_topk_gather_hist_kernel<<<grid, block, shared_bytes, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.router_score,
+        p->n_experts,
+        p->experts_per_token,
+        gpu_ctx->d_slot_ids,
+        batch,
+        p->n_experts,
+        gpu_ctx->state.sel_w,
+        gpu_ctx->state.sel_eids,
+        gpu_ctx->state.sel_sids,
+        gpu_ctx->state.eid_counts);
     }
     // 4) Zero e_agg for selected slots
     {
@@ -2080,24 +2148,12 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       zero_selected_slots_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.e_agg, hidden_dim, gpu_ctx->d_slot_ids, batch);
     }
-    // 5) Gather top-k selections into flattened arrays [batch * K]
+    // 5) Flatten selections are already populated by fused kernel
     int M = batch * p->experts_per_token;
-    {
-      dim3 block(256), grid((M + block.x - 1) / block.x);
-      gather_topk_pairs_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.topk_v, gpu_ctx->state.topk_i,
-        gpu_ctx->d_slot_ids, batch, p->experts_per_token,
-        gpu_ctx->state.sel_w, gpu_ctx->state.sel_eids, gpu_ctx->state.sel_sids);
-    }
     // 6) Group selections by expert (eid) into grouped arrays
     {
-      // Zero counts and cursors
-      HIP_CHECK(hipMemsetAsync(gpu_ctx->state.eid_counts,  0, (size_t)p->n_experts * sizeof(int), gpu_ctx->batch_stream));
+      // Zero cursors only (counts were built by fused kernel)
       HIP_CHECK(hipMemsetAsync(gpu_ctx->state.eid_cursors, 0, (size_t)p->n_experts * sizeof(int), gpu_ctx->batch_stream));
-      // Histogram counts
-      dim3 blockH(256), gridH((M + blockH.x - 1) / blockH.x);
-      histogram_eid_counts_kernel<<<gridH, blockH, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.sel_eids, M, gpu_ctx->state.eid_counts, p->n_experts);
       // 6') Xây prefix-sum đã đệm theo BLOCK_B (global)
       build_padded_offsets_kernel<<<1,1,0,gpu_ctx->batch_stream>>>(
           gpu_ctx->state.eid_counts,
