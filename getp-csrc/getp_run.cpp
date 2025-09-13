@@ -57,9 +57,7 @@ static const int BLOCK_B = read_BLOCK_B_env();
     } \
   } while(0)
 
-#ifndef MAX_EXPERT_STREAMS
-#define MAX_EXPERT_STREAMS 4
-#endif
+// Removed expert stream support; batch_stream only is used for inference
 
 
 // 128-bit alias cho load/stor 16B
@@ -393,7 +391,7 @@ typedef struct {
   int *topk_i;
   float *e_agg;
   float *qkv;
-  float *logits;      // (unused for final FP32 logits, but kept)
+  // Removed legacy 'logits' buffer; we use logits_fp32 only
   float *key_cache;   // Legacy pointer for backward compatibility
   float *value_cache; // Legacy pointer for backward compatibility
   float *mask;
@@ -402,9 +400,6 @@ typedef struct {
   // FP32 buffers for accumulation and precision-sensitive ops
   float *acc_buffer;         // x in FP32 for output matvec
   float *logits_fp32;        // final logits
-  // Packed input buffer for GEMM (FP32), size: K_max x Bpad
-  float *xpack_f32;
-
   // Packed input buffer for MLP1 (BF16), size: K_max x Bpad_mlp1
   hip_bfloat16 *xpack_bf16;
 
@@ -414,12 +409,7 @@ typedef struct {
   float *sel_w;           // [max_batch * experts_per_token]
   float *mlp1_out_all;    // [max_batch * experts_per_token][2 * intermediate_dim]
   float *gate_up_all;     // [max_batch * experts_per_token][intermediate_dim]
-  // Expert-grouped MoE staging
-  int   *sel_sids_grouped;   // grouped by expert
-  int   *sel_eids_grouped;   // grouped by expert
-  float *sel_w_grouped;      // grouped by expert
   int   *eid_counts;         // [n_experts]
-  int   *eid_offsets;        // [n_experts + 1]
   int   *eid_cursors;        // [n_experts] for scatter
   // --- New: Block-aligned MoE staging for MLP1 ---
   int   *sorted_indices;     // [M_pad]  index m gốc (hoặc -1 cho pad)
@@ -439,10 +429,7 @@ typedef struct {
   int device_id;
   GPUTransformerWeights weights;
   GPURunState state;
-  hipStream_t expert_streams[MAX_EXPERT_STREAMS];
-  int num_expert_streams;
   int max_batch; // number of concurrent slots per GPU for continuous batching
-  std::vector<hipStream_t> slot_streams; // persistent stream per slot
   hipStream_t batch_stream;              // shared stream for batched ops
   // Staging device buffers for batched indices and positions
   int *d_slot_ids;
@@ -525,6 +512,28 @@ __global__ void gather_pack_x_fp32_to_fp32_kernel(const float *x, float *xpack,
 }
 
 
+// Pack X with runtime B from device pointer: gather FP32 inputs and store to BF16 [K x Bpad]
+// Blive = *total_post_pad_ptr; for b >= Blive, write zeros. slot_ids is either d_slot_ids or sorted_sids.
+__global__ void gather_pack_x_fp32_to_bf16_kernel_Bptr(const float *x, hip_bfloat16 *xpack,
+                                                       int K, int Bpad,
+                                                       int in_stride, const int *slot_ids,
+                                                       const int *total_post_pad_ptr) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = (size_t)K * (size_t)Bpad;
+  if (idx >= total) return;
+  int k = (int)(idx / Bpad);
+  int b = (int)(idx % Bpad);
+  const int Blive = *total_post_pad_ptr;
+  if (b < Blive) {
+    int sid = slot_ids[b];
+    float v = x[(size_t)sid * (size_t)in_stride + (size_t)k];
+    xpack[(size_t)k * (size_t)Bpad + (size_t)b] = float_to_bfloat16(v);
+  } else {
+    xpack[(size_t)k * (size_t)Bpad + (size_t)b] = hip_bfloat16(0.0f);
+  }
+}
+
+
 
 
 // ========================= FLOAT KERNELS =========================
@@ -535,13 +544,13 @@ __global__ void gather_pack_x_fp32_to_fp32_kernel(const float *x, float *xpack,
 
 
 
-// GEMM MFMA FP32: W_packed [Mpad x Kpad] (tile 16x16 contiguous), Xpack [K x Bpad] (row-major K, stride=Bpad)
-// Accumulate FP32, add BF16 bias, and scatter to per-slot outputs via slot_ids.
+// GEMM MFMA FP32: W_packed [Mpad x Kpad] (tile 16x16 contiguous), Xpack BF16 [K x Bpad] (row-major K, stride=Bpad)
+// Compute uses BF16×BF16→FP32 MFMA. Accumulate FP32, add BF16 bias, and scatter to per-slot outputs via slot_ids.
 // Each block computes one 16x16 tile with 64 threads (dim3 block(16,4,1)).
 __global__ __launch_bounds__(64)
 void gemm16x16_mfma_f32_packedW_batched_scatter_bias(
     const hip_bfloat16* __restrict__ W_packed,
-    const float* __restrict__ Xpack,
+    const hip_bfloat16* __restrict__ Xpack,
     float* __restrict__ dst,
     const hip_bfloat16* __restrict__ bias,  // nullable
     int M, int K, int B, int Bpad,
@@ -562,67 +571,82 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias(
   const int base_col = tile_n * 16;
 
   const int Ktiles = (Kpad + 15) / 16;
+  const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
 
-  __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
-  __shared__ __align__(16) float sWf[16 * 16];
-  __shared__ __align__(16) float sX[16 * 16];
+  __shared__ __align__(16) hip_bfloat16 sWb[2][16 * 16];
+  __shared__ __align__(16) hip_bfloat16 sXb[2][16 * 16];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   float4v dmn = {0.f, 0.f, 0.f, 0.f};
 
-  for (int kk = 0; kk < Ktiles; ++kk) {
-    // Load W tile BF16: 16x16 contiguous (256 bf16 -> 512B). 32 lanes copy 16 bytes each.
+  // Preload first tile into buffer 0
+  int curr = 0;
+  {
+    const int kk = 0;
     if (lane < 32) {
-      const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
-      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256; // 256 elements (bf16)
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
       const hip_bfloat16* w_src = W_packed + w_tile_base;
-      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+      reinterpret_cast<u32x4*>(sWb[curr])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
     }
-
-    // Load X tile FP32: 16x16 floats (64 lanes copy 16B each = 4 floats)
-    if (lane < 64) {
-      const int r   = lane % 16;          // row within tile
-      const int c4  = (lane / 16) * 4;    // column block of 4 floats: 0,4,8,12
-      const int k_row = kk * 16 + r;      // actual K row
-
-      float* dst_vec = sX + r * 16 + c4;
-
+    if (lane < 32) {
+      const int r   = lane % 16;
+      const int h   = lane / 16;  // 0 or 1
+      const int c8  = h * 8;      // columns 0..7 or 8..15
+      const int k_row = kk * 16 + r;
       const bool in_k = (k_row < K);
-      const bool in_b = (base_col + c4) < Bpad;
-
-      if (in_k && in_b) {
-        const float* src_vec = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c4;
-        reinterpret_cast<u32x4*>(dst_vec)[0] = reinterpret_cast<const u32x4*>(src_vec)[0];
+      hip_bfloat16* dst = &sXb[curr][0] + r * 16 + c8;
+      if (in_k) {
+        const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
+        reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
       } else {
-        reinterpret_cast<u32x4*>(dst_vec)[0] = u32x4{0u,0u,0u,0u};
+        reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    const int next = curr ^ 1;
+    // Prefetch next tile
+    if (kk + 1 < Ktiles) {
+      if (lane < 32) {
+        const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)(kk + 1)) * (size_t)256;
+        const hip_bfloat16* w_src = W_packed + w_tile_base;
+        reinterpret_cast<u32x4*>(sWb[next])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+      }
+      if (lane < 32) {
+        const int r   = lane % 16;
+        const int h   = lane / 16;  // 0 or 1
+        const int c8  = h * 8;      // columns 0..7 or 8..15
+        const int k_row = (kk + 1) * 16 + r;
+        const bool in_k = (k_row < K);
+        hip_bfloat16* dst = &sXb[next][0] + r * 16 + c8;
+        if (in_k) {
+          const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
+          reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+        } else {
+          reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+        }
       }
     }
 
-    __syncthreads();
-
-    // Convert W tile BF16 -> FP32 in shared memory (64 lanes x 4 elems)
+    // Compute on current tile
     {
-      int idx4 = lane * 4;
-      if (idx4 < 256) {
-        sWf[idx4 + 0] = bfloat16_to_float(sWb[idx4 + 0]);
-        sWf[idx4 + 1] = bfloat16_to_float(sWb[idx4 + 1]);
-        sWf[idx4 + 2] = bfloat16_to_float(sWb[idx4 + 2]);
-        sWf[idx4 + 3] = bfloat16_to_float(sWb[idx4 + 3]);
-      }
-    }
-
-    // Iterate 4 micro-steps over the 16-wide K tile using MFMA 16x16x4 f32
-    #pragma unroll
-    for (int t = 0; t < 4; ++t) {
-      const int k4 = ty + 4 * t; // 0..15
-      // A: row = tx (M), col = k4
-      float amk = sWf[tx * 16 + k4];
-      // B: row = k4, col = tx (N)
-      float bkn = sX[k4 * 16 + tx];
-      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+      const int kbase = ty * 4;  // 4 BF16s per operand per lane
+      using short4v = __attribute__((ext_vector_type(4))) short;
+      union UB { hip_bfloat16 b; unsigned short u; } u0, u1, u2, u3;
+      short4v Areg, Breg;
+      u0.b = sWb[curr][tx * 16 + (kbase + 0)]; u1.b = sWb[curr][tx * 16 + (kbase + 1)];
+      u2.b = sWb[curr][tx * 16 + (kbase + 2)]; u3.b = sWb[curr][tx * 16 + (kbase + 3)];
+      Areg.x = (short)u0.u; Areg.y = (short)u1.u; Areg.z = (short)u2.u; Areg.w = (short)u3.u;
+      u0.b = sXb[curr][(kbase + 0) * 16 + tx]; u1.b = sXb[curr][(kbase + 1) * 16 + tx];
+      u2.b = sXb[curr][(kbase + 2) * 16 + tx]; u3.b = sXb[curr][(kbase + 3) * 16 + tx];
+      Breg.x = (short)u0.u; Breg.y = (short)u1.u; Breg.z = (short)u2.u; Breg.w = (short)u3.u;
+      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, dmn, 0, 0, 0);
     }
 
     __syncthreads();
+    curr = next;
   }
 
   // Epilogue: add bias and scatter store
@@ -929,19 +953,20 @@ __global__ void flash_attention_kernel_optimized_batched(
 }
 
 // New paged attention kernel that works with KVCacheManager
-__global__ void paged_flash_attention_kernel_batched(
-    const float *all_q,           // [B, n_heads*head_dim]
-    KVCacheDeviceData *cache_data, // Paged cache manager device data
-    const hip_bfloat16 *attn_sinks, // [layers * n_heads]
-    float *all_output,            // [B, n_heads*head_dim]
-    const float *mask,            // Sliding window mask (optional)
+// Optimized: use MFMA BF16xBF16->FP32 for Q·K^T score computation in 16-token tiles.
+// Each block uses 64 threads (16x4) to feed 16x16x16bf16 MFMA and reduce rows → 1x16 scores.
+__global__ __launch_bounds__(64)
+void paged_flash_attention_kernel_batched(
+    const float * __restrict__ all_q,           // [B, n_heads*head_dim]
+    KVCacheDeviceData * __restrict__ cache_data, // Paged cache manager device data
+    const hip_bfloat16 * __restrict__ attn_sinks, // [layers * n_heads]
+    float * __restrict__ all_output,            // [B, n_heads*head_dim]
     int head_dim, int kv_dim, int kv_mul,
     int n_heads, int seq_len, int layer,
-    const int *pos_list,          // [B]
-    bool can_add_sink,
+    const int * __restrict__ pos_list,          // [B]
     int batch,
     int q_stride,
-    const int *slot_ids) {
+    const int * __restrict__ slot_ids) {
 
   int h = blockIdx.y;   // head index
   int b = blockIdx.z;   // batch index
@@ -963,86 +988,196 @@ __global__ void paged_flash_attention_kernel_batched(
 
   // Simple shared memory for attention scores (allocate enough for sliding window)
   extern __shared__ float shared_att_paged[];
+  __shared__ int s_att_len;
   int att_len = end_pos - start_pos + 1;
   // Capacity (tokens) for this layer's cache (without sink). We allocate +1 slot in shared mem via host launch.
   int layer_capacity = (cache_data->get_layer_type(layer) == SLIDING_WINDOW) ? cache_data->sliding_window_size : seq_len;
-  
-  // Phase 1: Compute attention scores
-  for (int idx = threadIdx.x; idx < att_len; idx += blockDim.x) {
-    int t = start_pos + idx;
-    if (t <= pos) {
-      // Handle sliding window cache position mapping
-      int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
-      if (cache_pos >= 0) {
-        const hip_bfloat16 *k_bf16 = key_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
-        float score = 0.0f;
-        for (int i = 0; i < head_dim; i++) {
-          float ki = bfloat16_to_float(k_bf16[i]);
-          score += q_head[i] * ki;
-        }
-        score /= sqrtf((float)head_dim);
-        shared_att_paged[idx] = score;
-      } else {
-        shared_att_paged[idx] = -INFINITY;
-      }
-    } else {
-      shared_att_paged[idx] = -INFINITY;
-    }
-  }
+  if (threadIdx.x == 0) s_att_len = att_len;
   __syncthreads();
+  
+  // Phase 1: Compute attention scores using MFMA BF16×BF16→FP32 in 16-token tiles.
+  // Map 64 threads as (tx: 0..15 columns, ty: 0..3 row-groups) like other MFMA kernels.
+  const int lane_id = threadIdx.x;         // 0..63
+  const int tx   = lane_id & 15;           // column within 16-token tile
+  const int ty   = (lane_id >> 4) & 3;     // row group (4 rows per lane)
+  const float inv_sqrt_d = rsqrtf((float)head_dim);
+  const int head_base = (h / kv_mul) * head_dim;
+
+  // Shared helpers for MFMA tiling
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  using short4v = __attribute__((ext_vector_type(4))) short;
+  __shared__ short sQbf16[16];       // Q tile (16 bf16 packed to i16)
+  __shared__ int   sColPos[16];      // cache positions for 16 tokens in this tile (-1 if invalid)
+  __shared__ float sColSum[16];      // accumulate partial sums across rows for each column
+
+  // Iterate over attention columns (positions) in tiles of 16
+  for (int col0 = 0; col0 < att_len; col0 += 16) {
+    const int col = col0 + tx;
+    const bool col_in_range = (col < att_len);
+
+    // Compute cache position for each column once
+    if (ty == 0 && tx < 16) {
+      if (col_in_range) {
+        const int t = start_pos + col;
+        const int cp = (t <= pos) ? cache_data->get_cache_position(sid, layer, t, pos) : -1;
+        sColPos[tx] = cp;
+      } else {
+        sColPos[tx] = -1;
+      }
+      sColSum[tx] = 0.0f;
+    }
+    __syncthreads();
+
+    // Accumulator for this 16-column tile
+    float4v acc = {0.f, 0.f, 0.f, 0.f};
+
+    // Walk K dimension in tiles of 16
+    const int Ktiles = (head_dim + 15) / 16;
+    for (int kk = 0; kk < Ktiles; ++kk) {
+      // Preload 16 Q scalars for this K tile, convert to bf16 once
+      if (ty == 0 && tx < 16) {
+        const int k_row = kk * 16 + tx;
+        unsigned short qbits = 0u;
+        if (k_row < head_dim) {
+          union { hip_bfloat16 b; unsigned short u; } uq;
+          uq.b = float_to_bfloat16(q_head[k_row]);
+          qbits = uq.u;
+        }
+        sQbf16[tx] = (short)qbits;
+      }
+      __syncthreads();
+
+      // Build A and B operands for MFMA from 4 k-rows handled by this lane
+      const int kbase = ty * 4;  // rows within 16
+      short4v Areg, Breg;
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int kij = kbase + j;                    // 0..15
+        // A tile is diagonal with Q[kij] on (kij,kij); encode directly without shared memory writes.
+        Areg[j] = (tx == kij) ? sQbf16[kij] : (short)0;
+        // Breg pulls K at column 'tx' (one position) and row kij of this K tile, if valid
+        short kval = 0;
+        const int cp = sColPos[tx];
+        const int k_abs = kk * 16 + kij;
+        if (cp >= 0 && k_abs < head_dim) {
+          const hip_bfloat16 *kb = key_cache_layer + (size_t)cp * (size_t)kv_dim + (size_t)head_base + (size_t)k_abs;
+          union { hip_bfloat16 b; unsigned short u; } uk;
+          uk.b = *kb;
+          kval = (short)uk.u;
+        }
+        Breg[j] = kval;
+      }
+
+      // MFMA accumulate 16x16x16 (bf16) into FP32 registers
+      acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
+      __syncthreads();
+    }
+
+    // Reduce 16 rows → 1 value per column: sum 4 rows in this lane, then shfl-xor across ty groups.
+    float partial = acc.x + acc.y + acc.z + acc.w;
+    // Sum across lanes with same tx but different ty: toggle bit 4 (16) and 5 (32)
+    partial += __shfl_xor(partial, 16, 64);
+    partial += __shfl_xor(partial, 32, 64);
+
+    // Write normalized scores to shared buffer (one lane per column)
+    if (ty == 0 && col_in_range) {
+      float score = (sColPos[tx] >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
+      shared_att_paged[col] = score;
+    }
+    __syncthreads();
+  }
 
   // Phase 2: Add attention sink (match baseline behavior: add for all layers if space and within seq_len)
   // Baseline always injects sink at position pos+1 (even for sliding-window masked layers) and includes it in softmax
   // but excludes it from value accumulation, effectively reserving probability mass for the sink. We replicate that.
-  if (threadIdx.x == 0 && can_add_sink && (pos + 1) < seq_len) {
+  if (threadIdx.x == 0 && (pos + 1) < seq_len) {
     size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
     // We allocated shared memory for (layer_capacity + 1) scores; only append if space.
-    if (att_len < layer_capacity + 1) {
-      shared_att_paged[att_len] = bfloat16_to_float(attn_sinks[sink_idx]);
-      att_len++;
+    if (s_att_len < layer_capacity + 1) {
+      shared_att_paged[s_att_len] = bfloat16_to_float(attn_sinks[sink_idx]);
+      s_att_len++;
     }
   }
   __syncthreads();
+  const int len = s_att_len;
 
-  // Phase 3: Softmax
-  if (threadIdx.x == 0) {
-    if (att_len > 0) {
-      float max_val = shared_att_paged[0];
-      for (int i = 1; i < att_len; i++) {
-        if (shared_att_paged[i] != -INFINITY) {
-          max_val = fmaxf(max_val, shared_att_paged[i]);
-        }
-      }
-      float sum_val = 0.0f;
-      for (int i = 0; i < att_len; i++) {
-        if (shared_att_paged[i] != -INFINITY) {
-          float v = expf(shared_att_paged[i] - max_val);
-          shared_att_paged[i] = v;
-          sum_val += v;
-        } else {
-          shared_att_paged[i] = 0.0f;
-        }
-      }
-      float inv = 1.0f / (sum_val + 1e-8f);
-      for (int i = 0; i < att_len; i++) shared_att_paged[i] *= inv;
-    }
+  // Phase 3: Softmax (parallel across threads)
+  // Compute max
+  float local_max = -INFINITY;
+  for (int i = threadIdx.x; i < len; i += blockDim.x) {
+    local_max = fmaxf(local_max, shared_att_paged[i]);
+  }
+  // Reduce max across block using shuffles then shared memory scalars in last warp
+  // Warp reduce
+  const int W = 64;
+  for (int offset = W/2; offset > 0; offset >>= 1) {
+    float other = __shfl_down(local_max, offset, W);
+    local_max = fmaxf(local_max, other);
+  }
+  // Write warp results to shared, then have warp 0 reduce them
+  __shared__ float warp_max[4];
+  const int lane = threadIdx.x & (W-1);
+  const int wid  = threadIdx.x / W; // 64-thread wavefronts
+  if (lane == 0) warp_max[wid] = local_max;
+  __syncthreads();
+  float max_val = -INFINITY;
+  if (wid == 0) {
+    int warps = blockDim.x / W;
+    float val = (lane < warps) ? warp_max[lane] : -INFINITY;
+    for (int offset = W/2; offset > 0; offset >>= 1) val = fmaxf(val, __shfl_down(val, offset, W));
+    if (lane == 0) warp_max[0] = val;
+  }
+  __syncthreads();
+  max_val = warp_max[0];
+
+  // Compute exp and sum
+  float local_sum = 0.0f;
+  for (int i = threadIdx.x; i < len; i += blockDim.x) {
+    float v = shared_att_paged[i];
+    v = (v == -INFINITY) ? 0.0f : expf(v - max_val);
+    shared_att_paged[i] = v;
+    local_sum += v;
+  }
+  // Warp reduce sum
+  for (int offset = W/2; offset > 0; offset >>= 1) {
+    local_sum += __shfl_down(local_sum, offset, W);
+  }
+  __shared__ float warp_sum[4];
+  if (lane == 0) warp_sum[wid] = local_sum;
+  __syncthreads();
+  float sum_val = 0.0f;
+  if (wid == 0) {
+    int warps = blockDim.x / W;
+    float val = (lane < warps) ? warp_sum[lane] : 0.0f;
+    for (int offset = W/2; offset > 0; offset >>= 1) val += __shfl_down(val, offset, W);
+    if (lane == 0) warp_sum[0] = val;
+  }
+  __syncthreads();
+  sum_val = warp_sum[0];
+  const float inv_sum = 1.0f / (sum_val + 1e-8f);
+  __syncthreads();
+  for (int i = threadIdx.x; i < len; i += blockDim.x) {
+    shared_att_paged[i] *= inv_sum;
   }
   __syncthreads();
 
-  // Phase 4: Weighted sum with values
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    float sum = 0.0f;
-    for (int idx = 0; idx < att_len; idx++) {
-      int t = start_pos + idx;
-      if (t <= pos && shared_att_paged[idx] > 0.0f) {
-        int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
-        if (cache_pos >= 0) {
-          const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
-          sum += shared_att_paged[idx] * bfloat16_to_float(v_bf16[i]);
+  // Phase 4: Weighted sum with values (threads stride across dims)
+  {
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+      float acc = 0.0f;
+      for (int idx = 0; idx < len; idx++) {
+        const int t = start_pos + idx;
+        const float p = shared_att_paged[idx];
+        if (t <= pos && p > 0.f) {
+          const int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
+          if (cache_pos >= 0) {
+            const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)head_base;
+            acc += p * bfloat16_to_float(v_bf16[i]);
+          }
         }
       }
+      output[i] = acc;
     }
-    output[i] = sum;
   }
 }
 
@@ -1288,7 +1423,8 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
     int block_size,                                  // BLOCK_B (must be multiple of 16)
     int n_experts, int layer,
     int Mpad, int Kpad,
-    float swiglu_limit)
+    float swiglu_limit,
+    const int* __restrict__ total_post_pad_ptr)
 {
   const int tx = threadIdx.x;   // 0..15 (N within tile)
   const int ty = threadIdx.y;   // 0..3
@@ -1299,7 +1435,10 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
   const int row0    = tile_m * 16;
   const int col0    = tile_n * 16;
 
-  if (col0 >= Bpad_total) return;     // only loads use Bpad_total guard
+  // Early cull tiles beyond live padded width computed on device
+  const int Btotal_live = *total_post_pad_ptr;
+  const int Bpad_live   = ((Btotal_live + 15) / 16) * 16;
+  if (col0 >= Bpad_live) return;     // skip fully padded tiles
 
   // Determine expert for this 16-col tile via BLOCK_B mapping
   int blocks_per_b = block_size / 16; // tiles per BLOCK_B
@@ -1403,7 +1542,7 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
 
   // Epilogue fused: (2I) → I (SwiGLU) and scatter by global column id; guard with Btotal
   const int col = col0 + tx;
-  if (col >= Btotal) return;
+  if (col >= Btotal_live) return;
 
   const float alpha = 1.702f;
   const int   I     = Mout >> 1;
@@ -1456,7 +1595,8 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
     int hidden_dim, int intermediate_dim,
     int layer, int n_experts,
     int x_stride,
-    int Mpad, int Kpad)
+    int Mpad, int Kpad,
+    const int* __restrict__ total_post_pad_ptr)
 {
   // Each block computes a 16x16 tile: 16 rows (M) x 16 selections (N) for the same expert.
   // Y-dimension of the grid is over blocks of 16 contiguous selections grouped by expert.
@@ -1467,7 +1607,9 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
   const int tile_m = blockIdx.x;         // along hidden_dim (rows)
   const int block_b = blockIdx.y;        // block of 16 selections
   const int col0 = block_b * 16;
-  if (col0 >= Btotal) return;
+  const int Btotal_live = *total_post_pad_ptr;
+  const int Bpad_live   = ((Btotal_live + 15) / 16) * 16;
+  if (col0 >= Bpad_live) return;
   const int base_row = tile_m * 16;
 
   // All 16 columns in this block share the same expert due to prior grouping/padding.
@@ -1522,10 +1664,10 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
         const int col_2 = col0 + (c4 + 2);
         const int col_3 = col0 + (c4 + 3);
 
-        if (col_0 < Btotal) v0 = gate_up_all[(size_t)col_0 * (size_t)intermediate_dim + (size_t)k_row];
-        if (col_1 < Btotal) v1 = gate_up_all[(size_t)col_1 * (size_t)intermediate_dim + (size_t)k_row];
-        if (col_2 < Btotal) v2 = gate_up_all[(size_t)col_2 * (size_t)intermediate_dim + (size_t)k_row];
-        if (col_3 < Btotal) v3 = gate_up_all[(size_t)col_3 * (size_t)intermediate_dim + (size_t)k_row];
+        if (col_0 < Btotal_live) v0 = gate_up_all[(size_t)col_0 * (size_t)intermediate_dim + (size_t)k_row];
+        if (col_1 < Btotal_live) v1 = gate_up_all[(size_t)col_1 * (size_t)intermediate_dim + (size_t)k_row];
+        if (col_2 < Btotal_live) v2 = gate_up_all[(size_t)col_2 * (size_t)intermediate_dim + (size_t)k_row];
+        if (col_3 < Btotal_live) v3 = gate_up_all[(size_t)col_3 * (size_t)intermediate_dim + (size_t)k_row];
       }
       float4v vpack = {v0, v1, v2, v3};
       reinterpret_cast<float4v*>(dst_vec)[0] = vpack;
@@ -1561,7 +1703,7 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
 
   // Each thread contributes its 4 rows for its column (selection)
   const int msel = col0 + tx;  // selection index for this column
-  if (msel < Btotal) {
+  if (msel < Btotal_live) {
     const int valid_idx = sorted_indices[msel];
     const float ew = sorted_w[msel];
     if (valid_idx >= 0 && ew != 0.f) {
@@ -1802,12 +1944,12 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     int Bpad = ((batch + 15) / 16) * 16;
     int Mpad = ((qkv_out_dim + 15) / 16) * 16;
     int Kpad = ((Kqkv + 15) / 16) * 16;
-    // Gather/pack inputs t -> xpack_f32
+    // Gather/pack inputs t -> xpack_bf16
     {
       size_t total = (size_t)Kqkv * (size_t)Bpad;
       dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
-      gather_pack_x_fp32_to_fp32_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.t, gpu_ctx->state.xpack_f32, Kqkv, batch, Bpad, hidden_dim, gpu_ctx->d_slot_ids);
+      gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.t, gpu_ctx->state.xpack_bf16, Kqkv, batch, Bpad, hidden_dim, gpu_ctx->d_slot_ids);
     }
     // GEMM W_qkv_packed x Xpack -> qkv (scattered per slot) + bias
     {
@@ -1815,7 +1957,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 grid((unsigned)(Mpad + 15) / 16, (unsigned)(Bpad + 15) / 16);
       dim3 block(16, 4, 1);
       gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        w_qkv_packed, gpu_ctx->state.xpack_f32, gpu_ctx->state.qkv, b_qkv,
+        w_qkv_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.qkv, b_qkv,
         qkv_out_dim, Kqkv, batch, Bpad, qkv_out_dim, gpu_ctx->d_slot_ids, Mpad, Kpad);
     }
 
@@ -1855,21 +1997,19 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
     // Attention computation (FlashAttention-like, always enabled) -> tb
     {
-      dim3 block(256);
+      dim3 block(64);
       dim3 grid(1, p->n_attn_heads, batch);
-      bool can_add_sink = true;
-
       // Use shared memory for attention scores: use sliding window size for paged attention
-  int max_attention_length = (p->sliding_window > 0 && (l % 2 == 0)) ? p->sliding_window : p->seq_len;
-  // Allocate +1 element to store optional attention sink (baseline behavior) even for sliding-window layers.
-  size_t shared_mem_bytes = (size_t)(max_attention_length + 1) * sizeof(float);
+      int max_attention_length = (p->sliding_window > 0 && (l % 2 == 0)) ? p->sliding_window : p->seq_len;
+      // Allocate +1 element to store optional attention sink (baseline behavior) even for sliding-window layers.
+      size_t shared_mem_bytes = (size_t)(max_attention_length + 1) * sizeof(float);
       
       // Use the new paged attention kernel that handles different layer types
-      // No mask needed since sliding window is handled by cache compaction
+      // Sliding window is handled by cache compaction (no explicit mask)
       paged_flash_attention_kernel_batched<<<grid, block, shared_mem_bytes, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.qkv, gpu_ctx->state.kv_cache_manager->get_device_data(), gpu_ctx->weights.attn_sinks,
-        gpu_ctx->state.tb, nullptr, head_dim, kv_dim, kv_mul,
-        p->n_attn_heads, p->seq_len, l, gpu_ctx->d_pos_list, can_add_sink, batch,
+        gpu_ctx->state.tb, head_dim, kv_dim, kv_mul,
+        p->n_attn_heads, p->seq_len, l, gpu_ctx->d_pos_list, batch,
         qkv_out_dim, gpu_ctx->d_slot_ids);
     }
 
@@ -1881,16 +2021,16 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int Bpad2 = ((batch + 15) / 16) * 16;
       int Mpad2 = ((Mwo + 15) / 16) * 16;
       int Kpad2 = ((Kow + 15) / 16) * 16;
-      // Gather/pack tb -> xpack_f32
+      // Gather/pack tb -> xpack_bf16
       size_t total = (size_t)Kow * (size_t)Bpad2;
       dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
-      gather_pack_x_fp32_to_fp32_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.tb, gpu_ctx->state.xpack_f32, Kow, batch, Bpad2, Kow, gpu_ctx->d_slot_ids);
+      gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.tb, gpu_ctx->state.xpack_bf16, Kow, batch, Bpad2, Kow, gpu_ctx->d_slot_ids);
       const hip_bfloat16 *w_o_packed = gpu_ctx->weights.w_o_packed16 + (size_t)l * (size_t)Mpad2 * (size_t)Kpad2;
       dim3 blockG(16, 4, 1), gridG((unsigned int)((Mpad2 + 15) / 16), (unsigned int)((Bpad2 + 15) / 16));
 
       gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
-        w_o_packed, gpu_ctx->state.xpack_f32, gpu_ctx->state.tb2, b_o,
+        w_o_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.tb2, b_o,
         Mwo, Kow, batch, Bpad2, Mwo, gpu_ctx->d_slot_ids, Mpad2, Kpad2);
     }
 
@@ -1914,15 +2054,15 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int Bpadr = ((batch + 15) / 16) * 16;
       int Mpadr = ((Mr + 15) / 16) * 16;
       int Kpadr = ((Kr + 15) / 16) * 16;
-      // Gather/pack t -> xpack_f32
+      // Gather/pack t -> xpack_bf16
       size_t total = (size_t)Kr * (size_t)Bpadr;
       dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
-      gather_pack_x_fp32_to_fp32_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.t, gpu_ctx->state.xpack_f32, Kr, batch, Bpadr, hidden_dim, gpu_ctx->d_slot_ids);
+      gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.t, gpu_ctx->state.xpack_bf16, Kr, batch, Bpadr, hidden_dim, gpu_ctx->d_slot_ids);
       const hip_bfloat16 *w_router_packed = gpu_ctx->weights.w_router_packed16 + (size_t)l * (size_t)Mpadr * (size_t)Kpadr;
       dim3 blockG(16, 4, 1), gridG((unsigned)(Mpadr + 15) / 16, (unsigned)(Bpadr + 15) / 16);
       gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
-        w_router_packed, gpu_ctx->state.xpack_f32, gpu_ctx->state.router_score, b_router,
+        w_router_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.router_score, b_router,
         Mr, Kr, batch, Bpadr, Mr, gpu_ctx->d_slot_ids, Mpadr, Kpadr);
     }
     // 3) Top-k + softmax on device for all slots (fused per-slot kernel)
@@ -1964,19 +2104,15 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           gpu_ctx->state.padded_offsets,
           p->n_experts, BLOCK_B);
 
-      // Lấy total_post_pad từ padded_offsets[n_experts]
-      // int total_post_pad = 0;
-      HIP_CHECK(hipMemcpyAsync(&total_post_pad,
-                              gpu_ctx->state.padded_offsets + p->n_experts,
-                              sizeof(int),
-                              hipMemcpyDeviceToHost,
-                              gpu_ctx->batch_stream));
-      HIP_CHECK(hipStreamSynchronize(gpu_ctx->batch_stream));
+      // Bỏ đồng bộ D2H cho total_post_pad: không cần đọc về host nữa.
+      // Thay vào đó, mọi launch phía sau sẽ dùng upper bound theo Mmax_pad.
 
       // Reset cursors để scatter
       HIP_CHECK(hipMemsetAsync(gpu_ctx->state.eid_cursors, 0,
                               (size_t)p->n_experts * sizeof(int),
                               gpu_ctx->batch_stream));
+
+      // Không cần memset toàn bộ Mmax_pad; các kernel sau sẽ tự guard bằng Btotal live đọc từ device.
 
       // 6'') Scatter các selection thật theo expert vào vùng đã sort
       {
@@ -2008,31 +2144,36 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
             gpu_ctx->state.block_expert_ids);
       }
 
-      // 6'''') Chuẩn bị iota cột toàn cục 0..total_post_pad-1
+      // 6'''') Chuẩn bị iota cột toàn cục: fill theo Mmax_pad (kích thước thật của d_col_ids)
       {
+        const size_t Mmax      = (size_t)gpu_ctx->max_batch * (size_t)p->experts_per_token;
+        const size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_B - 1);
         int threads = 256;
-        int blocks  = (total_post_pad + threads - 1) / threads;
+        int blocks  = ((int)Mmax_pad + threads - 1) / threads;
         iota_kernel<<<blocks, threads, 0, gpu_ctx->batch_stream>>>(
-            gpu_ctx->state.d_col_ids, total_post_pad);
+            gpu_ctx->state.d_col_ids, (int)Mmax_pad);
       }
 
     }
     {
         // 7') Pack X cho MLP1 theo thứ tự đã sort+pad
     int Kmlp1 = p->hidden_dim;
-    int Bmlp1 = total_post_pad;
-    int Bpad_total = round_up16(Bmlp1); // Bpad dùng khi pack (toàn cục)
+    // Dùng upper bound cố định theo worst-case đã alloc
+    const size_t Mmax      = (size_t)gpu_ctx->max_batch * (size_t)p->experts_per_token;
+    const size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_B - 1);
+    int Bpad_total = round_up16((int)Mmax_pad); // Bpad dùng khi pack (toàn cục)
+    int Bmlp1 = (int)Mmax_pad;                  // số cột thực dùng cho guard và gather; phần đuôi pad điền 0
     {
       size_t total = (size_t)Kmlp1 * (size_t)Bpad_total;
       dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
-      gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+      gather_pack_x_fp32_to_bf16_kernel_Bptr<<<grid, block, 0, gpu_ctx->batch_stream>>>(
           gpu_ctx->state.t,            // nguồn: x đã RMSNorm-FFN per-slot
           gpu_ctx->state.xpack_bf16,   // đích:  [K x Bpad_total] BF16
           Kmlp1,
-          Bmlp1,
           Bpad_total,
           p->hidden_dim,
-          gpu_ctx->state.sorted_sids   // cột b → sid = sorted_sids[b]
+          gpu_ctx->state.sorted_sids,  // cột b → sid = sorted_sids[b]
+          gpu_ctx->state.padded_offsets + p->n_experts // runtime Btotal
       );
     }
         // 7'') GEMM MLP1 per-expert (fused epilogue SwiGLU → ghi thẳng gate_up_all)
@@ -2058,7 +2199,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
             /*BLOCK_B*/ BLOCK_B,
             /*nexp,l*/  p->n_experts, l,
             /*pads*/    Mpad_mlp1, Kpad_mlp1,
-            /*limit*/   p->swiglu_limit);
+            /*limit*/   p->swiglu_limit,
+            /*Btotal* */gpu_ctx->state.padded_offsets + p->n_experts);
       }
     }
         
@@ -2069,10 +2211,13 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int Mpad_mlp2 = ((hidden_dim + 15) / 16) * 16;
       int Kpad_mlp2 = ((p->intermediate_dim + 15) / 16) * 16;
       dim3 blockG2(16, 4, 1);
-      // Use total_post_pad (Btotal) selections produced by fused MLP1 scatter
-      int Btotal = total_post_pad;
+      // Dùng upper bound cho lưới; guard nội bộ với Btotal = Mmax_pad
+      const size_t Mmax      = (size_t)gpu_ctx->max_batch * (size_t)p->experts_per_token;
+      const size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_B - 1);
+      const int Bpad_total   = round_up16((int)Mmax_pad);
+      int Btotal = (int)Mmax_pad;
       // Launch one block per 16 contiguous selections (grouped by expert)
-      dim3 gridG2((unsigned int)((Mpad_mlp2 + 15) / 16), (unsigned int)((Btotal + 15) / 16));
+      dim3 gridG2((unsigned int)((Mpad_mlp2 + 15) / 16), (unsigned int)((Bpad_total + 15) / 16));
       gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel<<<gridG2, blockG2, 0, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.x,
         gpu_ctx->state.gate_up_all,
@@ -2084,7 +2229,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         gpu_ctx->state.sorted_indices,
         Btotal, hidden_dim, p->intermediate_dim,
         l, p->n_experts, hidden_dim,
-        Mpad_mlp2, Kpad_mlp2);
+        Mpad_mlp2, Kpad_mlp2,
+        gpu_ctx->state.padded_offsets + p->n_experts);
     }
 
     // 9) Residual fused in step 8 (mlp2 kernel accumulates directly into x)
@@ -2107,16 +2253,16 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int Bpad3 = ((batch + 15) / 16) * 16;
       int Mpad3 = ((Mout + 15) / 16) * 16;
       int Kpad3 = ((Kout + 15) / 16) * 16;
-      // Gather/pack x -> xpack_f32 in batch order using slot_ids
+      // Gather/pack x -> xpack_bf16 in batch order using slot_ids
       size_t total = (size_t)Kout * (size_t)Bpad3;
       dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
-      gather_pack_x_fp32_to_fp32_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.x, gpu_ctx->state.xpack_f32, Kout, batch, Bpad3, hidden_dim, gpu_ctx->d_slot_ids);
+      gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.x, gpu_ctx->state.xpack_bf16, Kout, batch, Bpad3, hidden_dim, gpu_ctx->d_slot_ids);
       const hip_bfloat16 *w_out_packed = gpu_ctx->weights.w_out_packed16;
       dim3 blockG(16, 4, 1), gridG((unsigned int)((Mpad3 + 15) / 16), (unsigned int)((Bpad3 + 15) / 16));
       // Use identity mapping for output rows (b -> row b)
       gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
-        w_out_packed, gpu_ctx->state.xpack_f32, gpu_ctx->state.logits_fp32, /*bias*/nullptr,
+        w_out_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.logits_fp32, /*bias*/nullptr,
         Mout, Kout, batch, Bpad3, Mout, gpu_ctx->d_batch_iota, Mpad3, Kpad3);
     }
 
@@ -2165,11 +2311,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     log_gpu_mem(d, "[GPU] After weight allocation on device:");
     gpu_malloc_run_state(&gpu_contexts[d].state, &transformer->config, gpu_contexts[d].max_batch);
     log_gpu_mem(d, "[GPU] After run state allocation on device:");
-    // Create per-slot persistent streams
-    gpu_contexts[d].slot_streams.resize(gpu_contexts[d].max_batch);
-    for (int s = 0; s < gpu_contexts[d].max_batch; ++s) {
-      HIP_CHECK(hipStreamCreate(&gpu_contexts[d].slot_streams[s]));
-    }
     // Create batch stream and staging device buffers
     HIP_CHECK(hipStreamCreate(&gpu_contexts[d].batch_stream));
     HIP_CHECK(hipMalloc(&gpu_contexts[d].d_slot_ids,  gpu_contexts[d].max_batch * sizeof(int)));
@@ -2185,28 +2326,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
       HIP_CHECK(hipGetLastError());
       HIP_CHECK(hipDeviceSynchronize());
     }
-    // Create expert streams (up to MAX_EXPERT_STREAMS). Allow override via GETP_NUM_EXPERT_STREAMS
-    int nes = MAX_EXPERT_STREAMS;
-    if (const char* env_es = getenv("GETP_NUM_EXPERT_STREAMS")) {
-      int v = atoi(env_es);
-      if (v > 0) nes = std::min(v, MAX_EXPERT_STREAMS);
-    }
-    gpu_contexts[d].num_expert_streams = nes;
-    for (int s = 0; s < gpu_contexts[d].num_expert_streams; ++s) {
-      HIP_CHECK(hipStreamCreate(&gpu_contexts[d].expert_streams[s]));
-    }
-
-    if (transformer->config.sliding_window > 0 && gpu_contexts[d].state.mask != NULL) {
-      int S = transformer->config.seq_len;
-      std::vector<float> cpu_mask((size_t)S * (size_t)S);
-      for (int i = 0; i < S; i++) {
-        for (int j = 0; j < S; j++) {
-          cpu_mask[(size_t)i * (size_t)S + (size_t)j] = (i - j >= transformer->config.sliding_window) ? -INFINITY : 0.0f;
-        }
-      }
-      // Copy mask directly as float (no conversion needed)
-      HIP_CHECK(hipMemcpy(gpu_contexts[d].state.mask, cpu_mask.data(), (size_t)S * (size_t)S * sizeof(float), hipMemcpyHostToDevice));
-    }
+    // Sliding window mask is not used in paged attention path; no mask allocation/copy
   }
   
   printf("[GPU] Warm-up done on %d device(s). Packed BF16 tiles for QKV/W_O/Router/MLP1/MLP2/OUT loaded.\n", max_devices);
@@ -2216,20 +2336,12 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
   for (auto &gpu_ctx : gpu_contexts) {
     HIP_CHECK(hipSetDevice(gpu_ctx.device_id));
-    // Destroy per-slot streams
-    for (auto &st : gpu_ctx.slot_streams) {
-      if (st != nullptr) HIP_CHECK(hipStreamDestroy(st));
-    }
-    gpu_ctx.slot_streams.clear();
     if (gpu_ctx.batch_stream) HIP_CHECK(hipStreamDestroy(gpu_ctx.batch_stream));
     if (gpu_ctx.d_slot_ids)    HIP_CHECK(hipFree(gpu_ctx.d_slot_ids));
     if (gpu_ctx.d_pos_list)    HIP_CHECK(hipFree(gpu_ctx.d_pos_list));
     if (gpu_ctx.d_token_ids)   HIP_CHECK(hipFree(gpu_ctx.d_token_ids));
     if (gpu_ctx.d_next_tokens) HIP_CHECK(hipFree(gpu_ctx.d_next_tokens));
     if (gpu_ctx.d_batch_iota)  HIP_CHECK(hipFree(gpu_ctx.d_batch_iota));
-    for (int s = 0; s < gpu_ctx.num_expert_streams; ++s) {
-      if (gpu_ctx.expert_streams[s] != nullptr) HIP_CHECK(hipStreamDestroy(gpu_ctx.expert_streams[s]));
-    }
     gpu_free_weights(&gpu_ctx.weights);
     gpu_free_run_state(&gpu_ctx.state);
   }
@@ -2380,7 +2492,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   // Initialize new KV Cache Manager with paged attention support
   s->kv_cache_manager = new KVCacheManager(max_batch, p->n_layers, p->seq_len, kv_dim, p->sliding_window);
   
-  HIP_CHECK(hipMalloc(&s->logits,      B * (size_t)p->vocab_size * sizeof(float)));
+  // Removed legacy 'logits' buffer
 
   // Mask not needed for paged attention path; keep null to avoid large alloc
   s->mask = NULL;
@@ -2399,28 +2511,20 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->sel_w,        Mmax * sizeof(float)));
 
   // Expert-grouped arrays and counters
-  HIP_CHECK(hipMalloc(&s->sel_sids_grouped, Mmax * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->sel_eids_grouped, Mmax * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->sel_w_grouped,    Mmax * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->eid_counts,   (size_t)p->n_experts * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->eid_offsets, ((size_t)p->n_experts + 1) * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->eid_cursors,  (size_t)p->n_experts * sizeof(int)));
 
-
-  int Bpad_batch = ((max_batch + 15) / 16) * 16;  // cho QKV/W_O/Router
+  
   // size_t Mmax      = (size_t)max_batch * (size_t)p->experts_per_token;               // B tối đa của selections
   size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_B - 1);            // trừ hao pad tối đa
   int Bpad_mlp1    = (int)round_up16((int)Mmax_pad);                                  // cho pack MLP1
-  int Bpad_pack    = std::max(Bpad_batch, Bpad_mlp1);
 
     size_t Kmax_xpack = std::max({
       (size_t)p->hidden_dim,
       (size_t)p->head_dim * (size_t)p->n_attn_heads,
       (size_t)p->intermediate_dim    // NEW
   });
-
-  HIP_CHECK(hipMalloc(&s->xpack_f32, Kmax_xpack * (size_t)Bpad_pack * sizeof(float)));
-
+  
   HIP_CHECK(hipMalloc(&s->xpack_bf16, Kmax_xpack * (size_t)Bpad_mlp1 * sizeof(hip_bfloat16)));
   // HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
   // HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
@@ -2465,8 +2569,8 @@ void gpu_free_run_state(GPURunState *s) {
     if (s->value_cache) HIP_CHECK(hipFree(s->value_cache));
   }
   
-  HIP_CHECK(hipFree(s->logits));
-  HIP_CHECK(hipFree(s->mask));
+  // No legacy logits or mask buffers to free
+  if (s->mask) HIP_CHECK(hipFree(s->mask));
   HIP_CHECK(hipFree(s->cos_vals));
   HIP_CHECK(hipFree(s->sin_vals));
   if (s->acc_buffer) HIP_CHECK(hipFree(s->acc_buffer));  // acc_buffer may be nullptr
@@ -2476,13 +2580,8 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->sel_w));
   if (s->mlp1_out_all) HIP_CHECK(hipFree(s->mlp1_out_all));
   HIP_CHECK(hipFree(s->gate_up_all));
-  HIP_CHECK(hipFree(s->sel_sids_grouped));
-  HIP_CHECK(hipFree(s->sel_eids_grouped));
-  HIP_CHECK(hipFree(s->sel_w_grouped));
   HIP_CHECK(hipFree(s->eid_counts));
-  HIP_CHECK(hipFree(s->eid_offsets));
   HIP_CHECK(hipFree(s->eid_cursors));
-  HIP_CHECK(hipFree(s->xpack_f32));
   HIP_CHECK(hipFree(s->xpack_bf16));
   HIP_CHECK(hipFree(s->sorted_indices));
   HIP_CHECK(hipFree(s->sorted_sids));
