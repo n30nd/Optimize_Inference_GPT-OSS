@@ -30,3 +30,5 @@ build/
 # Binaries
 *.safetensors
 *.bin
+
+evaluation/submission/output_20b_token_ids.txt
