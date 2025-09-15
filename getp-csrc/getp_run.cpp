@@ -496,74 +496,80 @@ __global__ void k_attention_step(
   tb_local[h*head_dim + d] = acc;
 }
 
-// Batched attention for local heads; B independent sequences processed
 __global__ void k_attention_step_batched(
     const float* __restrict__ q_local_b,   // [B, n_qh_local*hd]
-    const float* __restrict__ kv_cache_k_b,// [B, pos+1, n_kvh_local*hd]
+    const float* __restrict__ kv_cache_k_b,// [B, seq_len, n_kvh_local*hd]
     const float* __restrict__ kv_cache_v_b,
     float*       __restrict__ tb_local_b,  // [B, n_qh_local*hd]
-    const int*    __restrict__ pos_list,
+    const int*   __restrict__ pos_list,
     int head_dim,
     int n_qh_local, int n_kvh_local, int kv_mul,
-    int kv_block_stride, // stride between samples in kv cache (seq_len * kvdim)
-    const float* __restrict__ mask_base_or_null, // [seq_len, seq_len]
+    int kv_block_stride,                   // seq_len * (n_kvh_local*hd)
+    const float* __restrict__ mask_base_or_null, // [seq_len, seq_len] or null
     int seq_len,
-    const float* __restrict__ attn_sinks_l) {
-  int h = blockIdx.x;
-  int b = blockIdx.y;
-  int d = threadIdx.x;
+    const float* __restrict__ attn_sinks_l // [n_qh_local] or null
+) {
+  int h  = blockIdx.x;
+  int b  = blockIdx.y;
+  int d  = threadIdx.x;
   if (h >= n_qh_local || d >= head_dim) return;
 
-  extern __shared__ float smem[];
-  float* logits = smem; // length = pos_plus1 + 1
-  const float* q = q_local_b + (size_t)b * n_qh_local * head_dim + h * head_dim;
-
-  float inv_sqrt_d = rsqrtf((float)head_dim);
-  int kvdim = n_kvh_local * head_dim;
-  const float* k_base = kv_cache_k_b + (size_t)b * kv_block_stride;
-  const float* v_base = kv_cache_v_b + (size_t)b * kv_block_stride;
-
   int pos_b = pos_list[b];
-  if (pos_b < 0) return; // inactive sample
-  int pos_plus1 = pos_b + 1;
-  const float* mask_row_or_null = nullptr;
-  if (mask_base_or_null) mask_row_or_null = mask_base_or_null + (size_t)pos_b * seq_len;
+  if (pos_b < 0) return;
 
-  for (int t = 0; t < pos_plus1; ++t) {
+  const float* q = q_local_b + (size_t)b * (size_t)n_qh_local * head_dim + (size_t)h * head_dim;
+  const float* k_base = kv_cache_k_b + (size_t)b * (size_t)kv_block_stride;
+  const float* v_base = kv_cache_v_b + (size_t)b * (size_t)kv_block_stride;
+  const float* mask_row = (mask_base_or_null) ? (mask_base_or_null + (size_t)pos_b * seq_len) : nullptr;
+
+  const int kvdim = n_kvh_local * head_dim;
+  const int kvh_off = (h / kv_mul) * head_dim;
+  const float inv_sqrt_d = rsqrtf((float)head_dim);
+
+  extern __shared__ float smem[]; // size >= (max_pos+2) + head_dim
+  float* logits = smem;           // [0 .. pos_b+1]
+  float* redbuf = logits + (pos_b + 2); // [0 .. head_dim-1]
+
+  // 1) Tính logits[t] = softmax(q·k_t / sqrt(d)) với dot song song theo d
+  for (int t = 0; t <= pos_b; ++t) {
+    const float* k = k_base + (size_t)t * kvdim + kvh_off;
+    float prod = q[d] * k[d];
+    redbuf[d] = prod;
     __syncthreads();
+
+    if (blockDim.x >= 256) { if (d < 128) redbuf[d] += redbuf[d + 128]; __syncthreads(); }
+    if (blockDim.x >= 128) { if (d <  64) redbuf[d] += redbuf[d +  64]; __syncthreads(); }
+    if (d < 32) {
+      volatile float* v = redbuf;
+      v[d] += v[d + 32]; v[d] += v[d + 16]; v[d] += v[d + 8];
+      v[d] += v[d +  4]; v[d] += v[d +  2]; v[d] += v[d + 1];
+    }
     if (d == 0) {
-      const float* k = k_base + (size_t)t * kvdim + (h/kv_mul) * head_dim;
-      float score = 0.f;
-      for (int i = 0; i < head_dim; ++i) score += q[i]*k[i];
-      score *= inv_sqrt_d;
-      if (mask_row_or_null) score += mask_row_or_null[t];
+      float score = redbuf[0] * inv_sqrt_d;
+      if (mask_row) score += mask_row[t];
       logits[t] = score;
     }
     __syncthreads();
   }
   if (d == 0) {
-    float sink = (attn_sinks_l) ? attn_sinks_l[h] : 0.f;
-    logits[pos_plus1] = sink;
-  }
-  __syncthreads();
-
-  int len = pos_plus1 + 1;
-  if (d == 0) {
+    logits[pos_b + 1] = attn_sinks_l ? attn_sinks_l[h] : 0.f; // sink
+    int len = pos_b + 2;
     float m = logits[0];
-    for (int t = 1; t < len; ++t) m = fmaxf(m, logits[t]);
+    for (int i = 1; i < len; ++i) m = fmaxf(m, logits[i]);
     float s = 0.f;
-    for (int t = 0; t < len; ++t) { logits[t] = expf(logits[t] - m); s += logits[t]; }
-    for (int t = 0; t < len; ++t) logits[t] /= s;
+    for (int i = 0; i < len; ++i) { logits[i] = expf(logits[i] - m); s += logits[i]; }
+    float inv = 1.f / s;
+    for (int i = 0; i < len; ++i) logits[i] *= inv;
   }
   __syncthreads();
 
+  // 2) Tính tb = Σ_t a_t * v_t (mỗi thread d tích lũy thành phần d)
   float acc = 0.f;
-  for (int t = 0; t < pos_plus1; ++t) {
-    const float* v = v_base + (size_t)t * kvdim + (h/kv_mul) * head_dim;
-    float a = logits[t];
-    acc += a * v[d];
+  for (int t = 0; t <= pos_b; ++t) {
+    const float* v = v_base + (size_t)t * kvdim + kvh_off;
+    acc += logits[t] * v[d];
   }
-  tb_local_b[(size_t)b * n_qh_local * head_dim + h*head_dim + d] = acc;
+  tb_local_b[(size_t)b * (size_t)n_qh_local * head_dim + (size_t)h * head_dim + d] = acc;
 }
 
 
