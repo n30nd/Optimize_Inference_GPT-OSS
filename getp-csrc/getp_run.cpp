@@ -1,7 +1,7 @@
 // getp-csrc/getp_run.cpp
 // End-to-end "getp" path with 4x AMD GPUs, TP (Attention) + EP (MoE).
 // - No external GPU libs. Naive HIP kernels focused on correctness.
-// - Weights:    MLP1 stored as FP8-like (uint8 + per-row scale), others BF16
+// - Weights:    All stored as BF16 (MLP1 now BF16, previously FP8-like)
 // - Activations: FP32 (GPURunState concept)
 // - All-reduce: host-bridge (D2H sum H2D) for Attention W_o partials
 // - Warm-up does sharding + chunked copy (512 MB default)
@@ -100,20 +100,102 @@ static void safeHipFree(void* p) {
 // Very small, naive device kernels (correctness)
 // ---------------------------------------------
 
-// y[out] = W[out, in] (BF16) @ x[in] (FP32)
+// y[out] = W[out, in] (BF16) @ x[in] (FP32). One block per output row.
 __global__ void k_matvec_bf16_fp32(const hip_bfloat16* __restrict__ W,
                                    const float*        __restrict__ x,
                                    float*                    y,
                                    int in_features, int out_features) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x; // output row
-  if (i >= out_features) return;
-  float acc = 0.f;
-  const hip_bfloat16* row = W + (size_t)i * in_features;
-  for (int j = 0; j < in_features; ++j) {
-    float w = bf16_to_fp32_bi(row[j]);
-    acc += w * x[j];
+  int row = blockIdx.x;
+  if (row >= out_features) return;
+  const hip_bfloat16* wrow = W + (size_t)row * in_features;
+  float sum = 0.f;
+  for (int j = threadIdx.x; j < in_features; j += blockDim.x) {
+    float w = bf16_to_fp32_bi(wrow[j]);
+    sum += w * x[j];
   }
-  y[i] = acc;
+  __shared__ float sdata[256];
+  int tid = threadIdx.x;
+  sdata[tid] = sum; __syncthreads();
+  if (blockDim.x >= 256) { if (tid < 128) sdata[tid] += sdata[tid + 128]; __syncthreads(); }
+  if (blockDim.x >= 128) { if (tid <  64) sdata[tid] += sdata[tid +  64]; __syncthreads(); }
+  if (tid < 32) {
+    volatile float* v = sdata;
+    v[tid] += v[tid + 32];
+    v[tid] += v[tid + 16];
+    v[tid] += v[tid +  8];
+    v[tid] += v[tid +  4];
+    v[tid] += v[tid +  2];
+    v[tid] += v[tid +  1];
+  }
+  if (tid == 0) y[row] = sdata[0];
+}
+
+// RMSNorm for a single vector: y = weight * x / sqrt(mean(x^2)+eps)
+__global__ void k_rmsnorm_vec(const float* __restrict__ x,
+                              const float* __restrict__ weight,
+                              float* __restrict__ y,
+                              int size) {
+  __shared__ float ssum[256];
+  float local = 0.f;
+  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+    float v = x[i];
+    local += v * v;
+  }
+  ssum[threadIdx.x] = local; __syncthreads();
+  if (blockDim.x >= 256) { if (threadIdx.x < 128) ssum[threadIdx.x] += ssum[threadIdx.x + 128]; __syncthreads(); }
+  if (blockDim.x >= 128) { if (threadIdx.x <  64) ssum[threadIdx.x] += ssum[threadIdx.x +  64]; __syncthreads(); }
+  if (threadIdx.x < 32) {
+    volatile float* v = ssum;
+    v[threadIdx.x] += v[threadIdx.x + 32];
+    v[threadIdx.x] += v[threadIdx.x + 16];
+    v[threadIdx.x] += v[threadIdx.x +  8];
+    v[threadIdx.x] += v[threadIdx.x +  4];
+    v[threadIdx.x] += v[threadIdx.x +  2];
+    v[threadIdx.x] += v[threadIdx.x +  1];
+  }
+  __syncthreads();
+  float inv = rsqrtf(ssum[0] / (float)size + 1e-5f);
+  for (int i = threadIdx.x; i < size; i += blockDim.x) {
+    y[i] = weight[i] * (x[i] * inv);
+  }
+}
+
+// Generic FP32 matvec: y[out] = W[out,in] @ x[in]
+__global__ void k_matvec_fp32(const float* __restrict__ W,
+                              const float* __restrict__ x,
+                              float* __restrict__ y,
+                              int in_n, int out_n) {
+  int row = blockIdx.x;
+  if (row >= out_n) return;
+  const float* wrow = W + (size_t)row * in_n;
+  float sum = 0.f;
+  for (int j = threadIdx.x; j < in_n; j += blockDim.x) sum += wrow[j] * x[j];
+  __shared__ float sdata[256];
+  int tid = threadIdx.x;
+  sdata[tid] = sum; __syncthreads();
+  if (blockDim.x >= 256) { if (tid < 128) sdata[tid] += sdata[tid + 128]; __syncthreads(); }
+  if (blockDim.x >= 128) { if (tid <  64) sdata[tid] += sdata[tid +  64]; __syncthreads(); }
+  if (tid < 32) {
+    volatile float* v = sdata;
+    v[tid] += v[tid + 32];
+    v[tid] += v[tid + 16];
+    v[tid] += v[tid +  8];
+    v[tid] += v[tid +  4];
+    v[tid] += v[tid +  2];
+    v[tid] += v[tid +  1];
+  }
+  if (tid == 0) y[row] = sdata[0];
+}
+
+// In-place softmax for a small vector (naive)
+__global__ void k_softmax_inplace(float* x, int n) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  float m = x[0];
+  for (int i = 1; i < n; ++i) m = fmaxf(m, x[i]);
+  float s = 0.f;
+  for (int i = 0; i < n; ++i) { x[i] = expf(x[i] - m); s += x[i]; }
+  float inv = 1.f / s;
+  for (int i = 0; i < n; ++i) x[i] *= inv;
 }
 
 __global__ void k_add_bias(float* y, const float* b, int n) {
@@ -142,6 +224,44 @@ __global__ void k_apply_rotary(float* vec,       // shape: n_heads_local * head_
   float o2 = x2 * c + x1 * s;
   base[i] = o1;
   base[half + i] = o2;
+}
+
+// Compute RoPE cos/sin on device for a given position and config
+__global__ void k_compute_cos_sin(int pos,
+                                  float base,
+                                  int head_dim,
+                                  float scaling_factor,
+                                  float initial_context_length,
+                                  float ntk_beta,
+                                  float ntk_alpha,
+                                  float* __restrict__ cos_out,
+                                  float* __restrict__ sin_out) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  int d_half = head_dim / 2;
+  if (j >= d_half) return;
+  const float PI = 3.14159265358979323846f;
+
+  float exponent = (2.0f * (float)j) / (float)head_dim;
+  float freq = powf(base, exponent);
+  float concentration = (scaling_factor > 1.0f) ? (0.1f * logf(scaling_factor) + 1.0f) : 1.0f;
+
+  float inv_freq;
+  if (scaling_factor > 1.0f) {
+    float low = (float)d_half * logf(initial_context_length / (ntk_beta * 2.0f * PI)) / logf(base);
+    float high = (float)d_half * logf(initial_context_length / (ntk_alpha * 2.0f * PI)) / logf(base);
+    float interpolation = 1.0f / (scaling_factor * freq);
+    float extrapolation = 1.0f / freq;
+    float ramp = ((float)j - low) / (high - low);
+    if (ramp < 0.f) ramp = 0.f; if (ramp > 1.f) ramp = 1.f;
+    float mask = 1.0f - ramp;
+    inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
+  } else {
+    inv_freq = 1.0f / freq;
+  }
+
+  float val = (float)pos * inv_freq;
+  cos_out[j] = cosf(val) * concentration;
+  sin_out[j] = sinf(val) * concentration;
 }
 
 // Attention for local heads: computes tb_local
@@ -213,18 +333,37 @@ __global__ void k_matvec_colslice_bf16(const hip_bfloat16* __restrict__ Wcols,
                                        const float*        __restrict__ xcols,
                                        float*                    y,
                                        int hidden_dim, int cols_local) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x; // row in hidden_dim
-  if (i >= hidden_dim) return;
-  const hip_bfloat16* row = Wcols + (size_t)i * cols_local;
-  float acc = 0.f;
-  for (int j = 0; j < cols_local; ++j) {
-    float w = bf16_to_fp32_bi(row[j]);
-    acc += w * xcols[j];
+  int row = blockIdx.x; // one block per row
+  if (row >= hidden_dim) return;
+  const hip_bfloat16* wrow = Wcols + (size_t)row * cols_local;
+  float sum = 0.f;
+  for (int j = threadIdx.x; j < cols_local; j += blockDim.x) {
+    float w = bf16_to_fp32_bi(wrow[j]);
+    sum += w * xcols[j];
   }
-  y[i] = acc;
+  __shared__ float sdata[256];
+  int tid = threadIdx.x;
+  sdata[tid] = sum; __syncthreads();
+  if (blockDim.x >= 256) { if (tid < 128) sdata[tid] += sdata[tid + 128]; __syncthreads(); }
+  if (blockDim.x >= 128) { if (tid <  64) sdata[tid] += sdata[tid +  64]; __syncthreads(); }
+  if (tid < 32) {
+    volatile float* v = sdata;
+    v[tid] += v[tid + 32];
+    v[tid] += v[tid + 16];
+    v[tid] += v[tid +  8];
+    v[tid] += v[tid +  4];
+    v[tid] += v[tid +  2];
+    v[tid] += v[tid +  1];
+  }
+  if (tid == 0) y[row] = sdata[0];
 }
 
 // FP8-like (uint8 + per-row scale) matvec: out_rows x in_cols
+// Legacy path retained for future use; not used in current flow.
+#ifndef KEEP_FP8_UTILS
+#define KEEP_FP8_UTILS 1
+#endif
+#if KEEP_FP8_UTILS
 __global__ void k_matvec_fp8_rowscale(const uint8_t* __restrict__ W_u8,
                                       const float*   __restrict__ scale_rows,
                                       const float*   __restrict__ x,
@@ -241,6 +380,7 @@ __global__ void k_matvec_fp8_rowscale(const uint8_t* __restrict__ W_u8,
   }
   y[r] = acc;
 }
+#endif
 
 // ---------------------------------------------
 // Sharding helpers
@@ -273,7 +413,7 @@ static ExpertShard compute_expert_shard(const Config* p, int rank) {
 // ---------------------------------------------
 // Device-side containers per GPU
 // ---------------------------------------------
-struct DevBuffers {
+struct GPUTransformerWeights {
   hip_bfloat16* d_w_qkv_rows = nullptr;
   float*        d_b_qkv_rows = nullptr;
   size_t w_qkv_rows_stride = 0;
@@ -282,6 +422,33 @@ struct DevBuffers {
   hip_bfloat16* d_w_o_cols = nullptr;
   int cols_per_layer_local = 0;
 
+  hip_bfloat16* d_w_mlp1 = nullptr; // MLP1 as BF16
+#if KEEP_FP8_UTILS
+  // Legacy FP8 packing kept for future experiments
+  uint8_t* d_w_mlp1_u8 = nullptr;
+  float*   d_w_mlp1_scale = nullptr;
+#endif
+  float*   d_b_mlp1 = nullptr;
+
+  hip_bfloat16* d_w_mlp2 = nullptr;
+  float*        d_b_mlp2 = nullptr;
+
+  // Router (FP32) per layer
+  float* d_w_router = nullptr; // size L * E * D (row-major: E x D per layer)
+  float* d_b_router = nullptr; // size L * E
+
+  // Final classifier (FP32) stored on GPU0 only
+  float* d_w_out = nullptr; // size vocab_size * D (row-major)
+
+  // RMSNorm weights
+  float* d_rms_attn_w = nullptr; // size L*D
+  float* d_rms_ffn_w  = nullptr; // size L*D
+  float* d_rms_out_w  = nullptr; // size D
+
+  float* d_attn_sinks = nullptr; // size = n_layers * q_count
+};
+
+struct GPURunState {
   float* d_kv_k = nullptr;
   float* d_kv_v = nullptr;
 
@@ -292,26 +459,24 @@ struct DevBuffers {
   float* d_tb_local = nullptr;
   float* d_tb2_partial = nullptr;
 
-  uint8_t* d_w_mlp1_u8 = nullptr;
-  float*   d_w_mlp1_scale = nullptr;
-  float*   d_b_mlp1 = nullptr;
-
-  hip_bfloat16* d_w_mlp2 = nullptr;
-  float*        d_b_mlp2 = nullptr;
-
   float* d_mlp1_out = nullptr;
   float* d_gate_up  = nullptr;
   float* d_ffn_out  = nullptr;
 
-  // NEW: per-step rotary & static mask on device
   float* d_cos = nullptr;   // size head_dim/2
   float* d_sin = nullptr;   // size head_dim/2
   float* d_mask = nullptr;  // size seq_len * seq_len  (nullable)
-  float* d_attn_sinks = nullptr; // size = n_layers * q_count
 
+  // Router temporaries
+  float* d_router = nullptr; // size E
+  float* d_topk   = nullptr; // size K (experts_per_token)
+
+  // Logits (GPU0 only)
+  float* d_logits = nullptr; // size vocab_size
 };
 
-static DevBuffers g_devs[NUM_GPUS];
+static GPUTransformerWeights g_weights[NUM_GPUS];
+static GPURunState g_state[NUM_GPUS];
 static HeadShard  g_head_shard[NUM_GPUS];
 static ExpertShard g_expert_shard[NUM_GPUS];
 static int g_world = NUM_GPUS;
@@ -388,6 +553,8 @@ static void pack_layer_w_o_colslice_bf16(const TransformerWeights* w, const Conf
   }
 }
 
+// Legacy: keep rowwise FP8 pack util for future use
+#if KEEP_FP8_UTILS
 static void pack_rowwise_fp8_u8(const float* src, uint8_t* dst_u8, float* scale_rows,
                                 int out_rows, int in_cols) {
   for (int r = 0; r < out_rows; ++r) {
@@ -403,6 +570,7 @@ static void pack_rowwise_fp8_u8(const float* src, uint8_t* dst_u8, float* scale_
     }
   }
 }
+#endif
 
 // ---------------------------------------------
 // Memory utility functions
@@ -422,6 +590,237 @@ static void print_memory_usage(int gpu_id, const char* stage) {
          total_mem / (1024.0 * 1024.0 * 1024.0),
          (used_mem * 100.0) / total_mem);
   fflush(stdout);
+}
+
+// ---------------------------------------------
+// GPU allocation/copy helpers (weights vs run state)
+// ---------------------------------------------
+static void gpu_copy_weights(Transformer* transformer, int r) {
+  Config* p = &transformer->config;
+  TransformerWeights* w = &transformer->weights;
+
+  const int L  = p->n_layers;
+  const int D  = p->hidden_dim;
+  const int hd = p->head_dim;
+  const int E = p->n_experts;
+
+  auto& devw = g_weights[r];
+  auto& hs   = g_head_shard[r];
+  auto& es   = g_expert_shard[r];
+
+  // Derived locals
+  devw.rows_per_layer_local = (hs.q_count + 2*hs.kv_count)*hd;
+  devw.cols_per_layer_local = hs.q_count * hd;
+  devw.w_qkv_rows_stride    = (size_t)devw.rows_per_layer_local * D;
+
+  size_t tot_rows = (size_t)L * devw.rows_per_layer_local;
+  size_t tot_cols = (size_t)L * devw.cols_per_layer_local;
+
+  // Allocate attention weights
+  printf("[GPU%d] Allocating attention weights...\n", r);
+  size_t qkv_weights_size = tot_rows * D * sizeof(hip_bfloat16);
+  size_t qkv_bias_size    = tot_rows * sizeof(float);
+  size_t wo_weights_size  = (size_t)D * tot_cols * sizeof(hip_bfloat16);
+  printf("[GPU%d]   - QKV weights: %.2f MB\n", r, qkv_weights_size / (1024.0*1024.0));
+  printf("[GPU%d]   - QKV bias: %.2f MB\n", r, qkv_bias_size / (1024.0*1024.0));
+  printf("[GPU%d]   - W_o weights: %.2f MB\n", r, wo_weights_size / (1024.0*1024.0));
+
+  HIP_CHECK(hipMalloc(&devw.d_w_qkv_rows, qkv_weights_size));
+  HIP_CHECK(hipMalloc(&devw.d_b_qkv_rows, qkv_bias_size));
+  HIP_CHECK(hipMalloc(&devw.d_w_o_cols,   wo_weights_size));
+
+  print_memory_usage(r, "After attention allocation");
+
+  // Load attention weights layer by layer
+  printf("[GPU%d] Loading attention weights...\n", r);
+  {
+    std::vector<hip_bfloat16> tmp_rows(devw.rows_per_layer_local * D);
+    std::vector<float>        tmp_bias(devw.rows_per_layer_local);
+    std::vector<hip_bfloat16> tmp_cols((size_t)D * devw.cols_per_layer_local);
+
+    for (int l = 0; l < L; ++l) {
+      if (l % 10 == 0 || l == L-1) {
+        printf("[GPU%d]   Loading attention layer %d/%d...\n", r, l+1, L);
+        fflush(stdout);
+      }
+      pack_layer_w_qkv_local_bf16(w, p, l, hs, tmp_rows.data(), tmp_bias.data());
+      pack_layer_w_o_colslice_bf16(w, p, l, hs, tmp_cols.data());
+
+      hip_bfloat16* w_qkv_dst = devw.d_w_qkv_rows + (size_t)l * devw.w_qkv_rows_stride;
+      float*        b_qkv_dst = devw.d_b_qkv_rows + (size_t)l * devw.rows_per_layer_local;
+      hip_bfloat16* w_o_dst   = devw.d_w_o_cols   + (size_t)l * (size_t)D * devw.cols_per_layer_local;
+
+      memcpyHtoD_chunked(w_qkv_dst, tmp_rows.data(), tmp_rows.size() * sizeof(hip_bfloat16));
+      memcpyHtoD_chunked(b_qkv_dst, tmp_bias.data(), tmp_bias.size() * sizeof(float));
+      memcpyHtoD_chunked(w_o_dst,   tmp_cols.data(), tmp_cols.size() * sizeof(hip_bfloat16));
+    }
+  }
+  printf("[GPU%d] ✓ Attention weights loaded successfully\n", r);
+
+  // Copy RMSNorm weights
+  printf("[GPU%d] Copying RMSNorm weights...\n", r);
+  HIP_CHECK(hipMalloc(&devw.d_rms_attn_w, (size_t)L * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&devw.d_rms_ffn_w,  (size_t)L * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&devw.d_rms_out_w,  D * sizeof(float)));
+  memcpyHtoD_chunked(devw.d_rms_attn_w, transformer->weights.rms_attn_w, (size_t)L * D * sizeof(float));
+  memcpyHtoD_chunked(devw.d_rms_ffn_w,  transformer->weights.rms_ffn_w,  (size_t)L * D * sizeof(float));
+  memcpyHtoD_chunked(devw.d_rms_out_w,  transformer->weights.rms_out_w,  D * sizeof(float));
+
+  // Copy Router weights (FP32)
+  printf("[GPU%d] Copying Router weights...\n", r);
+  HIP_CHECK(hipMalloc(&devw.d_w_router, (size_t)L * (size_t)E * (size_t)D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&devw.d_b_router, (size_t)L * (size_t)E * sizeof(float)));
+  memcpyHtoD_chunked(devw.d_w_router, transformer->weights.w_router, (size_t)L * (size_t)E * (size_t)D * sizeof(float));
+  memcpyHtoD_chunked(devw.d_b_router, transformer->weights.b_router, (size_t)L * (size_t)E * sizeof(float));
+
+  // Copy final classifier (FP32) on GPU0 only
+  if (r == 0) {
+    int V = p->vocab_size;
+    printf("[GPU%d] Copying OUT weights (vocab x hidden) FP32...\n", r);
+    HIP_CHECK(hipMalloc(&devw.d_w_out, (size_t)V * (size_t)D * sizeof(float)));
+    memcpyHtoD_chunked(devw.d_w_out, transformer->weights.out, (size_t)V * (size_t)D * sizeof(float));
+  }
+
+  // Copy Router weights (FP32)
+  printf("[GPU%d] Copying Router weights...\n", r);
+  HIP_CHECK(hipMalloc(&devw.d_w_router, (size_t)L * (size_t)E * (size_t)D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&devw.d_b_router, (size_t)L * (size_t)E * sizeof(float)));
+  memcpyHtoD_chunked(devw.d_w_router, transformer->weights.w_router, (size_t)L * (size_t)E * (size_t)D * sizeof(float));
+  memcpyHtoD_chunked(devw.d_b_router, transformer->weights.b_router, (size_t)L * (size_t)E * sizeof(float));
+
+  // Allocate and load MLP weights (per local expert)
+  const int I = p->intermediate_dim;
+  const int E_local = es.e_count;
+  printf("[GPU%d] Allocating MLP weights for %d local experts...\n", r, E_local);
+  size_t mlp1_rows_per_block = 2 * (size_t)I;
+  size_t mlp1_elems_per_block = mlp1_rows_per_block * (size_t)D;
+
+  size_t mlp1_weights_size = (size_t)L * E_local * mlp1_elems_per_block * sizeof(hip_bfloat16);
+  size_t mlp1_bias_size    = (size_t)L * E_local * mlp1_rows_per_block * sizeof(float);
+  size_t mlp2_weights_size = (size_t)L * E_local * (size_t)D * I * sizeof(hip_bfloat16);
+  size_t mlp2_bias_size    = (size_t)L * E_local * (size_t)D * sizeof(float);
+  printf("[GPU%d]   - MLP1 weights (BF16): %.2f MB\n", r, mlp1_weights_size / (1024.0*1024.0));
+  printf("[GPU%d]   - MLP1 bias: %.2f MB\n", r, mlp1_bias_size / (1024.0*1024.0));
+  printf("[GPU%d]   - MLP2 weights (BF16): %.2f MB\n", r, mlp2_weights_size / (1024.0*1024.0));
+  printf("[GPU%d]   - MLP2 bias: %.2f MB\n", r, mlp2_bias_size / (1024.0*1024.0));
+
+  HIP_CHECK(hipMalloc(&devw.d_w_mlp1, mlp1_weights_size));
+  HIP_CHECK(hipMalloc(&devw.d_b_mlp1, mlp1_bias_size));
+  HIP_CHECK(hipMalloc(&devw.d_w_mlp2, mlp2_weights_size));
+  HIP_CHECK(hipMalloc(&devw.d_b_mlp2, mlp2_bias_size));
+
+  // Load MLP weights
+  printf("[GPU%d] Loading MLP weights...\n", r);
+  {
+    std::vector<hip_bfloat16> tmp_w1(mlp1_elems_per_block);
+    std::vector<float>        tmp_b1(mlp1_rows_per_block);
+    std::vector<hip_bfloat16> tmp_w2((size_t)D * I);
+    std::vector<float>        tmp_b2(D);
+    int total_experts_loaded = 0;
+    for (int l = 0; l < L; ++l) {
+      for (int ei = 0; ei < E_local; ++ei) {
+        int e_global = es.e_start + ei;
+        if (total_experts_loaded % 50 == 0 || (l == L-1 && ei == E_local-1)) {
+          printf("[GPU%d]   Loading expert %d/%d (layer %d, local expert %d)...\n",
+                 r, total_experts_loaded + 1, L * E_local, l+1, ei+1);
+          fflush(stdout);
+        }
+        const float* W1 = w->w_mlp1 + 1ll*(l*p->n_experts + e_global) * (2ll*I) * D;
+        const float* B1 = w->b_mlp1 + 1ll*(l*p->n_experts + e_global) * (2ll*I);
+        for (size_t i = 0; i < mlp1_elems_per_block; ++i) tmp_w1[i] = fp32_to_bf16_host(W1[i]);
+        std::copy(B1, B1 + 2ll*I, tmp_b1.begin());
+
+        hip_bfloat16* dst_w1 = devw.d_w_mlp1 + ((size_t)l*E_local + ei) * mlp1_elems_per_block;
+        float*        dst_b1 = devw.d_b_mlp1 + ((size_t)l*E_local + ei) * mlp1_rows_per_block;
+        memcpyHtoD_chunked(dst_w1, tmp_w1.data(), tmp_w1.size() * sizeof(hip_bfloat16));
+        memcpyHtoD_chunked(dst_b1, tmp_b1.data(), tmp_b1.size() * sizeof(float));
+
+        const float* W2 = w->w_mlp2 + 1ll*(l*p->n_experts + e_global) * (size_t)D * I;
+        const float* B2 = w->b_mlp2 + 1ll*(l*p->n_experts + e_global) * D;
+        for (int i = 0; i < D*I; ++i) tmp_w2[i] = fp32_to_bf16_host(W2[i]);
+        std::copy(B2, B2 + D, tmp_b2.begin());
+
+        hip_bfloat16* dst_w2 = devw.d_w_mlp2 + ((size_t)l*E_local + ei) * (size_t)D * I;
+        float*        dst_b2 = devw.d_b_mlp2 + ((size_t)l*E_local + ei) * (size_t)D;
+        memcpyHtoD_chunked(dst_w2, tmp_w2.data(), tmp_w2.size() * sizeof(hip_bfloat16));
+        memcpyHtoD_chunked(dst_b2, tmp_b2.data(), tmp_b2.size() * sizeof(float));
+
+        total_experts_loaded++;
+      }
+    }
+    printf("[GPU%d] ✓ MLP weights loaded successfully (%d experts)\n", r, total_experts_loaded);
+  }
+
+  // Allocate & load attention sinks for local Q-heads
+  int q_local = hs.q_count;
+  if (q_local > 0) {
+    HIP_CHECK(hipMalloc(&devw.d_attn_sinks, (size_t)p->n_layers * q_local * sizeof(float)));
+    std::vector<float> h_sinks((size_t)p->n_layers * q_local);
+    for (int l = 0; l < p->n_layers; ++l) {
+      for (int h = 0; h < q_local; ++h) {
+        int h_global = hs.q_start + h;
+        h_sinks[(size_t)l * q_local + h] = transformer->weights.attn_sinks[l * p->n_attn_heads + h_global];
+      }
+    }
+    memcpyHtoD_chunked(devw.d_attn_sinks, h_sinks.data(), h_sinks.size() * sizeof(float));
+  }
+}
+
+static void gpu_malloc_run_state(Transformer* transformer, int r) {
+  Config* p = &transformer->config;
+  const int L  = p->n_layers;
+  const int D  = p->hidden_dim;
+  const int hd = p->head_dim;
+  const int seq = p->seq_len;
+  auto& hs   = g_head_shard[r];
+  auto& devw = g_weights[r];
+  auto& st   = g_state[r];
+
+  // Allocate KV cache
+  printf("[GPU%d] Allocating KV cache...\n", r);
+  int kv_dim_local = hs.kv_count * hd;
+  size_t kv_cache_size = (size_t)L * seq * kv_dim_local * sizeof(float);
+  printf("[GPU%d]   - KV cache (K): %.2f MB\n", r, kv_cache_size / (1024.0*1024.0));
+  printf("[GPU%d]   - KV cache (V): %.2f MB\n", r, kv_cache_size / (1024.0*1024.0));
+  HIP_CHECK(hipMalloc(&st.d_kv_k, kv_cache_size));
+  HIP_CHECK(hipMalloc(&st.d_kv_v, kv_cache_size));
+
+  // Allocate working buffers
+  printf("[GPU%d] Allocating working buffers...\n", r);
+  HIP_CHECK(hipMalloc(&st.d_x, D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_t, D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_qkv, devw.rows_per_layer_local * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_q_local, hs.q_count * hd * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_tb_local, hs.q_count * hd * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_tb2_partial, D * sizeof(float)));
+
+  const int I = p->intermediate_dim;
+  HIP_CHECK(hipMalloc(&st.d_mlp1_out, (size_t)(2*I) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_gate_up,  I * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_ffn_out,  D * sizeof(float)));
+
+  // Rotary buffers
+  printf("[GPU%d] Allocating rotary buffers...\n", r);
+  HIP_CHECK(hipMalloc(&st.d_cos, (p->head_dim/2) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_sin, (p->head_dim/2) * sizeof(float)));
+
+  // Attention mask (optional)
+  if (transformer->state.mask) {
+    printf("[GPU%d] Allocating attention mask...\n", r);
+    size_t mask_elems = (size_t)p->seq_len * p->seq_len;
+    size_t mask_size = mask_elems * sizeof(float);
+    printf("[GPU%d]   - Attention mask: %.2f MB\n", r, mask_size / (1024.0*1024.0));
+    HIP_CHECK(hipMalloc(&st.d_mask, mask_size));
+    memcpyHtoD_chunked(st.d_mask, transformer->state.mask, mask_size);
+    printf("[GPU%d] ✓ Attention mask loaded\n", r);
+  }
+
+  // Router temporaries and logits buffer (GPU0)
+  HIP_CHECK(hipMalloc(&st.d_router, (size_t)p->n_experts * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_topk,   (size_t)p->experts_per_token * sizeof(float)));
+  if (r == 0) {
+    HIP_CHECK(hipMalloc(&st.d_logits, (size_t)p->vocab_size * sizeof(float)));
+  }
 }
 
 // ---------------------------------------------
@@ -472,194 +871,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int r = 0; r < NUM_GPUS; ++r) {
     printf("\n[GPU%d] ========== Starting weight loading ==========\n", r);
     HIP_CHECK(hipSetDevice(r));
-    auto& dev = g_devs[r];
-    auto& hs  = g_head_shard[r];
-    auto& es  = g_expert_shard[r];
-
     print_memory_usage(r, "Before allocation");
-
-    dev.rows_per_layer_local = (hs.q_count + 2*hs.kv_count)*hd;
-    dev.cols_per_layer_local = hs.q_count * hd;
-    dev.w_qkv_rows_stride    = (size_t)dev.rows_per_layer_local * D;
-
-    size_t tot_rows = (size_t)L * dev.rows_per_layer_local;
-    size_t tot_cols = (size_t)L * dev.cols_per_layer_local;
-
-    // Allocate attention weights
-    printf("[GPU%d] Allocating attention weights...\n", r);
-    size_t qkv_weights_size = tot_rows * D * sizeof(hip_bfloat16);
-    size_t qkv_bias_size = tot_rows * sizeof(float);
-    size_t wo_weights_size = (size_t)D * tot_cols * sizeof(hip_bfloat16);
-    printf("[GPU%d]   - QKV weights: %.2f MB\n", r, qkv_weights_size / (1024.0*1024.0));
-    printf("[GPU%d]   - QKV bias: %.2f MB\n", r, qkv_bias_size / (1024.0*1024.0));
-    printf("[GPU%d]   - W_o weights: %.2f MB\n", r, wo_weights_size / (1024.0*1024.0));
-    
-    HIP_CHECK(hipMalloc(&dev.d_w_qkv_rows, qkv_weights_size));
-    HIP_CHECK(hipMalloc(&dev.d_b_qkv_rows, qkv_bias_size));
-    HIP_CHECK(hipMalloc(&dev.d_w_o_cols, wo_weights_size));
-
-    // Allocate KV cache
-    printf("[GPU%d] Allocating KV cache...\n", r);
-    int kv_dim_local = hs.kv_count * hd;
-    size_t kv_cache_size = (size_t)L * seq * kv_dim_local * sizeof(float);
-    printf("[GPU%d]   - KV cache (K): %.2f MB\n", r, kv_cache_size / (1024.0*1024.0));
-    printf("[GPU%d]   - KV cache (V): %.2f MB\n", r, kv_cache_size / (1024.0*1024.0));
-    
-    HIP_CHECK(hipMalloc(&dev.d_kv_k, kv_cache_size));
-    HIP_CHECK(hipMalloc(&dev.d_kv_v, kv_cache_size));
-
-    // Allocate working buffers
-    printf("[GPU%d] Allocating working buffers...\n", r);
-    HIP_CHECK(hipMalloc(&dev.d_x, D * sizeof(float)));
-    HIP_CHECK(hipMalloc(&dev.d_t, D * sizeof(float)));
-    HIP_CHECK(hipMalloc(&dev.d_qkv, dev.rows_per_layer_local * sizeof(float)));
-    HIP_CHECK(hipMalloc(&dev.d_q_local, hs.q_count * hd * sizeof(float)));
-    HIP_CHECK(hipMalloc(&dev.d_tb_local, hs.q_count * hd * sizeof(float)));
-    HIP_CHECK(hipMalloc(&dev.d_tb2_partial, D * sizeof(float)));
-
-    print_memory_usage(r, "After attention allocation");
-
-    // Loading attention weights layer by layer
-    printf("[GPU%d] Loading attention weights...\n", r);
-    {
-      std::vector<hip_bfloat16> tmp_rows(dev.rows_per_layer_local * D);
-      std::vector<float>        tmp_bias(dev.rows_per_layer_local);
-      std::vector<hip_bfloat16> tmp_cols((size_t)D * dev.cols_per_layer_local);
-
-      for (int l = 0; l < L; ++l) {
-        if (l % 10 == 0 || l == L-1) {
-          printf("[GPU%d]   Loading attention layer %d/%d...\n", r, l+1, L);
-          fflush(stdout);
-        }
-        
-        pack_layer_w_qkv_local_bf16(w, p, l, hs, tmp_rows.data(), tmp_bias.data());
-        pack_layer_w_o_colslice_bf16(w, p, l, hs, tmp_cols.data());
-
-        hip_bfloat16* w_qkv_dst = dev.d_w_qkv_rows + (size_t)l * dev.w_qkv_rows_stride;
-        float*        b_qkv_dst = dev.d_b_qkv_rows + (size_t)l * dev.rows_per_layer_local;
-        hip_bfloat16* w_o_dst   = dev.d_w_o_cols   + (size_t)l * (size_t)D * dev.cols_per_layer_local;
-
-        memcpyHtoD_chunked(w_qkv_dst, tmp_rows.data(), tmp_rows.size() * sizeof(hip_bfloat16));
-        memcpyHtoD_chunked(b_qkv_dst, tmp_bias.data(), tmp_bias.size() * sizeof(float));
-        memcpyHtoD_chunked(w_o_dst,   tmp_cols.data(), tmp_cols.size() * sizeof(hip_bfloat16));
-      }
-      printf("[GPU%d] ✓ Attention weights loaded successfully\n", r);
-    }
-
-    const int E_local = es.e_count;
-    const int I = p->intermediate_dim;
-
-    // Allocate MLP weights
-    printf("[GPU%d] Allocating MLP weights for %d local experts...\n", r, E_local);
-    size_t mlp1_rows_per_block = 2 * (size_t)I;
-    size_t mlp1_elems_per_block = mlp1_rows_per_block * (size_t)D;
-    
-    size_t mlp1_weights_size = (size_t)L * E_local * mlp1_elems_per_block * sizeof(uint8_t);
-    size_t mlp1_scale_size = (size_t)L * E_local * mlp1_rows_per_block * sizeof(float);
-    size_t mlp1_bias_size = (size_t)L * E_local * mlp1_rows_per_block * sizeof(float);
-    size_t mlp2_weights_size = (size_t)L * E_local * (size_t)D * I * sizeof(hip_bfloat16);
-    size_t mlp2_bias_size = (size_t)L * E_local * (size_t)D * sizeof(float);
-    
-    printf("[GPU%d]   - MLP1 weights (FP8): %.2f MB\n", r, mlp1_weights_size / (1024.0*1024.0));
-    printf("[GPU%d]   - MLP1 scales: %.2f MB\n", r, mlp1_scale_size / (1024.0*1024.0));
-    printf("[GPU%d]   - MLP1 bias: %.2f MB\n", r, mlp1_bias_size / (1024.0*1024.0));
-    printf("[GPU%d]   - MLP2 weights (BF16): %.2f MB\n", r, mlp2_weights_size / (1024.0*1024.0));
-    printf("[GPU%d]   - MLP2 bias: %.2f MB\n", r, mlp2_bias_size / (1024.0*1024.0));
-
-    HIP_CHECK(hipMalloc(&dev.d_w_mlp1_u8, mlp1_weights_size));
-    HIP_CHECK(hipMalloc(&dev.d_w_mlp1_scale, mlp1_scale_size));
-    HIP_CHECK(hipMalloc(&dev.d_b_mlp1, mlp1_bias_size));
-    HIP_CHECK(hipMalloc(&dev.d_w_mlp2, mlp2_weights_size));
-    HIP_CHECK(hipMalloc(&dev.d_b_mlp2, mlp2_bias_size));
-
-    HIP_CHECK(hipMalloc(&dev.d_mlp1_out, mlp1_rows_per_block * sizeof(float)));
-    HIP_CHECK(hipMalloc(&dev.d_gate_up,  I * sizeof(float)));
-    HIP_CHECK(hipMalloc(&dev.d_ffn_out,  D * sizeof(float)));
-
-    // Allocate rotary buffers
-    printf("[GPU%d] Allocating rotary buffers...\n", r);
-    HIP_CHECK(hipMalloc(&dev.d_cos, (p->head_dim/2) * sizeof(float)));
-    HIP_CHECK(hipMalloc(&dev.d_sin, (p->head_dim/2) * sizeof(float)));
-
-    // Allocate attention mask (optional)
-    if (transformer->state.mask) {
-      printf("[GPU%d] Allocating attention mask...\n", r);
-      size_t mask_elems = (size_t)p->seq_len * p->seq_len;
-      size_t mask_size = mask_elems * sizeof(float);
-      printf("[GPU%d]   - Attention mask: %.2f MB\n", r, mask_size / (1024.0*1024.0));
-      HIP_CHECK(hipMalloc(&dev.d_mask, mask_size));
-      memcpyHtoD_chunked(dev.d_mask, transformer->state.mask, mask_size);
-      printf("[GPU%d] ✓ Attention mask loaded\n", r);
-    }
-    // --- NEW: allocate & load attention sinks for local Q-heads ---
-    {
-      int q_local = hs.q_count;
-      if (q_local > 0) {
-        HIP_CHECK(hipMalloc(&dev.d_attn_sinks, (size_t)p->n_layers * q_local * sizeof(float)));
-        std::vector<float> h_sinks((size_t)p->n_layers * q_local);
-        for (int l = 0; l < p->n_layers; ++l) {
-          for (int h = 0; h < q_local; ++h) {
-            int h_global = hs.q_start + h;
-            h_sinks[(size_t)l * q_local + h] = transformer->weights.attn_sinks[l * p->n_attn_heads + h_global];
-          }
-        }
-        memcpyHtoD_chunked(dev.d_attn_sinks, h_sinks.data(), h_sinks.size() * sizeof(float));
-      }
-    }
-
-    print_memory_usage(r, "After MLP allocation");
-
-
-    // Loading MLP weights
-    printf("[GPU%d] Loading MLP weights...\n", r);
-    {
-      std::vector<uint8_t> tmp_u8(mlp1_elems_per_block);
-      std::vector<float>   tmp_scale(mlp1_rows_per_block);
-      std::vector<float>   tmp_b1(mlp1_rows_per_block);
-      std::vector<hip_bfloat16> tmp_w2((size_t)D * I);
-      std::vector<float>   tmp_b2(D);
-
-      int total_experts_loaded = 0;
-      for (int l = 0; l < L; ++l) {
-        for (int ei = 0; ei < E_local; ++ei) {
-          int e_global = es.e_start + ei;
-
-          if (total_experts_loaded % 50 == 0 || (l == L-1 && ei == E_local-1)) {
-            printf("[GPU%d]   Loading expert %d/%d (layer %d, local expert %d)...\n", 
-                   r, total_experts_loaded + 1, L * E_local, l+1, ei+1);
-            fflush(stdout);
-          }
-
-          const float* W1 = w->w_mlp1 + 1ll*(l*p->n_experts + e_global) * (2ll*I) * D;
-          const float* B1 = w->b_mlp1 + 1ll*(l*p->n_experts + e_global) * (2ll*I);
-          pack_rowwise_fp8_u8(W1, tmp_u8.data(), tmp_scale.data(), (int)mlp1_rows_per_block, D);
-          std::copy(B1, B1 + 2ll*I, tmp_b1.begin());
-
-          uint8_t*  dst_u8 = dev.d_w_mlp1_u8 + ((size_t)l*E_local + ei) * mlp1_elems_per_block;
-          float*    dst_sc = dev.d_w_mlp1_scale + ((size_t)l*E_local + ei) * mlp1_rows_per_block;
-          float*    dst_b1 = dev.d_b_mlp1 + ((size_t)l*E_local + ei) * mlp1_rows_per_block;
-
-          memcpyHtoD_chunked(dst_u8, tmp_u8.data(), tmp_u8.size() * sizeof(uint8_t));
-          memcpyHtoD_chunked(dst_sc, tmp_scale.data(), tmp_scale.size() * sizeof(float));
-          memcpyHtoD_chunked(dst_b1, tmp_b1.data(), tmp_b1.size() * sizeof(float));
-
-          const float* W2 = w->w_mlp2 + 1ll*(l*p->n_experts + e_global) * (size_t)D * I;
-          const float* B2 = w->b_mlp2 + 1ll*(l*p->n_experts + e_global) * D;
-          for (int i = 0; i < D*I; ++i) tmp_w2[i] = fp32_to_bf16_host(W2[i]);
-          std::copy(B2, B2 + D, tmp_b2.begin());
-
-          hip_bfloat16* dst_w2 = dev.d_w_mlp2 + ((size_t)l*E_local + ei) * (size_t)D * I;
-          float*        dst_b2 = dev.d_b_mlp2 + ((size_t)l*E_local + ei) * (size_t)D;
-
-          memcpyHtoD_chunked(dst_w2, tmp_w2.data(), tmp_w2.size() * sizeof(hip_bfloat16));
-          memcpyHtoD_chunked(dst_b2, tmp_b2.data(), tmp_b2.size() * sizeof(float));
-          
-          total_experts_loaded++;
-        }
-      }
-      printf("[GPU%d] ✓ MLP weights loaded successfully (%d experts)\n", r, total_experts_loaded);
-    }
-    
+    gpu_copy_weights(transformer, r);
+    gpu_malloc_run_state(transformer, r);
     print_memory_usage(r, "After weight loading completed");
     printf("[GPU%d] ========== Weight loading completed ==========\n\n", r);
     fflush(stdout);
@@ -675,66 +889,58 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
   for (int r = 0; r < NUM_GPUS; ++r) {
     HIP_CHECK(hipSetDevice(r));
-    auto& d = g_devs[r];
-    safeHipFree(d.d_w_qkv_rows);
-    safeHipFree(d.d_b_qkv_rows);
-    safeHipFree(d.d_w_o_cols);
-    safeHipFree(d.d_kv_k);
-    safeHipFree(d.d_kv_v);
-    safeHipFree(d.d_x);
-    safeHipFree(d.d_t);
-    safeHipFree(d.d_qkv);
-    safeHipFree(d.d_q_local);
-    safeHipFree(d.d_tb_local);
-    safeHipFree(d.d_tb2_partial);
-    safeHipFree(d.d_w_mlp1_u8);
-    safeHipFree(d.d_w_mlp1_scale);
-    safeHipFree(d.d_b_mlp1);
-    safeHipFree(d.d_w_mlp2);
-    safeHipFree(d.d_b_mlp2);
-    safeHipFree(d.d_mlp1_out);
-    safeHipFree(d.d_gate_up);
-    safeHipFree(d.d_ffn_out);
-    safeHipFree(d.d_cos);
-    safeHipFree(d.d_sin);
-    safeHipFree(d.d_mask);
-    safeHipFree(d.d_attn_sinks);
+    auto& devw = g_weights[r];
+    auto& st   = g_state[r];
+    // Weights
+    safeHipFree(devw.d_w_qkv_rows);
+    safeHipFree(devw.d_b_qkv_rows);
+    safeHipFree(devw.d_w_o_cols);
+    safeHipFree(devw.d_w_mlp1);
+    safeHipFree(devw.d_b_mlp1);
+    safeHipFree(devw.d_w_mlp2);
+    safeHipFree(devw.d_b_mlp2);
+    safeHipFree(devw.d_w_router);
+    safeHipFree(devw.d_b_router);
+    safeHipFree(devw.d_rms_attn_w);
+    safeHipFree(devw.d_rms_ffn_w);
+    safeHipFree(devw.d_rms_out_w);
+    safeHipFree(devw.d_attn_sinks);
+#if KEEP_FP8_UTILS
+    safeHipFree(devw.d_w_mlp1_u8);
+    safeHipFree(devw.d_w_mlp1_scale);
+#endif
+    safeHipFree(devw.d_w_out);
+    // Run state
+    safeHipFree(st.d_kv_k);
+    safeHipFree(st.d_kv_v);
+    safeHipFree(st.d_x);
+    safeHipFree(st.d_t);
+    safeHipFree(st.d_qkv);
+    safeHipFree(st.d_q_local);
+    safeHipFree(st.d_tb_local);
+    safeHipFree(st.d_tb2_partial);
+    safeHipFree(st.d_mlp1_out);
+    safeHipFree(st.d_gate_up);
+    safeHipFree(st.d_ffn_out);
+    safeHipFree(st.d_cos);
+    safeHipFree(st.d_sin);
+    safeHipFree(st.d_mask);
+    safeHipFree(st.d_router);
+    safeHipFree(st.d_topk);
+    safeHipFree(st.d_logits);
 
   }
   for (int r = 0; r < NUM_GPUS; ++r) { free(h_tb2_partials[r]); h_tb2_partials[r] = nullptr; }
   free(h_tb2_sum); h_tb2_sum = nullptr;
 }
 
-// ---------------------------------------------
-// Host utilities reused from CPU path
-// ---------------------------------------------
-static void rmsnorm_host(float* o, const float* x, const float* weight, int size) {
-  double ss = 0.0;
-  for (int j = 0; j < size; ++j) ss += (double)x[j] * (double)x[j];
-  ss /= size; ss += 1e-5f; ss = 1.0 / sqrt(ss);
-  for (int j = 0; j < size; ++j) o[j] = weight[j] * (float)(ss * x[j]);
-}
-static void softmax_host(float* x, int n) {
-  double m = x[0]; for (int i=1;i<n;i++) m = std::max(m,(double)x[i]);
-  double s=0.0; for (int i=0;i<n;i++){ x[i]=expf((float)(x[i]-m)); s+=x[i]; }
-  for (int i=0;i<n;i++) x[i] = (float)(x[i]/s);
-}
-static void matmul_host(float* out, const float* x, const float* W, int in_n, int out_n) {
-  for (int i = 0; i < out_n; ++i) {
-    double v=0.0; const float* row = W + 1ll*i*in_n;
-    for (int j = 0; j < in_n; ++j) v += row[j]*x[j];
-    out[i] = (float)v;
-  }
-}
 
 // ---------------------------------------------
 // One-token forward using TP + EP
 // ---------------------------------------------
-static void forward_one(Transformer* tr, int token, int pos,
-                        std::vector<float>& x,
-                        std::vector<float>& t, std::vector<float>& tb2_sum,
-                        const std::vector<float>& cos_vals,
-                        const std::vector<float>& sin_vals) {
+static int forward_one(Transformer* tr, Sampler* sampler, int token, int pos,
+                       std::vector<float>& x,
+                       std::vector<float>& t, std::vector<float>& tb2_sum) {
   Config* p = &tr->config;
   TransformerWeights* w = &tr->weights;
 
@@ -749,23 +955,28 @@ static void forward_one(Transformer* tr, int token, int pos,
   std::copy(emb_row, emb_row + D, x.begin());
 
   for (int l = 0; l < L; ++l) {
-    rmsnorm_host(t.data(), x.data(), w->rms_attn_w + 1ll*l*D, D);
-
+    // Compute RMSNorm on GPU for each shard: t = RMSNorm(x, rms_attn_w[l])
     for (int r = 0; r < NUM_GPUS; ++r) {
       HIP_CHECK(hipSetDevice(r));
-      HIP_CHECK(hipMemcpy(g_devs[r].d_t, t.data(), D*sizeof(float), hipMemcpyHostToDevice));
+      auto& devw = g_weights[r];
+      auto& st   = g_state[r];
+      HIP_CHECK(hipMemcpy(st.d_x, x.data(), D*sizeof(float), hipMemcpyHostToDevice));
+      const float* w_attn = devw.d_rms_attn_w + (size_t)l * D;
+      k_rmsnorm_vec<<<1,256>>>(st.d_x, w_attn, st.d_t, D);
+      HIP_CHECK(hipGetLastError());
     }
 
     for (int r = 0; r < NUM_GPUS; ++r) {
       HIP_CHECK(hipSetDevice(r));
-      auto& dev = g_devs[r];
-      int rows = dev.rows_per_layer_local;
-      const hip_bfloat16* W = dev.d_w_qkv_rows + (size_t)l * dev.w_qkv_rows_stride;
-      float* Y = dev.d_qkv;
-      dim3 grid((rows + 255)/256), block(256);
-      k_matvec_bf16_fp32<<<grid, block>>>(W, dev.d_t, Y, D, rows);
+      auto& devw = g_weights[r];
+      auto& st   = g_state[r];
+      int rows = devw.rows_per_layer_local;
+      const hip_bfloat16* W = devw.d_w_qkv_rows + (size_t)l * devw.w_qkv_rows_stride;
+      float* Y = st.d_qkv;
+      dim3 grid(rows), block(256);
+      k_matvec_bf16_fp32<<<grid, block>>>(W, st.d_t, Y, D, rows);
       HIP_CHECK(hipGetLastError());
-      float* b = dev.d_b_qkv_rows + (size_t)l * rows;
+      float* b = devw.d_b_qkv_rows + (size_t)l * rows;
       k_add_bias<<<(rows+255)/256, 256>>>(Y, b, rows);
       HIP_CHECK(hipGetLastError());
     }
@@ -773,39 +984,47 @@ static void forward_one(Transformer* tr, int token, int pos,
     for (int r = 0; r < NUM_GPUS; ++r) {
       HIP_CHECK(hipSetDevice(r));
       auto& hs = g_head_shard[r];
-      auto& dev = g_devs[r];
+      auto& devw = g_weights[r];
+      auto& st = g_state[r];
       // (AFTER) — đúng thứ tự: quay Q/K rồi mới lưu K vào KV-cache
       int q_rows = hs.q_count * hd;
       int kv_rows = hs.kv_count * hd;
 
-      float* q_ptr = dev.d_qkv;
-      float* k_ptr = dev.d_qkv + q_rows;
-      float* v_ptr = dev.d_qkv + q_rows + kv_rows;
+      float* q_ptr = st.d_qkv;
+      float* k_ptr = st.d_qkv + q_rows;
+      float* v_ptr = st.d_qkv + q_rows + kv_rows;
 
-      // 1) copy cos/sin (host -> device) cho bước hiện tại (chỉ 1 lần)
-      HIP_CHECK(hipMemcpy(dev.d_cos, cos_vals.data(),
-                          (p->head_dim/2)*sizeof(float), hipMemcpyHostToDevice));
-      HIP_CHECK(hipMemcpy(dev.d_sin, sin_vals.data(),
-                          (p->head_dim/2)*sizeof(float), hipMemcpyHostToDevice));
+      // 1) compute cos/sin on device for this position
+      dim3 grid_cs(((p->head_dim/2) + 255)/256), block_cs(256);
+      k_compute_cos_sin<<<grid_cs, block_cs>>>(
+          pos,
+          p->rope_theta,
+          p->head_dim,
+          p->rope_scaling_factor,
+          p->initial_context_length,
+          32.0f, 1.0f,
+          st.d_cos,
+          st.d_sin);
+      HIP_CHECK(hipGetLastError());
 
       // 2) Quay RoPE cho Q và K (trên buffer q_ptr/k_ptr)
       dim3 grid_q(hs.q_count), block_q(hd/2);
-      k_apply_rotary<<<grid_q, block_q>>>(q_ptr, dev.d_cos, dev.d_sin, hs.q_count, hd);
+      k_apply_rotary<<<grid_q, block_q>>>(q_ptr, st.d_cos, st.d_sin, hs.q_count, hd);
       HIP_CHECK(hipGetLastError());
 
       dim3 grid_k(hs.kv_count), block_k(hd/2);
-      k_apply_rotary<<<grid_k, block_k>>>(k_ptr, dev.d_cos, dev.d_sin, hs.kv_count, hd);
+      k_apply_rotary<<<grid_k, block_k>>>(k_ptr, st.d_cos, st.d_sin, hs.kv_count, hd);
       HIP_CHECK(hipGetLastError());
 
       // 3) Sau khi K đã quay, mới lưu K/V vào KV-cache
       int kv_dim_local = hs.kv_count * hd;
-      float* k_cache_l = dev.d_kv_k + (size_t)l * p->seq_len * kv_dim_local;
-      float* v_cache_l = dev.d_kv_v + (size_t)l * p->seq_len * kv_dim_local;
+      float* k_cache_l = st.d_kv_k + (size_t)l * p->seq_len * kv_dim_local;
+      float* v_cache_l = st.d_kv_v + (size_t)l * p->seq_len * kv_dim_local;
       HIP_CHECK(hipMemcpy(k_cache_l + (size_t)pos*kv_dim_local, k_ptr, kv_dim_local*sizeof(float), hipMemcpyDeviceToDevice));
       HIP_CHECK(hipMemcpy(v_cache_l + (size_t)pos*kv_dim_local, v_ptr, kv_dim_local*sizeof(float), hipMemcpyDeviceToDevice));
 
       // 4) Q local cho attention
-      HIP_CHECK(hipMemcpy(dev.d_q_local, q_ptr, q_rows*sizeof(float), hipMemcpyDeviceToDevice));
+      HIP_CHECK(hipMemcpy(st.d_q_local, q_ptr, q_rows*sizeof(float), hipMemcpyDeviceToDevice));
         
     
     }
@@ -813,22 +1032,23 @@ static void forward_one(Transformer* tr, int token, int pos,
     for (int r = 0; r < NUM_GPUS; ++r) {
       HIP_CHECK(hipSetDevice(r));
       auto& hs = g_head_shard[r];
-      auto& dev = g_devs[r];
+      auto& devw = g_weights[r];
+      auto& st = g_state[r];
       int kv_dim_local = hs.kv_count * hd;
-      float* k_cache_l = dev.d_kv_k + (size_t)l * p->seq_len * kv_dim_local;
-      float* v_cache_l = dev.d_kv_v + (size_t)l * p->seq_len * kv_dim_local;
+      float* k_cache_l = st.d_kv_k + (size_t)l * p->seq_len * kv_dim_local;
+      float* v_cache_l = st.d_kv_v + (size_t)l * p->seq_len * kv_dim_local;
 
       const float* mask_row = nullptr;
-      if (dev.d_mask && (p->sliding_window > 0) && (l % 2 == 0)) {
-        mask_row = dev.d_mask + (size_t)pos * p->seq_len; // device pointer
+      if (st.d_mask && (p->sliding_window > 0) && (l % 2 == 0)) {
+        mask_row = st.d_mask + (size_t)pos * p->seq_len; // device pointer
       }
-      const float* sinks_l = dev.d_attn_sinks ? (dev.d_attn_sinks + (size_t)l * g_head_shard[r].q_count) : nullptr;
+      const float* sinks_l = devw.d_attn_sinks ? (devw.d_attn_sinks + (size_t)l * g_head_shard[r].q_count) : nullptr;
 
       // shared memory needs (pos+1 + 1) floats
       size_t smem = (size_t)(pos + 2) * sizeof(float);
       dim3 grid(hs.q_count), block(hd);
       k_attention_step<<<grid, block, smem>>>(
-          dev.d_q_local, k_cache_l, v_cache_l, dev.d_tb_local,
+          st.d_q_local, k_cache_l, v_cache_l, st.d_tb_local,
           pos+1, hd, hs.q_count, hs.kv_count, kv_mul,
           mask_row, sinks_l);
       HIP_CHECK(hipGetLastError());
@@ -837,16 +1057,17 @@ static void forward_one(Transformer* tr, int token, int pos,
 
     for (int r = 0; r < NUM_GPUS; ++r) {
       HIP_CHECK(hipSetDevice(r));
-      auto& dev = g_devs[r];
-      const hip_bfloat16* Wcols = dev.d_w_o_cols + (size_t)l * (size_t)D * dev.cols_per_layer_local;
-      dim3 grid((D+255)/256), block(256);
-      k_matvec_colslice_bf16<<<grid, block>>>(Wcols, dev.d_tb_local, dev.d_tb2_partial, D, dev.cols_per_layer_local);
+      auto& devw = g_weights[r];
+      auto& st = g_state[r];
+      const hip_bfloat16* Wcols = devw.d_w_o_cols + (size_t)l * (size_t)D * devw.cols_per_layer_local;
+      dim3 grid(D), block(256);
+      k_matvec_colslice_bf16<<<grid, block>>>(Wcols, st.d_tb_local, st.d_tb2_partial, D, devw.cols_per_layer_local);
       HIP_CHECK(hipGetLastError());
     }
 
     for (int r = 0; r < NUM_GPUS; ++r) {
       HIP_CHECK(hipSetDevice(r));
-      memcpyDtoH_chunked(h_tb2_partials[r], g_devs[r].d_tb2_partial, D*sizeof(float));
+      memcpyDtoH_chunked(h_tb2_partials[r], g_state[r].d_tb2_partial, D*sizeof(float));
     }
     for (int i = 0; i < D; ++i) {
       double s = 0.0;
@@ -856,12 +1077,32 @@ static void forward_one(Transformer* tr, int token, int pos,
     const float* b_o = tr->weights.b_o + 1ll*l*D;
     for (int i = 0; i < D; ++i) x[i] += (h_tb2_sum[i] + b_o[i]);
 
-    rmsnorm_host(t.data(), x.data(), w->rms_ffn_w + 1ll*l*D, D);
+    // Compute RMSNorm for FFN on GPU0; get t back to host
+    {
+      HIP_CHECK(hipSetDevice(0));
+      auto& devw0 = g_weights[0];
+      auto& st0   = g_state[0];
+      HIP_CHECK(hipMemcpy(st0.d_x, x.data(), D*sizeof(float), hipMemcpyHostToDevice));
+      const float* w_ffn = devw0.d_rms_ffn_w + (size_t)l * D;
+      k_rmsnorm_vec<<<1,256>>>(st0.d_x, w_ffn, st0.d_t, D);
+      HIP_CHECK(hipGetLastError());
+      HIP_CHECK(hipMemcpy(t.data(), st0.d_t, D*sizeof(float), hipMemcpyDeviceToHost));
+    }
 
+    // Router matvec on GPU0
     std::vector<float> router(E);
-    matmul_host(router.data(), t.data(), w->w_router + 1ll*l*D*E, D, E);
-    const float* b_router = w->b_router + 1ll*l*E;
-    for (int i = 0; i < E; ++i) router[i] += b_router[i];
+    {
+      HIP_CHECK(hipSetDevice(0));
+      auto& devw0 = g_weights[0];
+      auto& st0   = g_state[0];
+      const float* Wrouter_l = devw0.d_w_router + (size_t)l * (size_t)E * D;
+      k_matvec_fp32<<<E, 256>>>(Wrouter_l, st0.d_t, st0.d_router, D, E);
+      HIP_CHECK(hipGetLastError());
+      const float* b_router_l = devw0.d_b_router + (size_t)l * E;
+      k_add_bias<<<(E+255)/256, 256>>>(st0.d_router, b_router_l, E);
+      HIP_CHECK(hipGetLastError());
+      memcpyDtoH_chunked(router.data(), st0.d_router, E*sizeof(float));
+    }
 
     int K = tr->config.experts_per_token;
     std::vector<int> idx(E); for (int i=0;i<E;++i) idx[i]=i;
@@ -870,7 +1111,15 @@ static void forward_one(Transformer* tr, int token, int pos,
     std::vector<int> topk_idx(K);
     std::vector<float> topk_val(K);
     for (int i=0;i<K;++i){ topk_idx[i]=idx[i]; topk_val[i]=router[idx[i]]; }
-    softmax_host(topk_val.data(), K);
+    // Softmax over top-K on GPU0
+    {
+      HIP_CHECK(hipSetDevice(0));
+      auto& st0 = g_state[0];
+      HIP_CHECK(hipMemcpy(st0.d_topk, topk_val.data(), (size_t)K*sizeof(float), hipMemcpyHostToDevice));
+      k_softmax_inplace<<<1,1>>>(st0.d_topk, K);
+      HIP_CHECK(hipGetLastError());
+      HIP_CHECK(hipMemcpy(topk_val.data(), st0.d_topk, (size_t)K*sizeof(float), hipMemcpyDeviceToHost));
+    }
 
     std::vector<float> e_agg(D, 0.f);
 
@@ -886,22 +1135,22 @@ static void forward_one(Transformer* tr, int token, int pos,
       int e_local = e_glob - g_expert_shard[owner].e_start;
 
       HIP_CHECK(hipSetDevice(owner));
-      auto& dev = g_devs[owner];
-      HIP_CHECK(hipMemcpy(dev.d_t, t.data(), D*sizeof(float), hipMemcpyHostToDevice));
+      auto& devw = g_weights[owner];
+      auto& st   = g_state[owner];
+      HIP_CHECK(hipMemcpy(st.d_t, t.data(), D*sizeof(float), hipMemcpyHostToDevice));
 
       const int I = p->intermediate_dim;
-      const uint8_t* W1 = dev.d_w_mlp1_u8 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I) * D;
-      const float*   S1 = dev.d_w_mlp1_scale + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I);
-      const float*   B1 = dev.d_b_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I);
+      const hip_bfloat16* W1 = devw.d_w_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I) * D;
+      const float*        B1 = devw.d_b_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I);
 
-      dim3 g1((2*I + 255)/256), b1(256);
-      k_matvec_fp8_rowscale<<<g1, b1>>>(W1, S1, dev.d_t, dev.d_mlp1_out, D, 2*I);
+      dim3 g1((2*I), 1, 1), b1(256, 1, 1);
+      k_matvec_bf16_fp32<<<g1, b1>>>(W1, st.d_t, st.d_mlp1_out, D, 2*I);
       HIP_CHECK(hipGetLastError());
-      k_add_bias<<<((2*I)+255)/256, 256>>>(dev.d_mlp1_out, B1, 2*I);
+      k_add_bias<<<((2*I)+255)/256, 256>>>(st.d_mlp1_out, B1, 2*I);
       HIP_CHECK(hipGetLastError());
 
       std::vector<float> h_mlp1(2*I);
-      HIP_CHECK(hipMemcpy(h_mlp1.data(), dev.d_mlp1_out, (size_t)2*I*sizeof(float), hipMemcpyDeviceToHost));
+      HIP_CHECK(hipMemcpy(h_mlp1.data(), st.d_mlp1_out, (size_t)2*I*sizeof(float), hipMemcpyDeviceToHost));
       std::vector<float> h_gate_up(I);
       const float clampU = tr->config.swiglu_limit;
       const float clampL = -tr->config.swiglu_limit;
@@ -916,26 +1165,54 @@ static void forward_one(Transformer* tr, int token, int pos,
         h_gate_up[i] = silu(g) * (u + 1.0f);
       }
 
-      HIP_CHECK(hipMemcpy(dev.d_gate_up, h_gate_up.data(), I*sizeof(float), hipMemcpyHostToDevice));
+      HIP_CHECK(hipMemcpy(st.d_gate_up, h_gate_up.data(), I*sizeof(float), hipMemcpyHostToDevice));
 
-      const hip_bfloat16* W2 = dev.d_w_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D * I;
-      const float*        B2 = dev.d_b_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D;
+      const hip_bfloat16* W2 = devw.d_w_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D * I;
+      const float*        B2 = devw.d_b_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D;
 
-      dim3 g2((D+255)/256), b2d(256);
-      k_matvec_bf16_fp32<<<g2, b2d>>>(W2, dev.d_gate_up, dev.d_ffn_out, I, D);
+      dim3 g2(D, 1, 1), b2d(256, 1, 1);
+      k_matvec_bf16_fp32<<<g2, b2d>>>(W2, st.d_gate_up, st.d_ffn_out, I, D);
       HIP_CHECK(hipGetLastError());
-      k_add_bias<<<(D+255)/256, 256>>>(dev.d_ffn_out, B2, D);
+      k_add_bias<<<(D+255)/256, 256>>>(st.d_ffn_out, B2, D);
       HIP_CHECK(hipGetLastError());
 
       std::vector<float> h_ffn(D);
-      memcpyDtoH_chunked(h_ffn.data(), dev.d_ffn_out, D*sizeof(float));
+      memcpyDtoH_chunked(h_ffn.data(), st.d_ffn_out, D*sizeof(float));
       for (int i = 0; i < D; ++i) e_agg[i] += ew * h_ffn[i];
     }
 
     for (int i = 0; i < D; ++i) x[i] += e_agg[i];
   }
 
-  rmsnorm_host(x.data(), x.data(), w->rms_out_w, D);
+  // Final RMSNorm on GPU0
+  {
+    HIP_CHECK(hipSetDevice(0));
+    auto& devw0 = g_weights[0];
+    auto& st0   = g_state[0];
+    HIP_CHECK(hipMemcpy(st0.d_x, x.data(), D*sizeof(float), hipMemcpyHostToDevice));
+    k_rmsnorm_vec<<<1,256>>>(st0.d_x, devw0.d_rms_out_w, st0.d_x, D);
+    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipMemcpy(x.data(), st0.d_x, D*sizeof(float), hipMemcpyDeviceToHost));
+  }
+
+  // Compute final logits on GPU0 and sample next token
+  int next_token;
+  {
+    HIP_CHECK(hipSetDevice(0));
+    auto& devw0 = g_weights[0];
+    auto& st0   = g_state[0];
+    int Dv = tr->config.hidden_dim;
+    int V  = tr->config.vocab_size;
+    HIP_CHECK(hipMemcpy(st0.d_t, x.data(), (size_t)Dv * sizeof(float), hipMemcpyHostToDevice));
+    dim3 gL(V), bL(256);
+    k_matvec_fp32<<<gL, bL>>>(devw0.d_w_out, st0.d_t, st0.d_logits, Dv, V);
+    HIP_CHECK(hipGetLastError());
+    std::vector<float> logits(V);
+    memcpyDtoH_chunked(logits.data(), st0.d_logits, (size_t)V * sizeof(float));
+    next_token = sample(sampler, logits.data());
+  }
+
+  return next_token;
 }
 
 // ---------------------------------------------
@@ -961,13 +1238,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   std::vector<float> t(p->hidden_dim, 0.f);
   std::vector<float> tb2_sum(p->hidden_dim, 0.f);
 
-  auto mk_cos_sin = [&](int pos, std::vector<float>& c, std::vector<float>& s){
-    c.resize(p->head_dim/2); s.resize(p->head_dim/2);
-    float ntk_beta = 32.0f, ntk_alpha = 1.0f;
-    compute_cos_sin(pos, p->rope_theta, p->head_dim, p->rope_scaling_factor,
-                    p->initial_context_length, ntk_beta, ntk_alpha,
-                    c.data(), s.data());
-  };
+  // RoPE cos/sin computed on device in forward_one
 
   int next;
   int token = prompt_tokens[0];
@@ -977,26 +1248,17 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   safe_printf(first_piece); fflush(stdout);
 
   while (pos < steps) {
-    std::vector<float> cos_vals, sin_vals;
-    mk_cos_sin(pos, cos_vals, sin_vals);
-
-    forward_one(transformer, token, pos, x, t, tb2_sum, cos_vals, sin_vals);
-
-    std::vector<float> logits(transformer->config.vocab_size);
-    matmul_host(logits.data(), x.data(), transformer->weights.out,
-                p->hidden_dim, p->vocab_size);
+    int sampled = forward_one(transformer, sampler, token, pos, x, t, tb2_sum);
 
     pos++;
     if (pos < num_prompt_tokens) {
       next = prompt_tokens[pos];
     } else {
-      next = sample(sampler, logits.data());
+      next = sampled;
       output_tokens[pos - num_prompt_tokens] = next;
     }
     if (next == 199999 || next == 200002) break;
 
-    const char *piece = decode_piece(tokenizer, token, next);
-    safe_printf(piece); fflush(stdout);
     token = next;
   }
   printf("\n");
