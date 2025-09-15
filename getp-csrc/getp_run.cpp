@@ -326,6 +326,20 @@ __global__ void k_add_bias(float* y, const float* b, int n) {
 // SwiGLU piece
 __host__ __device__ inline float silu(float x) { return x / (1.0f + expf(-1.702f * x)); }
 
+// Apply SwiGLU with clamping on device: gate_up[i] = silu(clamp(g)) * (clamp(u) + 1)
+__global__ void k_swiglu_clamp(const float* __restrict__ mlp1_out, // length 2*I
+                                float*       __restrict__ gate_up,  // length I
+                                int I, float clampU, float clampL) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= I) return;
+  float g = mlp1_out[2*i + 0];
+  float u = mlp1_out[2*i + 1];
+  // Clamp like host path: g upper-clamped; u clamped to [clampL, clampU]
+  if (g > clampU) g = clampU;
+  if (u < clampL) u = clampL; if (u > clampU) u = clampU;
+  gate_up[i] = silu(g) * (u + 1.0f);
+}
+
 // Rotary on Q or K for local heads
 __global__ void k_apply_rotary(float* vec,       // shape: n_heads_local * head_dim
                                const float* cos_vals, // head_dim/2 (same for all heads)
@@ -590,56 +604,68 @@ __global__ void k_attention_step_batched_sid(
   int d = threadIdx.x;
   if (h >= n_qh_local || d >= head_dim) return;
 
+  // Shared memory layout: [logits(0..pos_b+1)] [redbuf(0..head_dim-1)]
   extern __shared__ float smem[];
-  float* logits = smem; // length = pos_plus1 + 1
   const float* q = q_local_b + (size_t)b * n_qh_local * head_dim + h * head_dim;
+  const float inv_sqrt_d = rsqrtf((float)head_dim);
+  const int kvdim = n_kvh_local * head_dim;
+  const int kvh_off = (h / kv_mul) * head_dim;
 
-  float inv_sqrt_d = rsqrtf((float)head_dim);
-  int kvdim = n_kvh_local * head_dim;
-  int sid = slot_ids[b];
+  const int sid = slot_ids[b];
   const float* k_base = kv_cache_k_b + (size_t)sid * kv_block_stride;
   const float* v_base = kv_cache_v_b + (size_t)sid * kv_block_stride;
 
-  int pos_b = pos_list[b];
-  int pos_plus1 = pos_b + 1;
-  const float* mask_row_or_null = nullptr;
-  if (mask_base_or_null) mask_row_or_null = mask_base_or_null + (size_t)pos_b * seq_len;
+  const int pos_b = pos_list[b];
+  const int pos_plus1 = pos_b + 1;
+  float* logits = smem;                // length = pos_plus1 + 1
+  float* redbuf = logits + (pos_plus1 + 1); // reduction buffer over head_dim
 
+  const float* mask_row_or_null = (mask_base_or_null)
+      ? (mask_base_or_null + (size_t)pos_b * seq_len)
+      : nullptr;
+
+  // 1) Parallel dot for logits over t=0..pos_b
   for (int t = 0; t < pos_plus1; ++t) {
+    const float* k = k_base + (size_t)t * kvdim + kvh_off;
+    float prod = q[d] * k[d];
+    redbuf[d] = prod;
     __syncthreads();
+
+    if (blockDim.x >= 256) { if (d < 128) redbuf[d] += redbuf[d + 128]; __syncthreads(); }
+    if (blockDim.x >= 128) { if (d <  64) redbuf[d] += redbuf[d +  64]; __syncthreads(); }
+    if (d < 32) {
+      volatile float* v = redbuf;
+      v[d] += v[d + 32]; v[d] += v[d + 16]; v[d] += v[d + 8];
+      v[d] += v[d +  4]; v[d] += v[d +  2]; v[d] += v[d + 1];
+    }
     if (d == 0) {
-      const float* k = k_base + (size_t)t * kvdim + (h/kv_mul) * head_dim;
-      float score = 0.f;
-      for (int i = 0; i < head_dim; ++i) score += q[i]*k[i];
-      score *= inv_sqrt_d;
+      float score = redbuf[0] * inv_sqrt_d;
       if (mask_row_or_null) score += mask_row_or_null[t];
       logits[t] = score;
     }
     __syncthreads();
   }
-  if (d == 0) {
-    float sink = (attn_sinks_l) ? attn_sinks_l[h] : 0.f;
-    logits[pos_plus1] = sink;
-  }
-  __syncthreads();
 
-  int len = pos_plus1 + 1;
+  // 2) Append sink logit and softmax over len=pos_plus1+1
   if (d == 0) {
+    logits[pos_plus1] = attn_sinks_l ? attn_sinks_l[h] : 0.f;
+    int len = pos_plus1 + 1;
     float m = logits[0];
-    for (int t = 1; t < len; ++t) m = fmaxf(m, logits[t]);
+    for (int i = 1; i < len; ++i) m = fmaxf(m, logits[i]);
     float s = 0.f;
-    for (int t = 0; t < len; ++t) { logits[t] = expf(logits[t] - m); s += logits[t]; }
-    for (int t = 0; t < len; ++t) logits[t] /= s;
+    for (int i = 0; i < len; ++i) { logits[i] = expf(logits[i] - m); s += logits[i]; }
+    float inv = 1.f / s;
+    for (int i = 0; i < len; ++i) logits[i] *= inv;
   }
   __syncthreads();
 
+  // 3) Weighted sum over real tokens (exclude sink)
   float acc = 0.f;
   for (int t = 0; t < pos_plus1; ++t) {
-    const float* v = v_base + (size_t)t * kvdim + (h/kv_mul) * head_dim;
-    float a = logits[t];
-    acc += a * v[d];
+    const float* v = v_base + (size_t)t * kvdim + kvh_off;
+    acc += logits[t] * v[d];
   }
-  tb_local_b[(size_t)b * n_qh_local * head_dim + h*head_dim + d] = acc;
+  tb_local_b[(size_t)b * n_qh_local * head_dim + h * head_dim + d] = acc;
 }
 
 
@@ -1153,7 +1179,7 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
       const float* sinks_l = nullptr;
       if (g_weights[r].d_attn_sinks) sinks_l = g_weights[r].d_attn_sinks + (size_t)l * g_head_shard[r].q_count;
 
-      size_t smem = (size_t)smem_len * sizeof(float);
+      size_t smem = (size_t)(smem_len + hd) * sizeof(float);
       dim3 grid(hs.q_count, B), block(hd);
       k_attention_step_batched_sid<<<grid, block, smem>>>(
         st.d_q_local,
@@ -1265,19 +1291,13 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
         HIP_CHECK(hipGetLastError());
         k_add_bias<<<((2*I)+255)/256, 256>>>(st.d_mlp1_out, B1, 2*I);
         HIP_CHECK(hipGetLastError());
-        std::vector<float> h_mlp1(2*I);
-        HIP_CHECK(hipMemcpy(h_mlp1.data(), st.d_mlp1_out, (size_t)2*I*sizeof(float), hipMemcpyDeviceToHost));
-        std::vector<float> h_gate_up(I);
-        const float clampU = tr->config.swiglu_limit;
-        const float clampL = -tr->config.swiglu_limit;
-        for (int i = 0; i < I; ++i) {
-          float g = h_mlp1[2*i+0];
-          float u = h_mlp1[2*i+1];
-          g = fminf(g, clampU);
-          u = fminf(fmaxf(u, clampL), clampU);
-          h_gate_up[i] = silu(g) * (u + 1.0f);
+        {
+          const float clampU = tr->config.swiglu_limit;
+          const float clampL = -tr->config.swiglu_limit;
+          dim3 gsw((I + 255)/256), bsw(256);
+          k_swiglu_clamp<<<gsw, bsw>>>(st.d_mlp1_out, st.d_gate_up, I, clampU, clampL);
+          HIP_CHECK(hipGetLastError());
         }
-        HIP_CHECK(hipMemcpy(st.d_gate_up, h_gate_up.data(), I*sizeof(float), hipMemcpyHostToDevice));
         const hip_bfloat16* W2 = devw.d_w_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D * I;
         const float*        B2 = devw.d_b_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D;
         dim3 g2(D, 1, 1), b2d(256, 1, 1);
