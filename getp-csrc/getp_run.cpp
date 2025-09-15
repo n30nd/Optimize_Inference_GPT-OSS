@@ -175,7 +175,71 @@ __global__ void k_matvec_bf16_fp32(const hip_bfloat16* __restrict__ W,
 }
 
 // Batched BF16xFP32 matvec: Y[b,out] = W[out,in] @ X[b,in]
-__global__ void k_matvec_bf16_fp32_batched(const hip_bfloat16* __restrict__ W,
+__global__ void k_qkv_matvec_bf16_fp32_batched(const hip_bfloat16* __restrict__ W,
+                                           const float*        __restrict__ X,
+                                           float*              __restrict__ Y,
+                                           int in_features, int out_features) {
+  int row = blockIdx.x;
+  int b   = blockIdx.y;
+  if (row >= out_features) return;
+  const hip_bfloat16* wrow = W + (size_t)row * in_features;
+  const float* x = X + (size_t)b * in_features;
+  float sum = 0.f;
+  for (int j = threadIdx.x; j < in_features; j += blockDim.x) {
+    float w = bf16_to_fp32_bi(wrow[j]);
+    sum += w * x[j];
+  }
+  __shared__ float sdata[256];
+  int tid = threadIdx.x;
+  sdata[tid] = sum; __syncthreads();
+  if (blockDim.x >= 256) { if (tid < 128) sdata[tid] += sdata[tid + 128]; __syncthreads(); }
+  if (blockDim.x >= 128) { if (tid <  64) sdata[tid] += sdata[tid +  64]; __syncthreads(); }
+  if (tid < 32) {
+    volatile float* v = sdata;
+    v[tid] += v[tid + 32];
+    v[tid] += v[tid + 16];
+    v[tid] += v[tid +  8];
+    v[tid] += v[tid +  4];
+    v[tid] += v[tid +  2];
+    v[tid] += v[tid +  1];
+  }
+  if (tid == 0) Y[(size_t)b * out_features + row] = sdata[0];
+}
+
+// Batched BF16xFP32 matvec: Y[b,out] = W[out,in] @ X[b,in]
+__global__ void k_mlp1_matvec_bf16_fp32_batched(const hip_bfloat16* __restrict__ W,
+                                           const float*        __restrict__ X,
+                                           float*              __restrict__ Y,
+                                           int in_features, int out_features) {
+  int row = blockIdx.x;
+  int b   = blockIdx.y;
+  if (row >= out_features) return;
+  const hip_bfloat16* wrow = W + (size_t)row * in_features;
+  const float* x = X + (size_t)b * in_features;
+  float sum = 0.f;
+  for (int j = threadIdx.x; j < in_features; j += blockDim.x) {
+    float w = bf16_to_fp32_bi(wrow[j]);
+    sum += w * x[j];
+  }
+  __shared__ float sdata[256];
+  int tid = threadIdx.x;
+  sdata[tid] = sum; __syncthreads();
+  if (blockDim.x >= 256) { if (tid < 128) sdata[tid] += sdata[tid + 128]; __syncthreads(); }
+  if (blockDim.x >= 128) { if (tid <  64) sdata[tid] += sdata[tid +  64]; __syncthreads(); }
+  if (tid < 32) {
+    volatile float* v = sdata;
+    v[tid] += v[tid + 32];
+    v[tid] += v[tid + 16];
+    v[tid] += v[tid +  8];
+    v[tid] += v[tid +  4];
+    v[tid] += v[tid +  2];
+    v[tid] += v[tid +  1];
+  }
+  if (tid == 0) Y[(size_t)b * out_features + row] = sdata[0];
+}
+
+// Batched BF16xFP32 matvec: Y[b,out] = W[out,in] @ X[b,in]
+__global__ void k_mlp2_matvec_bf16_fp32_batched(const hip_bfloat16* __restrict__ W,
                                            const float*        __restrict__ X,
                                            float*              __restrict__ Y,
                                            int in_features, int out_features) {
@@ -1229,7 +1293,7 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
       int rows = devw.rows_per_layer_local;
       const hip_bfloat16* W = devw.d_w_qkv_rows + (size_t)l * devw.w_qkv_rows_stride;
       dim3 grid(rows, B), block(256);
-      k_matvec_bf16_fp32_batched<<<grid, block>>>(W, st.d_t, st.d_qkv, D, rows);
+      k_qkv_matvec_bf16_fp32_batched<<<grid, block>>>(W, st.d_t, st.d_qkv, D, rows);
       HIP_CHECK(hipGetLastError());
       float* b = devw.d_b_qkv_rows + (size_t)l * rows;
       dim3 gridb((rows+255)/256, B);
@@ -1449,7 +1513,7 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
         const hip_bfloat16* W1 = devw.d_w_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I) * D;
         const float*        B1 = devw.d_b_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I);
         dim3 g1((2*I), nb), b1(256);
-        k_matvec_bf16_fp32_batched<<<g1, b1, 0, st.comm_stream>>>(W1, st.d_in_batch, st.d_mlp1_out, D, 2*I);
+        k_mlp1_matvec_bf16_fp32_batched<<<g1, b1, 0, st.comm_stream>>>(W1, st.d_in_batch, st.d_mlp1_out, D, 2*I);
         HIP_CHECK(hipGetLastError());
         dim3 gb1((2*I + 255)/256, nb);
         k_add_bias_batched<<<gb1, 256, 0, st.comm_stream>>>(st.d_mlp1_out, B1, 2*I);
@@ -1462,7 +1526,7 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
         const hip_bfloat16* W2 = devw.d_w_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D * I;
         const float*        B2 = devw.d_b_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D;
         dim3 g2(D, nb), b2d(256);
-        k_matvec_bf16_fp32_batched<<<g2, b2d, 0, st.comm_stream>>>(W2, st.d_gate_up, st.d_ffn_out, I, D);
+        k_mlp2_matvec_bf16_fp32_batched<<<g2, b2d, 0, st.comm_stream>>>(W2, st.d_gate_up, st.d_ffn_out, I, D);
         HIP_CHECK(hipGetLastError());
         dim3 gb2((D+255)/256, nb);
         k_add_bias_batched<<<gb2, 256, 0, st.comm_stream>>>(st.d_ffn_out, B2, D);
