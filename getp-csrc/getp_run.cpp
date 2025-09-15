@@ -473,6 +473,7 @@ struct GPURunState {
 
   // Logits (GPU0 only)
   float* d_logits = nullptr; // size vocab_size
+  int* d_next_token = nullptr; // single int result for greedy argmax
 };
 
 static GPUTransformerWeights g_weights[NUM_GPUS];
@@ -666,12 +667,6 @@ static void gpu_copy_weights(Transformer* transformer, int r) {
   memcpyHtoD_chunked(devw.d_rms_ffn_w,  transformer->weights.rms_ffn_w,  (size_t)L * D * sizeof(float));
   memcpyHtoD_chunked(devw.d_rms_out_w,  transformer->weights.rms_out_w,  D * sizeof(float));
 
-  // Copy Router weights (FP32)
-  printf("[GPU%d] Copying Router weights...\n", r);
-  HIP_CHECK(hipMalloc(&devw.d_w_router, (size_t)L * (size_t)E * (size_t)D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&devw.d_b_router, (size_t)L * (size_t)E * sizeof(float)));
-  memcpyHtoD_chunked(devw.d_w_router, transformer->weights.w_router, (size_t)L * (size_t)E * (size_t)D * sizeof(float));
-  memcpyHtoD_chunked(devw.d_b_router, transformer->weights.b_router, (size_t)L * (size_t)E * sizeof(float));
 
   // Copy final classifier (FP32) on GPU0 only
   if (r == 0) {
@@ -820,7 +815,39 @@ static void gpu_malloc_run_state(Transformer* transformer, int r) {
   HIP_CHECK(hipMalloc(&st.d_topk,   (size_t)p->experts_per_token * sizeof(float)));
   if (r == 0) {
     HIP_CHECK(hipMalloc(&st.d_logits, (size_t)p->vocab_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&st.d_next_token, sizeof(int)));
   }
+}
+
+// ---------------------------------------------
+// Greedy argmax kernel (one block) over vocab
+// Assumes logits length = vocab_size, writes index of max to out_idx
+// ---------------------------------------------
+__global__ void k_argmax(const float* __restrict__ logits, int vocab, int* __restrict__ out_idx) {
+  extern __shared__ unsigned char karg_smem[];
+  float* svals = reinterpret_cast<float*>(karg_smem);
+  int* sidx = reinterpret_cast<int*>(svals + blockDim.x);
+  int tid = threadIdx.x;
+  float best_v = -INFINITY;
+  int best_i = 0;
+  for (int i = tid; i < vocab; i += blockDim.x) {
+    float v = logits[i];
+    if (v > best_v) { best_v = v; best_i = i; }
+  }
+  svals[tid] = best_v;
+  sidx[tid] = best_i;
+  __syncthreads();
+  for (int offset = blockDim.x/2; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      float v_other = svals[tid + offset];
+      if (v_other > svals[tid] || (v_other == svals[tid] && sidx[tid + offset] < sidx[tid])) {
+        svals[tid] = v_other;
+        sidx[tid] = sidx[tid + offset];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) *out_idx = sidx[0];
 }
 
 // ---------------------------------------------
@@ -1111,14 +1138,14 @@ static int forward_one(Transformer* tr, Sampler* sampler, int token, int pos,
     std::vector<int> topk_idx(K);
     std::vector<float> topk_val(K);
     for (int i=0;i<K;++i){ topk_idx[i]=idx[i]; topk_val[i]=router[idx[i]]; }
-    // Softmax over top-K on GPU0
+    // Softmax over top-K (CPU path; K is small)
     {
-      HIP_CHECK(hipSetDevice(0));
-      auto& st0 = g_state[0];
-      HIP_CHECK(hipMemcpy(st0.d_topk, topk_val.data(), (size_t)K*sizeof(float), hipMemcpyHostToDevice));
-      k_softmax_inplace<<<1,1>>>(st0.d_topk, K);
-      HIP_CHECK(hipGetLastError());
-      HIP_CHECK(hipMemcpy(topk_val.data(), st0.d_topk, (size_t)K*sizeof(float), hipMemcpyDeviceToHost));
+      float maxv = -INFINITY;
+      for (float v: topk_val) if (v > maxv) maxv = v;
+      float sum = 0.f;
+      for (float &v: topk_val) { v = expf(v - maxv); sum += v; }
+      float inv = 1.f / sum;
+      for (float &v: topk_val) v *= inv;
     }
 
     std::vector<float> e_agg(D, 0.f);
@@ -1184,15 +1211,14 @@ static int forward_one(Transformer* tr, Sampler* sampler, int token, int pos,
     for (int i = 0; i < D; ++i) x[i] += e_agg[i];
   }
 
-  // Final RMSNorm on GPU0
+  // Final RMSNorm + logits entirely on device (single H2D copy of x)
+  HIP_CHECK(hipSetDevice(0));
   {
-    HIP_CHECK(hipSetDevice(0));
     auto& devw0 = g_weights[0];
     auto& st0   = g_state[0];
-    HIP_CHECK(hipMemcpy(st0.d_x, x.data(), D*sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(st0.d_x, x.data(), D*sizeof(float), hipMemcpyHostToDevice)); // one-time copy
     k_rmsnorm_vec<<<1,256>>>(st0.d_x, devw0.d_rms_out_w, st0.d_x, D);
     HIP_CHECK(hipGetLastError());
-    HIP_CHECK(hipMemcpy(x.data(), st0.d_x, D*sizeof(float), hipMemcpyDeviceToHost));
   }
 
   // Compute final logits on GPU0 and sample next token
@@ -1203,13 +1229,16 @@ static int forward_one(Transformer* tr, Sampler* sampler, int token, int pos,
     auto& st0   = g_state[0];
     int Dv = tr->config.hidden_dim;
     int V  = tr->config.vocab_size;
-    HIP_CHECK(hipMemcpy(st0.d_t, x.data(), (size_t)Dv * sizeof(float), hipMemcpyHostToDevice));
+  // st0.d_x already holds normalized activations; alias as d_t to reuse matvec kernel
+  HIP_CHECK(hipMemcpy(st0.d_t, g_state[0].d_x, (size_t)Dv * sizeof(float), hipMemcpyDeviceToDevice));
     dim3 gL(V), bL(256);
     k_matvec_fp32<<<gL, bL>>>(devw0.d_w_out, st0.d_t, st0.d_logits, Dv, V);
     HIP_CHECK(hipGetLastError());
-    std::vector<float> logits(V);
-    memcpyDtoH_chunked(logits.data(), st0.d_logits, (size_t)V * sizeof(float));
-    next_token = sample(sampler, logits.data());
+  // Greedy argmax directly on device (vocab_size fixed at 201088)
+  const size_t shmem_bytes = (size_t)1024 * (sizeof(float) + sizeof(int));
+  k_argmax<<<1, 1024, shmem_bytes>>>(st0.d_logits, V, st0.d_next_token);
+  HIP_CHECK(hipGetLastError());
+  HIP_CHECK(hipMemcpy(&next_token, st0.d_next_token, sizeof(int), hipMemcpyDeviceToHost));
   }
 
   return next_token;
