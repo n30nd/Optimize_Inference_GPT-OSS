@@ -5,10 +5,10 @@
 // - No external GPU libs. Naive HIP kernels focused on correctness.
 // - Weights:    All stored as BF16 (MLP1 now BF16, previously FP8-like)
 // - Activations: FP32 (GPURunState concept)
-// - All-reduce: host-bridge (D2H sum H2D) for Attention W_o partials
+// - All-reduce: P2P ring (hipMemcpyPeerAsync) for Attention W_o partials
 // - Warm-up does sharding + chunked copy (512 MB default)
 // - Inference runs one token stream per request (driver in getp_eval.cpp)
-// - Router computed on host; MoE dispatch via host -> owner GPU -> host
+// - Router computed on host; MoE dispatch via P2P alltoallv between GPUs
 
 #include "getp_eval.cpp"
 
@@ -117,6 +117,25 @@ static void safeHipFree(void* p) {
     hipError_t e = hipFree(p);
     if (e != hipSuccess) {
       fprintf(stderr, "hipFree error: %s\n", hipGetErrorString(e));
+    }
+  }
+}
+
+static void enable_peer_access_all() {
+  int ndev = 0;
+  HIP_CHECK(hipGetDeviceCount(&ndev));
+  for (int i = 0; i < ndev; ++i) {
+    HIP_CHECK(hipSetDevice(i));
+    for (int j = 0; j < ndev; ++j) {
+      if (i == j) continue;
+      int can = 0;
+      hipError_t e = hipDeviceCanAccessPeer(&can, i, j);
+      if (e == hipSuccess && can) {
+        hipError_t e2 = hipDeviceEnablePeerAccess(j, 0);
+        if (e2 != hipSuccess && e2 != hipErrorPeerAccessAlreadyEnabled) {
+          fprintf(stderr, "hipDeviceEnablePeerAccess(%d->%d) failed: %s\n", i, j, hipGetErrorString(e2));
+        }
+      }
     }
   }
 }
@@ -323,7 +342,74 @@ __global__ void k_add_bias(float* y, const float* b, int n) {
   if (i < n) y[i] += b[i];
 }
 
-// SwiGLU piece
+// In-place add: dst[i] += src[i] for i in [0,n)
+__global__ void k_add_inplace(float* dst, const float* src, size_t n) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] += src[i];
+}
+
+// Batched in-place add over B rows of length n: X[b,:] += Y[b,:]
+__global__ void k_add_inplace_batched(float* X, const float* Y, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = blockIdx.y;
+  if (i < n) X[(size_t)b * n + i] += Y[(size_t)b * n + i];
+}
+
+// Batched AXPY: X[b,:] += alpha * Y[b,:]
+__global__ void k_axpy_batched(float* X, const float* Y, float alpha, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = blockIdx.y;
+  if (i < n) X[(size_t)b * n + i] += alpha * Y[(size_t)b * n + i];
+}
+
+// Gather rows: dst[r,:] = src[idx[r],:], r in [0,nb)
+// Forward declaration for silu used below
+__host__ __device__ inline float silu(float x);
+
+__global__ void k_gather_rows_f32(const float* __restrict__ src,
+                                  const int*   __restrict__ idx,
+                                  int nb, int D,
+                                  float* __restrict__ dst) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x; // col
+  int r = blockIdx.y; // row
+  if (r < nb && j < D) {
+    int i_src = idx[r];
+    dst[(size_t)r * D + j] = src[(size_t)i_src * D + j];
+  }
+}
+
+// Scatter-add with weights: dst[idx[r],:] += w[r] * src[r,:]
+__global__ void k_scatter_axpy_rows_f32(float* __restrict__ dst,
+                                        const int* __restrict__ idx,
+                                        const float* __restrict__ w,
+                                        const float* __restrict__ src,
+                                        int nb, int D) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x; // col
+  int r = blockIdx.y; // row
+  if (r < nb && j < D) {
+    int i_dst = idx[r];
+    float alpha = w[r];
+    atomicAdd(&dst[(size_t)i_dst * D + j], alpha * src[(size_t)r * D + j]);
+  }
+}
+
+// Batched SwiGLU with clamping: gate_up_b[r,i] = silu(clamp(g)) * (clamp(u)+1)
+__global__ void k_swiglu_clamp_batched(const float* __restrict__ mlp1_out_b, // [nb, 2I]
+                                       float*       __restrict__ gate_up_b,   // [nb, I]
+                                       int I, float clampU, float clampL) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; // feature
+  int r = blockIdx.y; // row
+  if (i < I) {
+    const float* row = mlp1_out_b + (size_t)r * (2*I);
+    float g = row[2*i + 0];
+    float u = row[2*i + 1];
+    if (g > clampU) g = clampU;
+    if (u < clampL) u = clampL; if (u > clampU) u = clampU;
+    gate_up_b[(size_t)r * I + i] = silu(g) * (u + 1.0f);
+  }
+}
+
+  // SwiGLU piece
 __host__ __device__ inline float silu(float x) { return x / (1.0f + expf(-1.702f * x)); }
 
 // Apply SwiGLU with clamping on device: gate_up[i] = silu(clamp(g)) * (clamp(u) + 1)
@@ -829,6 +915,9 @@ struct GPUTransformerWeights {
   float* d_rms_out_w  = nullptr; // size D
 
   float* d_attn_sinks = nullptr; // size = n_layers * q_count
+
+  // W_o bias per layer on device (FP32)
+  float* d_b_o = nullptr; // size L * D
 };
 
 struct GPURunState {
@@ -862,6 +951,16 @@ struct GPURunState {
   // Logits (GPU0 only)
   float* d_logits = nullptr; // size vocab_size
   int* d_next_token = nullptr; // single int result for greedy argmax
+
+  // P2P communication helpers
+  float* d_comm_tmp = nullptr;   // size GROUP_BATCH * D (receive scratch)
+  float* d_moe_accum = nullptr;  // size GROUP_BATCH * D (accumulator on root)
+  hipStream_t comm_stream = nullptr;
+
+  // Batched MoE staging
+  float* d_in_batch = nullptr;    // size GROUP_BATCH * D
+  int*   d_idx_tmp = nullptr;     // size GROUP_BATCH
+  float* d_weight_tmp = nullptr;  // size GROUP_BATCH
 };
 
 static GPUTransformerWeights g_weights[WORLD_GPUS];
@@ -873,6 +972,34 @@ static std::mutex g_reduce_mutex;
 
 static float* h_tb2_partials[WORLD_GPUS] = {};
 static float* h_tb2_sum = nullptr; // legacy; not used in group-forward path
+
+// Simple ring-allreduce using peer copies and in-place accumulation.
+// Operates over g_state[r].d_tb2_partial for r in [base, base+group_size).
+// Root‑only reduction: accumulate all shard partials into root's d_tb2_partial
+static void root_reduce_tb2(int base, int group_size, int B, int D, int root) {
+  size_t elems = (size_t)B * (size_t)D;
+  size_t bytes = elems * sizeof(float);
+  // Ensure producers finished computing tb2_partial on default streams
+  for (int off = 0; off < group_size; ++off) {
+    int r = base + off;
+    HIP_CHECK(hipSetDevice(r));
+    HIP_CHECK(hipDeviceSynchronize());
+  }
+  // Accumulate on root
+  HIP_CHECK(hipSetDevice(root));
+  int blocks = (int)((elems + 255) / 256);
+  for (int off = 0; off < group_size; ++off) {
+    int r = base + off;
+    if (r == root) continue; // root already has its partial
+    HIP_CHECK(hipMemcpyPeerAsync(g_state[root].d_comm_tmp, root,
+                                 g_state[r].d_tb2_partial, r,
+                                 bytes, g_state[root].comm_stream));
+    k_add_inplace<<<blocks, 256, 0, g_state[root].comm_stream>>>(
+        g_state[root].d_tb2_partial, g_state[root].d_comm_tmp, elems);
+    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipStreamSynchronize(g_state[root].comm_stream));
+  }
+}
 
 // ---------------------------------------------
 // Packing helpers
@@ -1206,36 +1333,30 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
       HIP_CHECK(hipGetLastError());
     }
 
-    // 6) Host reduce across shards per batch
-    std::vector<float> tb2_sum_local((size_t)B * D, 0.f);
-    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
-      HIP_CHECK(hipSetDevice(r));
-      std::vector<float> tmp((size_t)B * D);
-      memcpyDtoH_chunked(tmp.data(), g_state[r].d_tb2_partial, (size_t)B * D * sizeof(float));
-      for (int b = 0; b < B; ++b) {
-        float* dst = tb2_sum_local.data() + (size_t)b * D;
-        float* src = tmp.data() + (size_t)b * D;
-        for (int i = 0; i < D; ++i) dst[i] += src[i];
-      }
-    }
-    const float* b_o = tr->weights.b_o + 1ll*l*D;
-    for (int b = 0; b < B; ++b) {
-      float* xb = xB.data() + (size_t)b * D;
-      float* tbs = tb2_sum_local.data() + (size_t)b * D;
-      for (int i = 0; i < D; ++i) xb[i] += (tbs[i] + b_o[i]);
-    }
+    // 6) Reduce all shards to root via P2P, then add bias and residual on root device
+    int root = base; // group root device
+    root_reduce_tb2(base, MP_GROUP_SIZE, B, D, root);
+    HIP_CHECK(hipSetDevice(root));
+    // Add W_o bias to tb2 partials on device
+    const float* b_o_dev = g_weights[root].d_b_o + (size_t)l * D;
+    dim3 gridb_b((D+255)/256, B);
+    k_add_bias_batched<<<gridb_b, 256>>>(g_state[root].d_tb2_partial, b_o_dev, D);
+    HIP_CHECK(hipGetLastError());
+    // Residual add: xB += tb2_sum (on device root)
+    // Root already has xB on device from step 1
+    dim3 grid_add((D+255)/256, B);
+    k_add_inplace_batched<<<grid_add, 256>>>(g_state[root].d_x, g_state[root].d_tb2_partial, D);
+    HIP_CHECK(hipGetLastError());
 
-    // 7) FFN RMSNorm on root (batched); copy tB back
+    // 7) FFN RMSNorm on root (batched); keep tB on device for MoE dispatch
     {
       HIP_CHECK(hipSetDevice(root));
       auto& devwr = g_weights[root];
       auto& str   = g_state[root];
-      HIP_CHECK(hipMemcpy(str.d_x, xB.data(), (size_t)B * D * sizeof(float), hipMemcpyHostToDevice));
       const float* w_ffn = devwr.d_rms_ffn_w + (size_t)l * D;
       dim3 grid(1, B), block(256);
       k_rmsnorm_vec_batched<<<grid, block>>>(str.d_x, w_ffn, str.d_t, D);
       HIP_CHECK(hipGetLastError());
-      memcpyDtoH_chunked(tB.data(), str.d_t, (size_t)B * D * sizeof(float));
     }
 
     // 8) Router matvec on root (batched) + bias; copy to host
@@ -1255,63 +1376,122 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
       memcpyDtoH_chunked(router.data(), str.d_router, (size_t)B * E * sizeof(float));
     }
 
-    // 9) Per-sample top-k and expert MLPs
+    // 9) Per-sample top-k and expert MLPs (P2P alltoallv batched per owner-expert)
+    // Build routing lists on host: for each owner r and its local expert e, collect (b, ew)
+    struct Item { int b; float w; int e_local; };
+    std::vector<std::vector<Item>> per_owner(MP_GROUP_SIZE);
+    for (int r = 0; r < MP_GROUP_SIZE; ++r) per_owner[r].reserve(B * tr->config.experts_per_token);
     for (int b = 0; b < B; ++b) {
       int K = tr->config.experts_per_token;
-      std::vector<int> idx(E); for (int i=0;i<E;++i) idx[i]=i;
+      std::vector<int> idxs(E); for (int i=0;i<E;++i) idxs[i]=i;
       float* rrow = router.data() + (size_t)b * E;
-      std::partial_sort(idx.begin(), idx.begin()+K, idx.end(),
-                        [&](int a,int b2){return rrow[a]>rrow[b2];});
+      std::partial_sort(idxs.begin(), idxs.begin()+K, idxs.end(), [&](int a,int b2){return rrow[a]>rrow[b2];});
       std::vector<int> topk_idx(K);
       std::vector<float> topk_val(K);
-      for (int i=0;i<K;++i){ topk_idx[i]=idx[i]; topk_val[i]=rrow[idx[i]]; }
+      for (int i=0;i<K;++i){ topk_idx[i]=idxs[i]; topk_val[i]=rrow[idxs[i]]; }
       float maxv = -INFINITY;
       for (float v: topk_val) if (v > maxv) maxv = v;
       float sum = 0.f; for (float &v: topk_val) { v = expf(v - maxv); sum += v; }
       float inv = 1.f / sum; for (float &v: topk_val) v *= inv;
-
-      std::vector<float> e_agg(D, 0.f);
       for (int ki = 0; ki < K; ++ki) {
         int e_glob = topk_idx[ki]; float ew = topk_val[ki];
         int owner = -1;
-        for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
-          if (e_glob >= g_expert_shard[r].e_start && e_glob < g_expert_shard[r].e_start + g_expert_shard[r].e_count) { owner = r; break; }
+        int owner_off = -1;
+        for (int rr = base; rr < base + MP_GROUP_SIZE; ++rr) {
+          if (e_glob >= g_expert_shard[rr].e_start && e_glob < g_expert_shard[rr].e_start + g_expert_shard[rr].e_count) {
+            owner = rr; owner_off = rr - base; break; }
         }
         if (owner < 0) { fprintf(stderr,"EP owner not found in group %d\n", group_id); exit(EXIT_FAILURE); }
         int e_local = e_glob - g_expert_shard[owner].e_start;
+        per_owner[owner_off].push_back({b, ew, e_local});
+      }
+    }
+
+    // Zero root accum buffer once for all samples
+    HIP_CHECK(hipSetDevice(root));
+    HIP_CHECK(hipMemsetAsync(g_state[root].d_moe_accum, 0, (size_t)B * D * sizeof(float), g_state[root].comm_stream));
+    HIP_CHECK(hipStreamSynchronize(g_state[root].comm_stream));
+
+    // For each owner, group by local expert and process minibatches
+    for (int r_off = 0; r_off < MP_GROUP_SIZE; ++r_off) {
+      int owner = base + r_off;
+      if (per_owner[r_off].empty()) continue;
+      // Build per-expert map
+      int E_local = g_expert_shard[owner].e_count;
+      std::vector<std::vector<Item>> by_exp(E_local);
+      for (auto &it : per_owner[r_off]) by_exp[it.e_local].push_back(it);
+
+      for (int e_local = 0; e_local < E_local; ++e_local) {
+        auto &v = by_exp[e_local];
+        if (v.empty()) continue;
+        int nb = (int)v.size();
+        // Copy indices and weights to root device
+        HIP_CHECK(hipSetDevice(root));
+        std::vector<int> h_idx(nb);
+        std::vector<float> h_w(nb);
+        for (int i = 0; i < nb; ++i) { h_idx[i] = v[i].b; h_w[i] = v[i].w; }
+        HIP_CHECK(hipMemcpy(g_state[root].d_idx_tmp, h_idx.data(), (size_t)nb * sizeof(int), hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(g_state[root].d_weight_tmp, h_w.data(), (size_t)nb * sizeof(float), hipMemcpyHostToDevice));
+        // Gather inputs on root: in_batch[nb,D]
+        dim3 gg((D+255)/256, nb);
+        k_gather_rows_f32<<<gg, 256, 0, g_state[root].comm_stream>>>(
+            g_state[root].d_t, g_state[root].d_idx_tmp, nb, D, g_state[root].d_in_batch);
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(g_state[root].comm_stream));
+        // P2P copy to owner
+        HIP_CHECK(hipMemcpyPeerAsync(g_state[owner].d_in_batch, owner,
+                                     g_state[root].d_in_batch, root,
+                                     (size_t)nb * D * sizeof(float), g_state[owner].comm_stream));
+        // Owner compute batched expert MLP
         HIP_CHECK(hipSetDevice(owner));
         auto& devw = g_weights[owner];
         auto& st   = g_state[owner];
-        // write t for this b to device
-        HIP_CHECK(hipMemcpy(st.d_t, tB.data() + (size_t)b * D, D*sizeof(float), hipMemcpyHostToDevice));
         const hip_bfloat16* W1 = devw.d_w_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I) * D;
         const float*        B1 = devw.d_b_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I);
-        dim3 g1((2*I), 1, 1), b1(256, 1, 1);
-        k_matvec_bf16_fp32<<<g1, b1>>>(W1, st.d_t, st.d_mlp1_out, D, 2*I);
+        dim3 g1((2*I), nb), b1(256);
+        k_matvec_bf16_fp32_batched<<<g1, b1, 0, st.comm_stream>>>(W1, st.d_in_batch, st.d_mlp1_out, D, 2*I);
         HIP_CHECK(hipGetLastError());
-        k_add_bias<<<((2*I)+255)/256, 256>>>(st.d_mlp1_out, B1, 2*I);
+        dim3 gb1((2*I + 255)/256, nb);
+        k_add_bias_batched<<<gb1, 256, 0, st.comm_stream>>>(st.d_mlp1_out, B1, 2*I);
         HIP_CHECK(hipGetLastError());
-        {
-          const float clampU = tr->config.swiglu_limit;
-          const float clampL = -tr->config.swiglu_limit;
-          dim3 gsw((I + 255)/256), bsw(256);
-          k_swiglu_clamp<<<gsw, bsw>>>(st.d_mlp1_out, st.d_gate_up, I, clampU, clampL);
-          HIP_CHECK(hipGetLastError());
-        }
+        const float clampU = tr->config.swiglu_limit;
+        const float clampL = -tr->config.swiglu_limit;
+        dim3 gsw((I + 255)/256, nb), bsw(256);
+        k_swiglu_clamp_batched<<<gsw, bsw, 0, st.comm_stream>>>(st.d_mlp1_out, st.d_gate_up, I, clampU, clampL);
+        HIP_CHECK(hipGetLastError());
         const hip_bfloat16* W2 = devw.d_w_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D * I;
         const float*        B2 = devw.d_b_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D;
-        dim3 g2(D, 1, 1), b2d(256, 1, 1);
-        k_matvec_bf16_fp32<<<g2, b2d>>>(W2, st.d_gate_up, st.d_ffn_out, I, D);
+        dim3 g2(D, nb), b2d(256);
+        k_matvec_bf16_fp32_batched<<<g2, b2d, 0, st.comm_stream>>>(W2, st.d_gate_up, st.d_ffn_out, I, D);
         HIP_CHECK(hipGetLastError());
-        k_add_bias<<<(D+255)/256, 256>>>(st.d_ffn_out, B2, D);
+        dim3 gb2((D+255)/256, nb);
+        k_add_bias_batched<<<gb2, 256, 0, st.comm_stream>>>(st.d_ffn_out, B2, D);
         HIP_CHECK(hipGetLastError());
-        std::vector<float> h_ffn(D);
-        memcpyDtoH_chunked(h_ffn.data(), st.d_ffn_out, D*sizeof(float));
-        for (int i = 0; i < D; ++i) e_agg[i] += ew * h_ffn[i];
+        HIP_CHECK(hipStreamSynchronize(st.comm_stream));
+        // Copy back to root and scatter-add with weights
+        HIP_CHECK(hipSetDevice(root));
+        HIP_CHECK(hipMemcpyPeerAsync(g_state[root].d_in_batch, root,
+                                     g_state[owner].d_ffn_out, owner,
+                                     (size_t)nb * D * sizeof(float), g_state[root].comm_stream));
+        dim3 gsax((D+255)/256, nb);
+        k_scatter_axpy_rows_f32<<<gsax, 256, 0, g_state[root].comm_stream>>>(
+            g_state[root].d_moe_accum,
+            g_state[root].d_idx_tmp,
+            g_state[root].d_weight_tmp,
+            g_state[root].d_in_batch,
+            nb, D);
+        HIP_CHECK(hipGetLastError());
+        HIP_CHECK(hipStreamSynchronize(g_state[root].comm_stream));
       }
-      float* xb = xB.data() + (size_t)b * D;
-      for (int i = 0; i < D; ++i) xb[i] += e_agg[i];
     }
+
+    // Add accumulated expert outputs into root x buffer (residual)
+    HIP_CHECK(hipSetDevice(root));
+    dim3 gadd_exp((D+255)/256, B);
+    k_add_inplace_batched<<<gadd_exp, 256>>>(g_state[root].d_x, g_state[root].d_moe_accum, D);
+    HIP_CHECK(hipGetLastError());
+    // Update host xB for the next layer inputs
+    memcpyDtoH_chunked(xB.data(), g_state[root].d_x, (size_t)B * D * sizeof(float));
   }
 
   // Final RMSNorm + logits (batched) and argmax on root
@@ -1319,7 +1499,6 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
   {
     auto& devwr = g_weights[root];
     auto& str   = g_state[root];
-    HIP_CHECK(hipMemcpy(str.d_x, xB.data(), (size_t)B*D*sizeof(float), hipMemcpyHostToDevice));
     dim3 gridN(1, B), blockN(256);
     k_rmsnorm_vec_batched<<<gridN, blockN>>>(str.d_x, devwr.d_rms_out_w, str.d_x, D);
     HIP_CHECK(hipGetLastError());
@@ -1514,6 +1693,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     exit(EXIT_FAILURE);
   }
 
+  // Enable P2P access across all GPUs (best-effort)
+  enable_peer_access_all();
+
   // Print initial memory state for all GPUs
   printf("[WARMUP] Initial GPU memory state:\n");
   for (int r = 0; r < WORLD_GPUS; ++r) {
@@ -1582,6 +1764,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     safeHipFree(devw.d_rms_ffn_w);
     safeHipFree(devw.d_rms_out_w);
     safeHipFree(devw.d_attn_sinks);
+    safeHipFree(devw.d_b_o);
 #if KEEP_FP8_UTILS
     safeHipFree(devw.d_w_mlp1_u8);
     safeHipFree(devw.d_w_mlp1_scale);
@@ -1608,6 +1791,12 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     safeHipFree(st.d_slot_ids);
     safeHipFree(st.d_next_token);
     safeHipFree(st.d_logits);
+    if (st.comm_stream) { HIP_CHECK(hipStreamDestroy(st.comm_stream)); st.comm_stream = nullptr; }
+    safeHipFree(st.d_comm_tmp);
+    safeHipFree(st.d_moe_accum);
+    safeHipFree(st.d_in_batch);
+    safeHipFree(st.d_idx_tmp);
+    safeHipFree(st.d_weight_tmp);
 
   }
   for (int r = 0; r < WORLD_GPUS; ++r) { free(h_tb2_partials[r]); h_tb2_partials[r] = nullptr; }
@@ -1703,6 +1892,11 @@ static void gpu_copy_weights(Transformer* transformer, int r) {
   HIP_CHECK(hipMalloc(&devw.d_b_router, (size_t)L * (size_t)E * sizeof(float)));
   memcpyHtoD_chunked(devw.d_w_router, transformer->weights.w_router, (size_t)L * (size_t)E * (size_t)D * sizeof(float));
   memcpyHtoD_chunked(devw.d_b_router, transformer->weights.b_router, (size_t)L * (size_t)E * sizeof(float));
+
+  // Copy W_o bias per layer (FP32)
+  printf("[GPU%d] Copying W_o bias...\n", r);
+  HIP_CHECK(hipMalloc(&devw.d_b_o, (size_t)L * (size_t)D * sizeof(float)));
+  memcpyHtoD_chunked(devw.d_b_o, transformer->weights.b_o, (size_t)L * (size_t)D * sizeof(float));
 
   // Allocate and load MLP weights (per local expert)
   const int I = p->intermediate_dim;
@@ -1837,6 +2031,14 @@ static void gpu_malloc_run_state(Transformer* transformer, int r) {
   HIP_CHECK(hipMalloc(&st.d_topk,   (size_t)g_group_batch * (size_t)p->experts_per_token * sizeof(float)));
   HIP_CHECK(hipMalloc(&st.d_pos_list, (size_t)g_group_batch * sizeof(int)));
   HIP_CHECK(hipMalloc(&st.d_slot_ids, (size_t)g_group_batch * sizeof(int)));
+  // P2P comm allocations
+  HIP_CHECK(hipMalloc(&st.d_comm_tmp, (size_t)g_group_batch * (size_t)D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_moe_accum, (size_t)g_group_batch * (size_t)D * sizeof(float)));
+  HIP_CHECK(hipStreamCreate(&st.comm_stream));
+  // Batched MoE staging buffers
+  HIP_CHECK(hipMalloc(&st.d_in_batch, (size_t)g_group_batch * (size_t)D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_idx_tmp, (size_t)g_group_batch * sizeof(int)));
+  HIP_CHECK(hipMalloc(&st.d_weight_tmp, (size_t)g_group_batch * sizeof(float)));
   if (mp_rank_from_rank(r) == 0) {
     HIP_CHECK(hipMalloc(&st.d_logits, (size_t)g_group_batch * (size_t)p->vocab_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&st.d_next_token, (size_t)g_group_batch * sizeof(int)));
