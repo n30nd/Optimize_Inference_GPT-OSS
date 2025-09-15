@@ -340,6 +340,53 @@ __global__ void k_swiglu_clamp(const float* __restrict__ mlp1_out, // length 2*I
   gate_up[i] = silu(g) * (u + 1.0f);
 }
 
+// Batched SwiGLU with clamping: processes B rows of length I each
+__global__ void k_swiglu_clamp_batched(const float* __restrict__ mlp1_out, // [B, 2*I]
+                                       float*       __restrict__ gate_up,  // [B, I]
+                                       int I, int B,
+                                       float clampU, float clampL) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; // index within I
+  int b = blockIdx.y;                            // batch row
+  if (b >= B || i >= I) return;
+  const float* src = mlp1_out + (size_t)b * (size_t)(2*I);
+  float* dst = gate_up + (size_t)b * (size_t)I;
+  float g = src[2*i + 0];
+  float u = src[2*i + 1];
+  if (g > clampU) g = clampU;
+  if (u < clampL) u = clampL; if (u > clampU) u = clampU;
+  dst[i] = silu(g) * (u + 1.0f);
+}
+
+// Fused TopK + Softmax for each row in a [B, E] router matrix.
+// One block per sample; serial per-block selection (K is small).
+__global__ void k_topk_softmax_batched(const float* __restrict__ router, // [B, E]
+                                       int B, int E, int K,
+                                       float* __restrict__ topv,         // [B, K]
+                                       int*   __restrict__ topi) {       // [B, K]
+  int b = blockIdx.x;
+  if (b >= B) return;
+  if (threadIdx.x != 0) return;
+  const float* scores = router + (size_t)b * (size_t)E;
+  float* tv = topv + (size_t)b * (size_t)K;
+  int*   ti = topi + (size_t)b * (size_t)K;
+  for (int i = 0; i < K; ++i) { tv[i] = -INFINITY; ti[i] = -1; }
+  for (int j = 0; j < E; ++j) {
+    float v = scores[j];
+    int pos = -1;
+    for (int t = 0; t < K; ++t) { if (v > tv[t]) { pos = t; break; } }
+    if (pos >= 0) {
+      for (int t = K-1; t > pos; --t) { tv[t] = tv[t-1]; ti[t] = ti[t-1]; }
+      tv[pos] = v; ti[pos] = j;
+    }
+  }
+  float maxv = tv[0];
+  for (int i = 1; i < K; ++i) if (tv[i] > maxv) maxv = tv[i];
+  float sum = 0.0f;
+  for (int i = 0; i < K; ++i) { tv[i] = expf(tv[i] - maxv); sum += tv[i]; }
+  float inv = 1.0f / sum;
+  for (int i = 0; i < K; ++i) tv[i] *= inv;
+}
+
 // Rotary on Q or K for local heads
 __global__ void k_apply_rotary(float* vec,       // shape: n_heads_local * head_dim
                                const float* cos_vals, // head_dim/2 (same for all heads)
@@ -853,6 +900,7 @@ struct GPURunState {
   // Router temporaries
   float* d_router = nullptr; // size E
   float* d_topk   = nullptr; // size K (experts_per_token)
+  int*   d_topk_idx = nullptr; // size K (experts_per_token)
 
   // Per-batch dynamic positions
   int* d_pos_list = nullptr; // size GROUP_BATCH
@@ -1238,8 +1286,10 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
       memcpyDtoH_chunked(tB.data(), str.d_t, (size_t)B * D * sizeof(float));
     }
 
-    // 8) Router matvec on root (batched) + bias; copy to host
-    std::vector<float> router((size_t)B * E);
+    // 8) Router matvec on root (batched) + bias; TopK on GPU; copy compact TopK to host
+    const int K = tr->config.experts_per_token;
+    std::vector<int>   h_topk_idx((size_t)B * K);
+    std::vector<float> h_topk_val((size_t)B * K);
     {
       HIP_CHECK(hipSetDevice(root));
       auto& devwr = g_weights[root];
@@ -1252,65 +1302,113 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
       const float* b_router_l = devwr.d_b_router + (size_t)l * E;
       k_add_bias_batched<<<gridb, 256>>>(str.d_router, b_router_l, E);
       HIP_CHECK(hipGetLastError());
-      memcpyDtoH_chunked(router.data(), str.d_router, (size_t)B * E * sizeof(float));
+      // compute TopK with softmax over top-k on GPU
+      k_topk_softmax_batched<<<B, 1>>>(str.d_router, B, E, K, str.d_topk, str.d_topk_idx);
+      HIP_CHECK(hipGetLastError());
+      // copy compact results
+      memcpyDtoH_chunked(h_topk_idx.data(), str.d_topk_idx, (size_t)B * K * sizeof(int));
+      memcpyDtoH_chunked(h_topk_val.data(), str.d_topk,     (size_t)B * K * sizeof(float));
     }
 
-    // 9) Per-sample top-k and expert MLPs
+    // 9) Batched expert MLPs per owner GPU (group selections by expert)
+    // Build per-owner, per-local-expert selection lists
+    struct Sel { int b; float w; };
+    std::vector<std::vector<std::vector<Sel>>> owner_sel;
+    owner_sel.resize(MP_GROUP_SIZE);
+    for (int r = 0; r < MP_GROUP_SIZE; ++r) {
+      int rr = base + r;
+      int E_local = g_expert_shard[rr].e_count;
+      owner_sel[r].resize(E_local);
+    }
     for (int b = 0; b < B; ++b) {
-      int K = tr->config.experts_per_token;
-      std::vector<int> idx(E); for (int i=0;i<E;++i) idx[i]=i;
-      float* rrow = router.data() + (size_t)b * E;
-      std::partial_sort(idx.begin(), idx.begin()+K, idx.end(),
-                        [&](int a,int b2){return rrow[a]>rrow[b2];});
-      std::vector<int> topk_idx(K);
-      std::vector<float> topk_val(K);
-      for (int i=0;i<K;++i){ topk_idx[i]=idx[i]; topk_val[i]=rrow[idx[i]]; }
-      float maxv = -INFINITY;
-      for (float v: topk_val) if (v > maxv) maxv = v;
-      float sum = 0.f; for (float &v: topk_val) { v = expf(v - maxv); sum += v; }
-      float inv = 1.f / sum; for (float &v: topk_val) v *= inv;
-
-      std::vector<float> e_agg(D, 0.f);
-      for (int ki = 0; ki < K; ++ki) {
-        int e_glob = topk_idx[ki]; float ew = topk_val[ki];
-        int owner = -1;
-        for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
-          if (e_glob >= g_expert_shard[r].e_start && e_glob < g_expert_shard[r].e_start + g_expert_shard[r].e_count) { owner = r; break; }
+      for (int t = 0; t < K; ++t) {
+        int e_glob = h_topk_idx[(size_t)b * K + t];
+        float ew    = h_topk_val[(size_t)b * K + t];
+        int owner = -1, owner_rel = -1;
+        for (int r = 0; r < MP_GROUP_SIZE; ++r) {
+          int rr = base + r;
+          int start = g_expert_shard[rr].e_start;
+          int count = g_expert_shard[rr].e_count;
+          if (e_glob >= start && e_glob < start + count) { owner = rr; owner_rel = r; break; }
         }
-        if (owner < 0) { fprintf(stderr,"EP owner not found in group %d\n", group_id); exit(EXIT_FAILURE); }
+        if (owner < 0) { fprintf(stderr, "EP owner not found in group %d\n", group_id); exit(EXIT_FAILURE); }
         int e_local = e_glob - g_expert_shard[owner].e_start;
-        HIP_CHECK(hipSetDevice(owner));
-        auto& devw = g_weights[owner];
-        auto& st   = g_state[owner];
-        // write t for this b to device
-        HIP_CHECK(hipMemcpy(st.d_t, tB.data() + (size_t)b * D, D*sizeof(float), hipMemcpyHostToDevice));
-        const hip_bfloat16* W1 = devw.d_w_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I) * D;
-        const float*        B1 = devw.d_b_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I);
-        dim3 g1((2*I), 1, 1), b1(256, 1, 1);
-        k_matvec_bf16_fp32<<<g1, b1>>>(W1, st.d_t, st.d_mlp1_out, D, 2*I);
-        HIP_CHECK(hipGetLastError());
-        k_add_bias<<<((2*I)+255)/256, 256>>>(st.d_mlp1_out, B1, 2*I);
-        HIP_CHECK(hipGetLastError());
-        {
+        owner_sel[owner_rel][e_local].push_back({b, ew});
+      }
+    }
+
+    // Aggregate contributions per sample on host
+    std::vector<float> e_agg_host((size_t)B * D, 0.0f);
+
+    // For each owner GPU, process each local expert in batch
+    for (int rrel = 0; rrel < MP_GROUP_SIZE; ++rrel) {
+      int rdev = base + rrel;
+      HIP_CHECK(hipSetDevice(rdev));
+      auto& devw = g_weights[rdev];
+      auto& st   = g_state[rdev];
+      int E_local = g_expert_shard[rdev].e_count;
+      for (int e_local = 0; e_local < E_local; ++e_local) {
+        auto& vec = owner_sel[rrel][e_local];
+        int m = (int)vec.size();
+        if (m == 0) continue;
+        // Pack tB rows for selected samples into contiguous buffer
+        std::vector<float> h_t_in((size_t)m * D);
+        std::vector<float> h_w(m);
+        std::vector<int>   h_bidx(m);
+        for (int i = 0; i < m; ++i) {
+          h_bidx[i] = vec[i].b; h_w[i] = vec[i].w;
+          const float* src = tB.data() + (size_t)vec[i].b * D;
+          std::copy(src, src + D, h_t_in.begin() + (size_t)i * D);
+        }
+        // Upload batched t to device temporary (reuse st.d_t sized for g_group_batch x D by iterating in chunks if needed)
+        // Process possibly in chunks if m > g_group_batch
+        int offset = 0;
+        while (offset < m) {
+          int chunk = std::min(g_group_batch, m - offset);
+          HIP_CHECK(hipMemcpy(st.d_t, h_t_in.data() + (size_t)offset * D, (size_t)chunk * D * sizeof(float), hipMemcpyHostToDevice));
+          const hip_bfloat16* W1 = devw.d_w_mlp1 + ((size_t)l * E_local + e_local) * (size_t)(2*I) * D;
+          const float*        B1 = devw.d_b_mlp1 + ((size_t)l * E_local + e_local) * (size_t)(2*I);
+          // MLP1 batched
+          dim3 g1(2*I, chunk), b1(256);
+          k_matvec_bf16_fp32_batched<<<g1, b1>>>(W1, st.d_t, st.d_mlp1_out, D, 2*I);
+          HIP_CHECK(hipGetLastError());
+          dim3 gb1(((2*I)+255)/256, chunk);
+          k_add_bias_batched<<<gb1, 256>>>(st.d_mlp1_out, B1, 2*I);
+          HIP_CHECK(hipGetLastError());
+          // SwiGLU batched
           const float clampU = tr->config.swiglu_limit;
           const float clampL = -tr->config.swiglu_limit;
-          dim3 gsw((I + 255)/256), bsw(256);
-          k_swiglu_clamp<<<gsw, bsw>>>(st.d_mlp1_out, st.d_gate_up, I, clampU, clampL);
+          dim3 gsw((I + 255)/256, chunk), bsw(256);
+          k_swiglu_clamp_batched<<<gsw, bsw>>>(st.d_mlp1_out, st.d_gate_up, I, chunk, clampU, clampL);
           HIP_CHECK(hipGetLastError());
+          // MLP2 batched
+          const hip_bfloat16* W2 = devw.d_w_mlp2 + ((size_t)l * E_local + e_local) * (size_t)D * I;
+          const float*        B2 = devw.d_b_mlp2 + ((size_t)l * E_local + e_local) * (size_t)D;
+          dim3 g2(D, chunk), b2d(256);
+          k_matvec_bf16_fp32_batched<<<g2, b2d>>>(W2, st.d_gate_up, st.d_ffn_out, I, D);
+          HIP_CHECK(hipGetLastError());
+          dim3 gb2(((D+255)/256), chunk);
+          k_add_bias_batched<<<gb2, 256>>>(st.d_ffn_out, B2, D);
+          HIP_CHECK(hipGetLastError());
+          // Download and accumulate with weights
+          std::vector<float> h_ffn((size_t)chunk * D);
+          memcpyDtoH_chunked(h_ffn.data(), st.d_ffn_out, (size_t)chunk * D * sizeof(float));
+          for (int i = 0; i < chunk; ++i) {
+            int bi = h_bidx[offset + i];
+            float ew = h_w[offset + i];
+            float* dst = e_agg_host.data() + (size_t)bi * D;
+            const float* src = h_ffn.data() + (size_t)i * D;
+            for (int j = 0; j < D; ++j) dst[j] += ew * src[j];
+          }
+          offset += chunk;
         }
-        const hip_bfloat16* W2 = devw.d_w_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D * I;
-        const float*        B2 = devw.d_b_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D;
-        dim3 g2(D, 1, 1), b2d(256, 1, 1);
-        k_matvec_bf16_fp32<<<g2, b2d>>>(W2, st.d_gate_up, st.d_ffn_out, I, D);
-        HIP_CHECK(hipGetLastError());
-        k_add_bias<<<(D+255)/256, 256>>>(st.d_ffn_out, B2, D);
-        HIP_CHECK(hipGetLastError());
-        std::vector<float> h_ffn(D);
-        memcpyDtoH_chunked(h_ffn.data(), st.d_ffn_out, D*sizeof(float));
-        for (int i = 0; i < D; ++i) e_agg[i] += ew * h_ffn[i];
       }
+    }
+    // Add expert aggregation to xB
+    for (int b = 0; b < B; ++b) {
       float* xb = xB.data() + (size_t)b * D;
-      for (int i = 0; i < D; ++i) xb[i] += e_agg[i];
+      float* ea = e_agg_host.data() + (size_t)b * D;
+      for (int i = 0; i < D; ++i) xb[i] += ea[i];
     }
   }
 
@@ -1604,6 +1702,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     safeHipFree(st.d_mask);
     safeHipFree(st.d_router);
     safeHipFree(st.d_topk);
+    safeHipFree(st.d_topk_idx);
     safeHipFree(st.d_pos_list);
     safeHipFree(st.d_slot_ids);
     safeHipFree(st.d_next_token);
@@ -1835,6 +1934,7 @@ static void gpu_malloc_run_state(Transformer* transformer, int r) {
   // Router temporaries and logits buffer (group root)
   HIP_CHECK(hipMalloc(&st.d_router, (size_t)g_group_batch * (size_t)p->n_experts * sizeof(float)));
   HIP_CHECK(hipMalloc(&st.d_topk,   (size_t)g_group_batch * (size_t)p->experts_per_token * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_topk_idx, (size_t)g_group_batch * (size_t)p->experts_per_token * sizeof(int)));
   HIP_CHECK(hipMalloc(&st.d_pos_list, (size_t)g_group_batch * sizeof(int)));
   HIP_CHECK(hipMalloc(&st.d_slot_ids, (size_t)g_group_batch * sizeof(int)));
   if (mp_rank_from_rank(r) == 0) {
