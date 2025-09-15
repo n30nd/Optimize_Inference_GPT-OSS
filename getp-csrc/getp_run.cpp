@@ -347,26 +347,53 @@ __global__ void k_apply_rotary(float* vec,       // shape: n_heads_local * head_
   base[half + i] = o2;
 }
 
-// Batched rotary: vec_b shape [B, n_heads_local * head_dim]
-__global__ void k_apply_rotary_batched_strided(float* vec_b,
-                                               const float* cos_vals,
-                                               const float* sin_vals,
-                                               int n_heads_local, int head_dim,
-                                               int sample_stride) {
+// Batched rotary with per-sample positions; computes cos/sin on the fly
+__global__ void k_apply_rotary_dynamic_batched_strided(
+    float* vec_b,
+    const int* __restrict__ pos_list,
+    float base,
+    int head_dim,
+    float scaling_factor,
+    float initial_context_length,
+    float ntk_beta,
+    float ntk_alpha,
+    int n_heads_local,
+    int sample_stride) {
   int h = blockIdx.x;
   int b = blockIdx.y;
   int i = threadIdx.x;
   if (h >= n_heads_local || i >= head_dim/2) return;
-  float* base = vec_b + (size_t)b * sample_stride + h * head_dim;
+  float* vec_base = vec_b + (size_t)b * sample_stride + h * head_dim;
   int half = head_dim/2;
-  float x1 = base[i];
-  float x2 = base[half + i];
-  float c = cos_vals[i];
-  float s = sin_vals[i];
+  float x1 = vec_base[i];
+  float x2 = vec_base[half + i];
+  // Compute cos/sin for this sample position and dimension i
+  int pos_b = pos_list[b];
+  if (pos_b < 0) return; // inactive sample
+  const float PI = 3.14159265358979323846f;
+  float exponent = (2.0f * (float)i) / (float)head_dim;
+  float freq = powf(base, exponent);
+  float concentration = (scaling_factor > 1.0f) ? (0.1f * logf(scaling_factor) + 1.0f) : 1.0f;
+  float inv_freq;
+  if (scaling_factor > 1.0f) {
+    float low = (float)half * logf(initial_context_length / (ntk_beta * 2.0f * PI)) / logf(base);
+    float high = (float)half * logf(initial_context_length / (ntk_alpha * 2.0f * PI)) / logf(base);
+    float interpolation = 1.0f / (scaling_factor * freq);
+    float extrapolation = 1.0f / freq;
+    float ramp = ((float)i - low) / (high - low);
+    if (ramp < 0.f) ramp = 0.f; if (ramp > 1.f) ramp = 1.f;
+    float mask = 1.0f - ramp;
+    inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
+  } else {
+    inv_freq = 1.0f / freq;
+  }
+  float val = (float)pos_b * inv_freq;
+  float c = cosf(val) * concentration;
+  float s = sinf(val) * concentration;
   float o1 = x1 * c - x2 * s;
   float o2 = x2 * c + x1 * s;
-  base[i] = o1;
-  base[half + i] = o2;
+  vec_base[i] = o1;
+  vec_base[half + i] = o2;
 }
 
 // Compute RoPE cos/sin on device for a given position and config
@@ -476,10 +503,12 @@ __global__ void k_attention_step_batched(
     const float* __restrict__ kv_cache_k_b,// [B, pos+1, n_kvh_local*hd]
     const float* __restrict__ kv_cache_v_b,
     float*       __restrict__ tb_local_b,  // [B, n_qh_local*hd]
-    int pos_plus1, int head_dim,
+    const int*    __restrict__ pos_list,
+    int head_dim,
     int n_qh_local, int n_kvh_local, int kv_mul,
     int kv_block_stride, // stride between samples in kv cache (seq_len * kvdim)
-    const float* __restrict__ mask_row_or_null, // same for all in lock-step
+    const float* __restrict__ mask_base_or_null, // [seq_len, seq_len]
+    int seq_len,
     const float* __restrict__ attn_sinks_l) {
   int h = blockIdx.x;
   int b = blockIdx.y;
@@ -494,6 +523,12 @@ __global__ void k_attention_step_batched(
   int kvdim = n_kvh_local * head_dim;
   const float* k_base = kv_cache_k_b + (size_t)b * kv_block_stride;
   const float* v_base = kv_cache_v_b + (size_t)b * kv_block_stride;
+
+  int pos_b = pos_list[b];
+  if (pos_b < 0) return; // inactive sample
+  int pos_plus1 = pos_b + 1;
+  const float* mask_row_or_null = nullptr;
+  if (mask_base_or_null) mask_row_or_null = mask_base_or_null + (size_t)pos_b * seq_len;
 
   for (int t = 0; t < pos_plus1; ++t) {
     __syncthreads();
@@ -707,6 +742,9 @@ struct GPURunState {
   // Router temporaries
   float* d_router = nullptr; // size E
   float* d_topk   = nullptr; // size K (experts_per_token)
+
+  // Per-batch dynamic positions
+  int* d_pos_list = nullptr; // size GROUP_BATCH
 
   // Logits (GPU0 only)
   float* d_logits = nullptr; // size vocab_size
@@ -1051,6 +1089,7 @@ static void gpu_malloc_run_state(Transformer* transformer, int r) {
   // Router temporaries and logits buffer (group root)
   HIP_CHECK(hipMalloc(&st.d_router, (size_t)GROUP_BATCH * (size_t)p->n_experts * sizeof(float)));
   HIP_CHECK(hipMalloc(&st.d_topk,   (size_t)GROUP_BATCH * (size_t)p->experts_per_token * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_pos_list, (size_t)GROUP_BATCH * sizeof(int)));
   if (mp_rank_from_rank(r) == 0) {
     HIP_CHECK(hipMalloc(&st.d_logits, (size_t)GROUP_BATCH * (size_t)p->vocab_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&st.d_next_token, (size_t)GROUP_BATCH * sizeof(int)));
@@ -1091,6 +1130,7 @@ __global__ void k_argmax(const float* __restrict__ logits, int vocab, int* __res
 // Batched argmax: one block per sample (assumes blockDim.x>=1024 for V)
 __global__ void k_argmax_batched(const float* __restrict__ logits, int batch, int vocab, int* __restrict__ out_idx) {
   int b = blockIdx.x;
+  if (b >= batch) return;
   extern __shared__ unsigned char karg_smem[];
   float* svals = reinterpret_cast<float*>(karg_smem);
   int* sidx = reinterpret_cast<int*>(svals + blockDim.x);
@@ -1227,6 +1267,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     safeHipFree(st.d_mask);
     safeHipFree(st.d_router);
     safeHipFree(st.d_topk);
+    safeHipFree(st.d_pos_list);
     safeHipFree(st.d_logits);
 
   }
@@ -1798,7 +1839,8 @@ static int forward_one_group(Transformer* tr, Sampler* sampler, int group_id,
 // ---------------------------------------------
 static void forward_one_group_batched(Transformer* tr, int group_id,
                                       int B,
-                                      const int* tokens, int pos,
+                                      const int* tokens,
+                                      const int* pos_list,
                                       std::vector<float>& xB, // size B*D
                                       std::vector<float>& tB  // size B*D
                                       , std::vector<int>& next_tokens_out) {
@@ -1849,30 +1891,31 @@ static void forward_one_group_batched(Transformer* tr, int group_id,
       HIP_CHECK(hipGetLastError());
     }
 
-    // 3) RoPE and KV cache update, extract local Q (batched)
+    // 3) RoPE (dynamic pos) and KV cache update, extract local Q (batched)
     for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
       HIP_CHECK(hipSetDevice(r));
       auto& hs = g_head_shard[r];
       auto& st = g_state[r];
+      // Upload positions for this batch
+      HIP_CHECK(hipMemcpy(st.d_pos_list, pos_list, (size_t)B * sizeof(int), hipMemcpyHostToDevice));
       int q_rows = hs.q_count * hd;
       int kv_rows = hs.kv_count * hd;
 
-      // compute cos/sin once per device
-      dim3 grid_cs(((p->head_dim/2) + 255)/256), block_cs(256);
-      k_compute_cos_sin<<<grid_cs, block_cs>>>(pos, p->rope_theta, p->head_dim,
-          p->rope_scaling_factor, p->initial_context_length, 32.0f, 1.0f,
-          st.d_cos, st.d_sin);
-      HIP_CHECK(hipGetLastError());
-
-      // Apply to Q and K in batched buffers
+      // Apply RoPE to Q and K with dynamic per-sample positions
       float* q_ptr_b = st.d_qkv; // samples separated by sample_stride = (q_rows + 2*kv_rows)
       float* k_ptr_b = st.d_qkv + q_rows;
       int sample_stride = q_rows + 2*kv_rows;
       dim3 grid_q(hs.q_count, B), block_q(hd/2);
-      k_apply_rotary_batched_strided<<<grid_q, block_q>>>(q_ptr_b, st.d_cos, st.d_sin, hs.q_count, hd, sample_stride);
+      k_apply_rotary_dynamic_batched_strided<<<grid_q, block_q>>>(
+          q_ptr_b, st.d_pos_list, p->rope_theta, p->head_dim,
+          p->rope_scaling_factor, p->initial_context_length, 32.0f, 1.0f,
+          hs.q_count, sample_stride);
       HIP_CHECK(hipGetLastError());
       dim3 grid_k(hs.kv_count, B), block_k(hd/2);
-      k_apply_rotary_batched_strided<<<grid_k, block_k>>>(k_ptr_b, st.d_cos, st.d_sin, hs.kv_count, hd, sample_stride);
+      k_apply_rotary_dynamic_batched_strided<<<grid_k, block_k>>>(
+          k_ptr_b, st.d_pos_list, p->rope_theta, p->head_dim,
+          p->rope_scaling_factor, p->initial_context_length, 32.0f, 1.0f,
+          hs.kv_count, sample_stride);
       HIP_CHECK(hipGetLastError());
 
       // Save K/V to cache for each b
@@ -1881,12 +1924,14 @@ static void forward_one_group_batched(Transformer* tr, int group_id,
       float* k_cache_layer_base = st.d_kv_k + (size_t)l * GROUP_BATCH * kv_block;
       float* v_cache_layer_base = st.d_kv_v + (size_t)l * GROUP_BATCH * kv_block;
       for (int b = 0; b < B; ++b) {
+        int pos_b = pos_list[b];
+        if (pos_b < 0) continue; // inactive
         const float* k_ptr = st.d_qkv + (size_t)b * (q_rows + 2*kv_rows) + q_rows;
         const float* v_ptr = st.d_qkv + (size_t)b * (q_rows + 2*kv_rows) + q_rows + kv_rows;
         float* k_cache_b = k_cache_layer_base + (size_t)b * kv_block;
         float* v_cache_b = v_cache_layer_base + (size_t)b * kv_block;
-        HIP_CHECK(hipMemcpy(k_cache_b + (size_t)pos * kv_dim_local, k_ptr, kv_dim_local*sizeof(float), hipMemcpyDeviceToDevice));
-        HIP_CHECK(hipMemcpy(v_cache_b + (size_t)pos * kv_dim_local, v_ptr, kv_dim_local*sizeof(float), hipMemcpyDeviceToDevice));
+        HIP_CHECK(hipMemcpy(k_cache_b + (size_t)pos_b * kv_dim_local, k_ptr, kv_dim_local*sizeof(float), hipMemcpyDeviceToDevice));
+        HIP_CHECK(hipMemcpy(v_cache_b + (size_t)pos_b * kv_dim_local, v_ptr, kv_dim_local*sizeof(float), hipMemcpyDeviceToDevice));
       }
 
       // Copy Q local into contiguous B buffer
@@ -1906,21 +1951,24 @@ static void forward_one_group_batched(Transformer* tr, int group_id,
       size_t kv_block = (size_t)p->seq_len * kv_dim_local;
       const float* k_cache_layer_base = st.d_kv_k + (size_t)l * GROUP_BATCH * kv_block;
       const float* v_cache_layer_base = st.d_kv_v + (size_t)l * GROUP_BATCH * kv_block;
-      const float* mask_row = nullptr;
-      if (st.d_mask) mask_row = st.d_mask + (size_t)pos * p->seq_len;
+      int max_pos = -1;
+      for (int b = 0; b < B; ++b) if (pos_list[b] > max_pos) max_pos = pos_list[b];
+      int smem_len = (max_pos >= 0 ? (max_pos + 2) : 1);
       const float* sinks_l = nullptr;
       if (g_weights[r].d_attn_sinks) sinks_l = g_weights[r].d_attn_sinks + (size_t)l * g_head_shard[r].q_count;
 
-      size_t smem = (size_t)(pos + 2) * sizeof(float);
+      size_t smem = (size_t)smem_len * sizeof(float);
       dim3 grid(hs.q_count, B), block(hd);
       k_attention_step_batched<<<grid, block, smem>>>(
         st.d_q_local,
         k_cache_layer_base,
         v_cache_layer_base,
         st.d_tb_local,
-        pos+1, hd, hs.q_count, hs.kv_count, kv_mul,
+        st.d_pos_list,
+        hd, hs.q_count, hs.kv_count, kv_mul,
         (int)((size_t)p->seq_len * kv_dim_local),
-        mask_row, sinks_l);
+        st.d_mask, p->seq_len,
+        sinks_l);
       HIP_CHECK(hipGetLastError());
     }
 
@@ -2164,8 +2212,8 @@ static long long simple_getp_generate_group_batched(Transformer* transformer, To
   long long tokens_out_total = 0;
   int active = B;
   for (int step = 0; step < steps && active > 0; ++step) {
-    // Run one batched forward step using shared kernels
-    forward_one_group_batched(transformer, group_id, B, token.data(), step, xB, tB, next);
+    // Run one batched forward step using shared kernels with per-sample positions
+    forward_one_group_batched(transformer, group_id, B, token.data(), pos.data(), xB, tB, next);
 
     // Advance each sequence
     for (int b = 0; b < B; ++b) {
@@ -2211,10 +2259,53 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
         inputs[i] = get_str_req_ptr(requests, idx_start + i);
         outputs[i] = get_tok_gen_ptr(requests, idx_start + i);
       }
-      long long n = simple_getp_generate_group_batched(transformer, tokenizer, sampler,
-                                                       group_id, inputs.data(), B,
-                                                       outputs.data(), requests->max_seq_len);
-      total_tokens.fetch_add(n);
+      // Inline merged simple_getp_generate_group_batched
+      int steps = requests->max_seq_len;
+      if (steps == 0 || steps > transformer->config.seq_len)
+        steps = transformer->config.seq_len;
+
+      std::vector<int> num_prompt_tokens(B);
+      std::vector<std::vector<int>> prompt_tokens(B);
+      for (int b = 0; b < B; ++b) {
+        int npt = 0;
+        prompt_tokens[b].resize(strlen(inputs[b]) + 3);
+        encode(tokenizer, inputs[b], -1, -1, prompt_tokens[b].data(), &npt,
+               transformer->config.initial_context_length);
+        num_prompt_tokens[b] = npt;
+        if (npt < 1) { fprintf(stderr, "empty prompt in batch item %d\n", b); exit(EXIT_FAILURE);}    
+      }
+
+      int D = transformer->config.hidden_dim;
+      std::vector<float> xB((size_t)B * D, 0.f);
+      std::vector<float> tB((size_t)B * D, 0.f);
+
+      std::vector<int> token(B);
+      std::vector<int> pos(B, 0);
+      std::vector<int> next(B);
+      std::vector<int> done(B, 0);
+      for (int b = 0; b < B; ++b) token[b] = prompt_tokens[b][0];
+
+      long long tokens_out_total = 0;
+      int active = B;
+      for (int step = 0; step < steps && active > 0; ++step) {
+        forward_one_group_batched(transformer, group_id, B, token.data(), pos.data(), xB, tB, next);
+        for (int b = 0; b < B; ++b) {
+          if (done[b]) continue;
+          pos[b]++;
+          int nt;
+          if (pos[b] < num_prompt_tokens[b]) {
+            nt = prompt_tokens[b][pos[b]];
+          } else {
+            nt = next[b];
+            outputs[b][pos[b] - num_prompt_tokens[b]] = nt;
+            tokens_out_total++;
+          }
+          if (nt == 199999 || nt == 200002) { done[b] = 1; active--; }
+          token[b] = nt;
+        }
+      }
+      for (int b = 0; b < B; ++b) outputs[b][pos[b] - num_prompt_tokens[b] + 1] = -1;
+      total_tokens.fetch_add(tokens_out_total);
     }
   };
 
