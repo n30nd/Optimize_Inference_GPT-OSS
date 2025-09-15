@@ -27,7 +27,7 @@
 
 // Model/data parallel sizing
 #ifndef DP_GROUPS
-#define DP_GROUPS 2
+#define DP_GROUPS 1
 #endif
 #ifndef MP_GROUP_SIZE
 #define MP_GROUP_SIZE 4
