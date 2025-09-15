@@ -1,5 +1,7 @@
 // getp-csrc/getp_run.cpp
-// End-to-end "getp" path with 4x AMD GPUs, TP (Attention) + EP (MoE).
+// End-to-end "getp" path with multi-GPU: DP x (TP+EP).
+// Default targets DP=2 and TP+EP per group=4 (total WORLD_GPUS=8),
+// where each DP group owns 4 GPUs and runs the same per-token inputs.
 // - No external GPU libs. Naive HIP kernels focused on correctness.
 // - Weights:    All stored as BF16 (MLP1 now BF16, previously FP8-like)
 // - Activations: FP32 (GPURunState concept)
@@ -20,9 +22,23 @@
 #include <vector>
 #include <string>
 #include <mutex>
+#include <thread>
+#include <atomic>
 
+// Model/data parallel sizing
+#ifndef DP_GROUPS
+#define DP_GROUPS 2
+#endif
+#ifndef MP_GROUP_SIZE
+#define MP_GROUP_SIZE 4
+#endif
+#ifndef WORLD_GPUS
+#define WORLD_GPUS (DP_GROUPS * MP_GROUP_SIZE)
+#endif
+
+// Compatibility alias for legacy code paths
 #ifndef NUM_GPUS
-#define NUM_GPUS 4
+#define NUM_GPUS MP_GROUP_SIZE
 #endif
 
 #ifndef CHUNK_BYTES_MB
@@ -38,6 +54,16 @@
 } while(0)
 
 static size_t CHUNK_BYTES = (size_t)CHUNK_BYTES_MB * 1024ull * 1024ull;
+
+// Helpers for DP/MP rank mapping
+static inline int group_id_from_rank(int r) { return r / MP_GROUP_SIZE; }
+static inline int mp_rank_from_rank(int r) { return r % MP_GROUP_SIZE; }
+static inline int group_base_rank(int g) { return g * MP_GROUP_SIZE; }
+
+// Default micro-batch size per DP group
+#ifndef GROUP_BATCH
+#define GROUP_BATCH 4
+#endif
 
 // ---------------------------------------------
 // Small helpers: BF16 <-> FP32 and chunked copy
@@ -130,6 +156,38 @@ __global__ void k_matvec_bf16_fp32(const hip_bfloat16* __restrict__ W,
   if (tid == 0) y[row] = sdata[0];
 }
 
+// Batched BF16xFP32 matvec: Y[b,out] = W[out,in] @ X[b,in]
+__global__ void k_matvec_bf16_fp32_batched(const hip_bfloat16* __restrict__ W,
+                                           const float*        __restrict__ X,
+                                           float*              __restrict__ Y,
+                                           int in_features, int out_features) {
+  int row = blockIdx.x;
+  int b   = blockIdx.y;
+  if (row >= out_features) return;
+  const hip_bfloat16* wrow = W + (size_t)row * in_features;
+  const float* x = X + (size_t)b * in_features;
+  float sum = 0.f;
+  for (int j = threadIdx.x; j < in_features; j += blockDim.x) {
+    float w = bf16_to_fp32_bi(wrow[j]);
+    sum += w * x[j];
+  }
+  __shared__ float sdata[256];
+  int tid = threadIdx.x;
+  sdata[tid] = sum; __syncthreads();
+  if (blockDim.x >= 256) { if (tid < 128) sdata[tid] += sdata[tid + 128]; __syncthreads(); }
+  if (blockDim.x >= 128) { if (tid <  64) sdata[tid] += sdata[tid +  64]; __syncthreads(); }
+  if (tid < 32) {
+    volatile float* v = sdata;
+    v[tid] += v[tid + 32];
+    v[tid] += v[tid + 16];
+    v[tid] += v[tid +  8];
+    v[tid] += v[tid +  4];
+    v[tid] += v[tid +  2];
+    v[tid] += v[tid +  1];
+  }
+  if (tid == 0) Y[(size_t)b * out_features + row] = sdata[0];
+}
+
 // RMSNorm for a single vector: y = weight * x / sqrt(mean(x^2)+eps)
 __global__ void k_rmsnorm_vec(const float* __restrict__ x,
                               const float* __restrict__ weight,
@@ -160,6 +218,34 @@ __global__ void k_rmsnorm_vec(const float* __restrict__ x,
   }
 }
 
+// Batched RMSNorm over B vectors
+__global__ void k_rmsnorm_vec_batched(const float* __restrict__ X,
+                                      const float* __restrict__ weight,
+                                      float* __restrict__ Y,
+                                      int size) {
+  int b = blockIdx.y;
+  const float* x = X + (size_t)b * size;
+  float* y = Y + (size_t)b * size;
+  __shared__ float ssum[256];
+  float local = 0.f;
+  for (int i = threadIdx.x; i < size; i += blockDim.x) local += x[i]*x[i];
+  ssum[threadIdx.x] = local; __syncthreads();
+  if (blockDim.x >= 256) { if (threadIdx.x < 128) ssum[threadIdx.x] += ssum[threadIdx.x + 128]; __syncthreads(); }
+  if (blockDim.x >= 128) { if (threadIdx.x <  64) ssum[threadIdx.x] += ssum[threadIdx.x +  64]; __syncthreads(); }
+  if (threadIdx.x < 32) {
+    volatile float* v = ssum;
+    v[threadIdx.x] += v[threadIdx.x + 32];
+    v[threadIdx.x] += v[threadIdx.x + 16];
+    v[threadIdx.x] += v[threadIdx.x +  8];
+    v[threadIdx.x] += v[threadIdx.x +  4];
+    v[threadIdx.x] += v[threadIdx.x +  2];
+    v[threadIdx.x] += v[threadIdx.x +  1];
+  }
+  __syncthreads();
+  float inv = rsqrtf(ssum[0] / (float)size + 1e-5f);
+  for (int i = threadIdx.x; i < size; i += blockDim.x) y[i] = weight[i] * (x[i] * inv);
+}
+
 // Generic FP32 matvec: y[out] = W[out,in] @ x[in]
 __global__ void k_matvec_fp32(const float* __restrict__ W,
                               const float* __restrict__ x,
@@ -187,6 +273,35 @@ __global__ void k_matvec_fp32(const float* __restrict__ W,
   if (tid == 0) y[row] = sdata[0];
 }
 
+// Batched FP32 matvec: Y[b,out] = W[out,in] @ X[b,in]
+__global__ void k_matvec_fp32_batched(const float* __restrict__ W,
+                                      const float* __restrict__ X,
+                                      float* __restrict__ Y,
+                                      int in_n, int out_n) {
+  int row = blockIdx.x;
+  int b   = blockIdx.y;
+  if (row >= out_n) return;
+  const float* wrow = W + (size_t)row * in_n;
+  const float* x = X + (size_t)b * in_n;
+  float sum = 0.f;
+  for (int j = threadIdx.x; j < in_n; j += blockDim.x) sum += wrow[j] * x[j];
+  __shared__ float sdata[256];
+  int tid = threadIdx.x;
+  sdata[tid] = sum; __syncthreads();
+  if (blockDim.x >= 256) { if (tid < 128) sdata[tid] += sdata[tid + 128]; __syncthreads(); }
+  if (blockDim.x >= 128) { if (tid <  64) sdata[tid] += sdata[tid +  64]; __syncthreads(); }
+  if (tid < 32) {
+    volatile float* v = sdata;
+    v[tid] += v[tid + 32];
+    v[tid] += v[tid + 16];
+    v[tid] += v[tid +  8];
+    v[tid] += v[tid +  4];
+    v[tid] += v[tid +  2];
+    v[tid] += v[tid +  1];
+  }
+  if (tid == 0) Y[(size_t)b * out_n + row] = sdata[0];
+}
+
 // In-place softmax for a small vector (naive)
 __global__ void k_softmax_inplace(float* x, int n) {
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
@@ -196,6 +311,12 @@ __global__ void k_softmax_inplace(float* x, int n) {
   for (int i = 0; i < n; ++i) { x[i] = expf(x[i] - m); s += x[i]; }
   float inv = 1.f / s;
   for (int i = 0; i < n; ++i) x[i] *= inv;
+}
+
+__global__ void k_add_bias_batched(float* Y, const float* B, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = blockIdx.y;
+  if (i < n) Y[(size_t)b * n + i] += B[i];
 }
 
 __global__ void k_add_bias(float* y, const float* b, int n) {
@@ -216,6 +337,28 @@ __global__ void k_apply_rotary(float* vec,       // shape: n_heads_local * head_
   if (h >= n_heads_local || i >= head_dim/2) return;
   int half = head_dim/2;
   float* base = vec + h * head_dim;
+  float x1 = base[i];
+  float x2 = base[half + i];
+  float c = cos_vals[i];
+  float s = sin_vals[i];
+  float o1 = x1 * c - x2 * s;
+  float o2 = x2 * c + x1 * s;
+  base[i] = o1;
+  base[half + i] = o2;
+}
+
+// Batched rotary: vec_b shape [B, n_heads_local * head_dim]
+__global__ void k_apply_rotary_batched_strided(float* vec_b,
+                                               const float* cos_vals,
+                                               const float* sin_vals,
+                                               int n_heads_local, int head_dim,
+                                               int sample_stride) {
+  int h = blockIdx.x;
+  int b = blockIdx.y;
+  int i = threadIdx.x;
+  if (h >= n_heads_local || i >= head_dim/2) return;
+  float* base = vec_b + (size_t)b * sample_stride + h * head_dim;
+  int half = head_dim/2;
   float x1 = base[i];
   float x2 = base[half + i];
   float c = cos_vals[i];
@@ -327,6 +470,68 @@ __global__ void k_attention_step(
   tb_local[h*head_dim + d] = acc;
 }
 
+// Batched attention for local heads; B independent sequences processed
+__global__ void k_attention_step_batched(
+    const float* __restrict__ q_local_b,   // [B, n_qh_local*hd]
+    const float* __restrict__ kv_cache_k_b,// [B, pos+1, n_kvh_local*hd]
+    const float* __restrict__ kv_cache_v_b,
+    float*       __restrict__ tb_local_b,  // [B, n_qh_local*hd]
+    int pos_plus1, int head_dim,
+    int n_qh_local, int n_kvh_local, int kv_mul,
+    int kv_block_stride, // stride between samples in kv cache (seq_len * kvdim)
+    const float* __restrict__ mask_row_or_null, // same for all in lock-step
+    const float* __restrict__ attn_sinks_l) {
+  int h = blockIdx.x;
+  int b = blockIdx.y;
+  int d = threadIdx.x;
+  if (h >= n_qh_local || d >= head_dim) return;
+
+  extern __shared__ float smem[];
+  float* logits = smem; // length = pos_plus1 + 1
+  const float* q = q_local_b + (size_t)b * n_qh_local * head_dim + h * head_dim;
+
+  float inv_sqrt_d = rsqrtf((float)head_dim);
+  int kvdim = n_kvh_local * head_dim;
+  const float* k_base = kv_cache_k_b + (size_t)b * kv_block_stride;
+  const float* v_base = kv_cache_v_b + (size_t)b * kv_block_stride;
+
+  for (int t = 0; t < pos_plus1; ++t) {
+    __syncthreads();
+    if (d == 0) {
+      const float* k = k_base + (size_t)t * kvdim + (h/kv_mul) * head_dim;
+      float score = 0.f;
+      for (int i = 0; i < head_dim; ++i) score += q[i]*k[i];
+      score *= inv_sqrt_d;
+      if (mask_row_or_null) score += mask_row_or_null[t];
+      logits[t] = score;
+    }
+    __syncthreads();
+  }
+  if (d == 0) {
+    float sink = (attn_sinks_l) ? attn_sinks_l[h] : 0.f;
+    logits[pos_plus1] = sink;
+  }
+  __syncthreads();
+
+  int len = pos_plus1 + 1;
+  if (d == 0) {
+    float m = logits[0];
+    for (int t = 1; t < len; ++t) m = fmaxf(m, logits[t]);
+    float s = 0.f;
+    for (int t = 0; t < len; ++t) { logits[t] = expf(logits[t] - m); s += logits[t]; }
+    for (int t = 0; t < len; ++t) logits[t] /= s;
+  }
+  __syncthreads();
+
+  float acc = 0.f;
+  for (int t = 0; t < pos_plus1; ++t) {
+    const float* v = v_base + (size_t)t * kvdim + (h/kv_mul) * head_dim;
+    float a = logits[t];
+    acc += a * v[d];
+  }
+  tb_local_b[(size_t)b * n_qh_local * head_dim + h*head_dim + d] = acc;
+}
+
 
 // y_partial[hidden_dim] = W_o_local(hidden_dim, cols_local BF16) @ tb_local(cols_local)
 __global__ void k_matvec_colslice_bf16(const hip_bfloat16* __restrict__ Wcols,
@@ -356,6 +561,38 @@ __global__ void k_matvec_colslice_bf16(const hip_bfloat16* __restrict__ Wcols,
     v[tid] += v[tid +  1];
   }
   if (tid == 0) y[row] = sdata[0];
+}
+
+// Batched colslice matvec for W_o partials
+__global__ void k_matvec_colslice_bf16_batched(const hip_bfloat16* __restrict__ Wcols,
+                                               const float*        __restrict__ Xcols,
+                                               float*              __restrict__ Y,
+                                               int hidden_dim, int cols_local) {
+  int row = blockIdx.x; // hidden dim
+  int b   = blockIdx.y;
+  if (row >= hidden_dim) return;
+  const hip_bfloat16* wrow = Wcols + (size_t)row * cols_local;
+  const float* xcols = Xcols + (size_t)b * cols_local;
+  float sum = 0.f;
+  for (int j = threadIdx.x; j < cols_local; j += blockDim.x) {
+    float w = bf16_to_fp32_bi(wrow[j]);
+    sum += w * xcols[j];
+  }
+  __shared__ float sdata[256];
+  int tid = threadIdx.x;
+  sdata[tid] = sum; __syncthreads();
+  if (blockDim.x >= 256) { if (tid < 128) sdata[tid] += sdata[tid + 128]; __syncthreads(); }
+  if (blockDim.x >= 128) { if (tid <  64) sdata[tid] += sdata[tid +  64]; __syncthreads(); }
+  if (tid < 32) {
+    volatile float* v = sdata;
+    v[tid] += v[tid + 32];
+    v[tid] += v[tid + 16];
+    v[tid] += v[tid +  8];
+    v[tid] += v[tid +  4];
+    v[tid] += v[tid +  2];
+    v[tid] += v[tid +  1];
+  }
+  if (tid == 0) Y[(size_t)b * hidden_dim + row] = sdata[0];
 }
 
 // FP8-like (uint8 + per-row scale) matvec: out_rows x in_cols
@@ -396,17 +633,17 @@ struct HeadShard {
   int q_start, q_count;
   int kv_start, kv_count;
 };
-static HeadShard compute_head_shard(const Config* p, int rank) {
+static HeadShard compute_head_shard(const Config* p, int local_rank, int world_in_group) {
   HeadShard hs{};
-  split_even(p->n_attn_heads, rank, NUM_GPUS, hs.q_start, hs.q_count);
-  split_even(p->n_kv_heads,  rank, NUM_GPUS, hs.kv_start, hs.kv_count);
+  split_even(p->n_attn_heads, local_rank, world_in_group, hs.q_start, hs.q_count);
+  split_even(p->n_kv_heads,  local_rank, world_in_group, hs.kv_start, hs.kv_count);
   return hs;
 }
 
 struct ExpertShard { int e_start, e_count; };
-static ExpertShard compute_expert_shard(const Config* p, int rank) {
+static ExpertShard compute_expert_shard(const Config* p, int local_rank, int world_in_group) {
   ExpertShard es{};
-  split_even(p->n_experts, rank, NUM_GPUS, es.e_start, es.e_count);
+  split_even(p->n_experts, local_rank, world_in_group, es.e_start, es.e_count);
   return es;
 }
 
@@ -476,15 +713,15 @@ struct GPURunState {
   int* d_next_token = nullptr; // single int result for greedy argmax
 };
 
-static GPUTransformerWeights g_weights[NUM_GPUS];
-static GPURunState g_state[NUM_GPUS];
-static HeadShard  g_head_shard[NUM_GPUS];
-static ExpertShard g_expert_shard[NUM_GPUS];
-static int g_world = NUM_GPUS;
+static GPUTransformerWeights g_weights[WORLD_GPUS];
+static GPURunState g_state[WORLD_GPUS];
+static HeadShard  g_head_shard[WORLD_GPUS];
+static ExpertShard g_expert_shard[WORLD_GPUS];
+static int g_world = WORLD_GPUS;
 static std::mutex g_reduce_mutex;
 
-static float* h_tb2_partials[NUM_GPUS] = {nullptr, nullptr, nullptr, nullptr};
-static float* h_tb2_sum = nullptr;
+static float* h_tb2_partials[WORLD_GPUS] = {};
+static float* h_tb2_sum = nullptr; // legacy; not used in group-forward path
 
 // ---------------------------------------------
 // Packing helpers
@@ -668,8 +905,8 @@ static void gpu_copy_weights(Transformer* transformer, int r) {
   memcpyHtoD_chunked(devw.d_rms_out_w,  transformer->weights.rms_out_w,  D * sizeof(float));
 
 
-  // Copy final classifier (FP32) on GPU0 only
-  if (r == 0) {
+  // Copy final classifier (FP32) on group root only (mp_rank==0)
+  if (mp_rank_from_rank(r) == 0) {
     int V = p->vocab_size;
     printf("[GPU%d] Copying OUT weights (vocab x hidden) FP32...\n", r);
     HIP_CHECK(hipMalloc(&devw.d_w_out, (size_t)V * (size_t)D * sizeof(float)));
@@ -774,25 +1011,26 @@ static void gpu_malloc_run_state(Transformer* transformer, int r) {
   // Allocate KV cache
   printf("[GPU%d] Allocating KV cache...\n", r);
   int kv_dim_local = hs.kv_count * hd;
-  size_t kv_cache_size = (size_t)L * seq * kv_dim_local * sizeof(float);
-  printf("[GPU%d]   - KV cache (K): %.2f MB\n", r, kv_cache_size / (1024.0*1024.0));
-  printf("[GPU%d]   - KV cache (V): %.2f MB\n", r, kv_cache_size / (1024.0*1024.0));
-  HIP_CHECK(hipMalloc(&st.d_kv_k, kv_cache_size));
-  HIP_CHECK(hipMalloc(&st.d_kv_v, kv_cache_size));
+  size_t kv_cache_size_one = (size_t)L * seq * kv_dim_local * sizeof(float);
+  size_t kv_cache_size_all = (size_t)GROUP_BATCH * kv_cache_size_one;
+  printf("[GPU%d]   - KV cache (K): %.2f MB x B=%d\n", r, kv_cache_size_one / (1024.0*1024.0), GROUP_BATCH);
+  printf("[GPU%d]   - KV cache (V): %.2f MB x B=%d\n", r, kv_cache_size_one / (1024.0*1024.0), GROUP_BATCH);
+  HIP_CHECK(hipMalloc(&st.d_kv_k, kv_cache_size_all));
+  HIP_CHECK(hipMalloc(&st.d_kv_v, kv_cache_size_all));
 
   // Allocate working buffers
   printf("[GPU%d] Allocating working buffers...\n", r);
-  HIP_CHECK(hipMalloc(&st.d_x, D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_t, D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_qkv, devw.rows_per_layer_local * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_q_local, hs.q_count * hd * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_tb_local, hs.q_count * hd * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_tb2_partial, D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_x, (size_t)GROUP_BATCH * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_t, (size_t)GROUP_BATCH * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_qkv, (size_t)GROUP_BATCH * devw.rows_per_layer_local * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_q_local, (size_t)GROUP_BATCH * hs.q_count * hd * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_tb_local, (size_t)GROUP_BATCH * hs.q_count * hd * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_tb2_partial, (size_t)GROUP_BATCH * D * sizeof(float)));
 
   const int I = p->intermediate_dim;
-  HIP_CHECK(hipMalloc(&st.d_mlp1_out, (size_t)(2*I) * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_gate_up,  I * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_ffn_out,  D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_mlp1_out, (size_t)GROUP_BATCH * (size_t)(2*I) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_gate_up,  (size_t)GROUP_BATCH * I * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_ffn_out,  (size_t)GROUP_BATCH * D * sizeof(float)));
 
   // Rotary buffers
   printf("[GPU%d] Allocating rotary buffers...\n", r);
@@ -810,12 +1048,12 @@ static void gpu_malloc_run_state(Transformer* transformer, int r) {
     printf("[GPU%d] ✓ Attention mask loaded\n", r);
   }
 
-  // Router temporaries and logits buffer (GPU0)
-  HIP_CHECK(hipMalloc(&st.d_router, (size_t)p->n_experts * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_topk,   (size_t)p->experts_per_token * sizeof(float)));
-  if (r == 0) {
-    HIP_CHECK(hipMalloc(&st.d_logits, (size_t)p->vocab_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&st.d_next_token, sizeof(int)));
+  // Router temporaries and logits buffer (group root)
+  HIP_CHECK(hipMalloc(&st.d_router, (size_t)GROUP_BATCH * (size_t)p->n_experts * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_topk,   (size_t)GROUP_BATCH * (size_t)p->experts_per_token * sizeof(float)));
+  if (mp_rank_from_rank(r) == 0) {
+    HIP_CHECK(hipMalloc(&st.d_logits, (size_t)GROUP_BATCH * (size_t)p->vocab_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&st.d_next_token, (size_t)GROUP_BATCH * sizeof(int)));
   }
 }
 
@@ -850,6 +1088,36 @@ __global__ void k_argmax(const float* __restrict__ logits, int vocab, int* __res
   if (tid == 0) *out_idx = sidx[0];
 }
 
+// Batched argmax: one block per sample (assumes blockDim.x>=1024 for V)
+__global__ void k_argmax_batched(const float* __restrict__ logits, int batch, int vocab, int* __restrict__ out_idx) {
+  int b = blockIdx.x;
+  extern __shared__ unsigned char karg_smem[];
+  float* svals = reinterpret_cast<float*>(karg_smem);
+  int* sidx = reinterpret_cast<int*>(svals + blockDim.x);
+  int tid = threadIdx.x;
+  float best_v = -INFINITY;
+  int best_i = 0;
+  const float* l = logits + (size_t)b * vocab;
+  for (int i = tid; i < vocab; i += blockDim.x) {
+    float v = l[i];
+    if (v > best_v) { best_v = v; best_i = i; }
+  }
+  svals[tid] = best_v;
+  sidx[tid] = best_i;
+  __syncthreads();
+  for (int offset = blockDim.x/2; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      float v_other = svals[tid + offset];
+      if (v_other > svals[tid] || (v_other == svals[tid] && sidx[tid + offset] < sidx[tid])) {
+        svals[tid] = v_other;
+        sidx[tid] = sidx[tid + offset];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) out_idx[b] = sidx[0];
+}
+
 // ---------------------------------------------
 // Warm-up
 // ---------------------------------------------
@@ -862,28 +1130,33 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
          p->n_layers, p->hidden_dim, p->head_dim, p->n_experts);
   fflush(stdout);
 
-  if (NUM_GPUS < 4) {
-    fprintf(stderr, "This implementation expects NUM_GPUS=4.\n");
+  int device_count = 0;
+  HIP_CHECK(hipGetDeviceCount(&device_count));
+  if (device_count < WORLD_GPUS) {
+    fprintf(stderr, "This implementation expects at least %d GPUs, found %d.\n", WORLD_GPUS, device_count);
     exit(EXIT_FAILURE);
   }
 
   // Print initial memory state for all GPUs
   printf("[WARMUP] Initial GPU memory state:\n");
-  for (int r = 0; r < NUM_GPUS; ++r) {
+  for (int r = 0; r < WORLD_GPUS; ++r) {
     print_memory_usage(r, "Initial");
   }
 
-  for (int r = 0; r < NUM_GPUS; ++r) {
-    g_head_shard[r] = compute_head_shard(p, r);
-    g_expert_shard[r] = compute_expert_shard(p, r);
-    printf("[GPU%d] Head shard: Q[%d:%d], KV[%d:%d] | Expert shard: [%d:%d]\n",
-           r, g_head_shard[r].q_start, g_head_shard[r].q_start + g_head_shard[r].q_count - 1,
+  for (int r = 0; r < WORLD_GPUS; ++r) {
+    int mp_rank = mp_rank_from_rank(r);
+    g_head_shard[r] = compute_head_shard(p, mp_rank, MP_GROUP_SIZE);
+    g_expert_shard[r] = compute_expert_shard(p, mp_rank, MP_GROUP_SIZE);
+    printf("[GPU%d / G%d.R%d] Head shard: Q[%d:%d], KV[%d:%d] | Expert shard: [%d:%d]\n",
+           r, group_id_from_rank(r), mp_rank,
+           g_head_shard[r].q_start, g_head_shard[r].q_start + g_head_shard[r].q_count - 1,
            g_head_shard[r].kv_start, g_head_shard[r].kv_start + g_head_shard[r].kv_count - 1,
            g_expert_shard[r].e_start, g_expert_shard[r].e_start + g_expert_shard[r].e_count - 1);
   }
 
+  // Legacy buffer kept allocated for compatibility (not used in group path)
   h_tb2_sum = (float*)malloc(p->hidden_dim * sizeof(float));
-  for (int r = 0; r < NUM_GPUS; ++r) {
+  for (int r = 0; r < WORLD_GPUS; ++r) {
     h_tb2_partials[r] = (float*)malloc(p->hidden_dim * sizeof(float));
   }
 
@@ -895,7 +1168,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   printf("[WARMUP] Starting per-GPU weight loading...\n");
   fflush(stdout);
 
-  for (int r = 0; r < NUM_GPUS; ++r) {
+  for (int r = 0; r < WORLD_GPUS; ++r) {
     printf("\n[GPU%d] ========== Starting weight loading ==========\n", r);
     HIP_CHECK(hipSetDevice(r));
     print_memory_usage(r, "Before allocation");
@@ -906,7 +1179,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     fflush(stdout);
   }
 
-  printf("[warm_up] Sharded weights loaded across %d GPUs (chunk %zu MB)\n", NUM_GPUS, CHUNK_BYTES/1024/1024);
+  printf("[warm_up] Sharded weights loaded across %d GPUs (chunk %zu MB)\n", WORLD_GPUS, CHUNK_BYTES/1024/1024);
   fflush(stdout);
 }
 
@@ -914,7 +1187,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 // Finish
 // ---------------------------------------------
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
-  for (int r = 0; r < NUM_GPUS; ++r) {
+  for (int r = 0; r < WORLD_GPUS; ++r) {
     HIP_CHECK(hipSetDevice(r));
     auto& devw = g_weights[r];
     auto& st   = g_state[r];
@@ -957,7 +1230,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     safeHipFree(st.d_logits);
 
   }
-  for (int r = 0; r < NUM_GPUS; ++r) { free(h_tb2_partials[r]); h_tb2_partials[r] = nullptr; }
+  for (int r = 0; r < WORLD_GPUS; ++r) { free(h_tb2_partials[r]); h_tb2_partials[r] = nullptr; }
   free(h_tb2_sum); h_tb2_sum = nullptr;
 }
 
@@ -1245,10 +1518,564 @@ static int forward_one(Transformer* tr, Sampler* sampler, int token, int pos,
 }
 
 // ---------------------------------------------
+// One-token forward for a specific DP group (size = MP_GROUP_SIZE)
+// ---------------------------------------------
+static int forward_one_group(Transformer* tr, Sampler* sampler, int group_id,
+                             int token, int pos,
+                             std::vector<float>& x,
+                             std::vector<float>& t) {
+  Config* p = &tr->config;
+  TransformerWeights* w = &tr->weights;
+
+  const int L  = p->n_layers;
+  const int D  = p->hidden_dim;
+  const int hd = p->head_dim;
+  const int kv_mul = p->n_attn_heads / p->n_kv_heads;
+  const int I  = p->intermediate_dim;
+  const int E  = p->n_experts;
+
+  const int base = group_base_rank(group_id);
+  const int root = base; // mp_rank==0 device in group
+
+  // Embedding on host
+  float* emb_row = w->token_embedding_table + token * D;
+  std::copy(emb_row, emb_row + D, x.begin());
+
+  // Per-layer
+  for (int l = 0; l < L; ++l) {
+    // 1) RMSNorm: compute t on each GPU (same x)
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      auto& devw = g_weights[r];
+      auto& st   = g_state[r];
+      HIP_CHECK(hipMemcpy(st.d_x, x.data(), D*sizeof(float), hipMemcpyHostToDevice));
+      const float* w_attn = devw.d_rms_attn_w + (size_t)l * D;
+      k_rmsnorm_vec<<<1,256>>>(st.d_x, w_attn, st.d_t, D);
+      HIP_CHECK(hipGetLastError());
+    }
+
+    // 2) QKV matvec + bias per shard
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      auto& devw = g_weights[r];
+      auto& st   = g_state[r];
+      int rows = devw.rows_per_layer_local;
+      const hip_bfloat16* W = devw.d_w_qkv_rows + (size_t)l * devw.w_qkv_rows_stride;
+      float* Y = st.d_qkv;
+      dim3 grid(rows), block(256);
+      k_matvec_bf16_fp32<<<grid, block>>>(W, st.d_t, Y, D, rows);
+      HIP_CHECK(hipGetLastError());
+      float* b = devw.d_b_qkv_rows + (size_t)l * rows;
+      k_add_bias<<<(rows+255)/256, 256>>>(Y, b, rows);
+      HIP_CHECK(hipGetLastError());
+    }
+
+    // 3) Apply RoPE to Q/K, update KV cache, extract local Q
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      auto& hs = g_head_shard[r];
+      auto& devw = g_weights[r];
+      auto& st = g_state[r];
+
+      int q_rows = hs.q_count * hd;
+      int kv_rows = hs.kv_count * hd;
+      float* q_ptr = st.d_qkv;
+      float* k_ptr = st.d_qkv + q_rows;
+      float* v_ptr = st.d_qkv + q_rows + kv_rows;
+
+      // RoPE cos/sin for position
+      dim3 grid_cs(((p->head_dim/2) + 255)/256), block_cs(256);
+      k_compute_cos_sin<<<grid_cs, block_cs>>>(
+          pos,
+          p->rope_theta,
+          p->head_dim,
+          p->rope_scaling_factor,
+          p->initial_context_length,
+          32.0f, 1.0f,
+          st.d_cos,
+          st.d_sin);
+      HIP_CHECK(hipGetLastError());
+
+      dim3 grid_q(hs.q_count), block_q(hd/2);
+      k_apply_rotary<<<grid_q, block_q>>>(q_ptr, st.d_cos, st.d_sin, hs.q_count, hd);
+      HIP_CHECK(hipGetLastError());
+
+      dim3 grid_k(hs.kv_count), block_k(hd/2);
+      k_apply_rotary<<<grid_k, block_k>>>(k_ptr, st.d_cos, st.d_sin, hs.kv_count, hd);
+      HIP_CHECK(hipGetLastError());
+
+      // Save K/V to cache after rotation
+      int kv_dim_local = hs.kv_count * hd;
+      float* k_cache_l = st.d_kv_k + (size_t)l * p->seq_len * kv_dim_local;
+      float* v_cache_l = st.d_kv_v + (size_t)l * p->seq_len * kv_dim_local;
+      HIP_CHECK(hipMemcpy(k_cache_l + (size_t)pos*kv_dim_local, k_ptr, kv_dim_local*sizeof(float), hipMemcpyDeviceToDevice));
+      HIP_CHECK(hipMemcpy(v_cache_l + (size_t)pos*kv_dim_local, v_ptr, kv_dim_local*sizeof(float), hipMemcpyDeviceToDevice));
+
+      HIP_CHECK(hipMemcpy(st.d_q_local, q_ptr, q_rows*sizeof(float), hipMemcpyDeviceToDevice));
+    }
+
+    // 4) Attention over cache, produce tb_local on each shard
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      auto& hs = g_head_shard[r];
+      auto& devw = g_weights[r];
+      auto& st = g_state[r];
+      int kv_dim_local = hs.kv_count * hd;
+      float* k_cache_l = st.d_kv_k + (size_t)l * p->seq_len * kv_dim_local;
+      float* v_cache_l = st.d_kv_v + (size_t)l * p->seq_len * kv_dim_local;
+      const float* mask_row = nullptr;
+      if (st.d_mask) mask_row = st.d_mask + (size_t)pos * p->seq_len;
+      const float* sinks_l = nullptr;
+      if (g_weights[r].d_attn_sinks) {
+        sinks_l = g_weights[r].d_attn_sinks + (size_t)l * g_head_shard[r].q_count;
+      }
+      size_t smem = (size_t)(pos + 2) * sizeof(float);
+      dim3 grid(hs.q_count), block(hd);
+      k_attention_step<<<grid, block, smem>>>(
+          st.d_q_local, k_cache_l, v_cache_l, st.d_tb_local,
+          pos+1, hd, hs.q_count, hs.kv_count, kv_mul,
+          mask_row, sinks_l);
+      HIP_CHECK(hipGetLastError());
+    }
+
+    // 5) W_o partial matvec on each shard
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      auto& devw = g_weights[r];
+      auto& st = g_state[r];
+      const hip_bfloat16* Wcols = devw.d_w_o_cols + (size_t)l * (size_t)D * devw.cols_per_layer_local;
+      dim3 grid(D), block(256);
+      k_matvec_colslice_bf16<<<grid, block>>>(Wcols, st.d_tb_local, st.d_tb2_partial, D, devw.cols_per_layer_local);
+      HIP_CHECK(hipGetLastError());
+    }
+
+    // 6) Host-batched all-reduce across group shards (sum partials)
+    std::vector<float> tb2_sum_local(D, 0.f);
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      memcpyDtoH_chunked(h_tb2_partials[r], g_state[r].d_tb2_partial, D*sizeof(float));
+    }
+    for (int i = 0; i < D; ++i) {
+      double s = 0.0;
+      for (int r = base; r < base + MP_GROUP_SIZE; ++r) s += h_tb2_partials[r][i];
+      tb2_sum_local[i] = (float)s;
+    }
+    const float* b_o = tr->weights.b_o + 1ll*l*D;
+    for (int i = 0; i < D; ++i) x[i] += (tb2_sum_local[i] + b_o[i]);
+
+    // 7) RMSNorm for FFN on group root; pull t to host
+    {
+      HIP_CHECK(hipSetDevice(root));
+      auto& devwr = g_weights[root];
+      auto& str   = g_state[root];
+      HIP_CHECK(hipMemcpy(str.d_x, x.data(), D*sizeof(float), hipMemcpyHostToDevice));
+      const float* w_ffn = devwr.d_rms_ffn_w + (size_t)l * D;
+      k_rmsnorm_vec<<<1,256>>>(str.d_x, w_ffn, str.d_t, D);
+      HIP_CHECK(hipGetLastError());
+      HIP_CHECK(hipMemcpy(t.data(), str.d_t, D*sizeof(float), hipMemcpyDeviceToHost));
+    }
+
+    // 8) Router matvec on group root (CPU top-k afterwards)
+    std::vector<float> router(E);
+    {
+      HIP_CHECK(hipSetDevice(root));
+      auto& devwr = g_weights[root];
+      auto& str   = g_state[root];
+      const float* Wrouter_l = devwr.d_w_router + (size_t)l * (size_t)E * D;
+      k_matvec_fp32<<<E, 256>>>(Wrouter_l, str.d_t, str.d_router, D, E);
+      HIP_CHECK(hipGetLastError());
+      const float* b_router_l = devwr.d_b_router + (size_t)l * E;
+      k_add_bias<<<(E+255)/256, 256>>>(str.d_router, b_router_l, E);
+      HIP_CHECK(hipGetLastError());
+      memcpyDtoH_chunked(router.data(), str.d_router, E*sizeof(float));
+    }
+
+    int K = tr->config.experts_per_token;
+    std::vector<int> idx(E); for (int i=0;i<E;++i) idx[i]=i;
+    std::partial_sort(idx.begin(), idx.begin()+K, idx.end(),
+                      [&](int a,int b){return router[a]>router[b];});
+    std::vector<int> topk_idx(K);
+    std::vector<float> topk_val(K);
+    for (int i=0;i<K;++i){ topk_idx[i]=idx[i]; topk_val[i]=router[idx[i]]; }
+    {
+      float maxv = -INFINITY;
+      for (float v: topk_val) if (v > maxv) maxv = v;
+      float sum = 0.f;
+      for (float &v: topk_val) { v = expf(v - maxv); sum += v; }
+      float inv = 1.f / sum;
+      for (float &v: topk_val) v *= inv;
+    }
+
+    std::vector<float> e_agg(D, 0.f);
+    for (int ki = 0; ki < K; ++ki) {
+      int e_glob = topk_idx[ki];
+      float ew = topk_val[ki];
+      int owner = -1;
+      // find owner only within this group
+      for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+        if (e_glob >= g_expert_shard[r].e_start &&
+            e_glob <  g_expert_shard[r].e_start + g_expert_shard[r].e_count) { owner = r; break; }
+      }
+      if (owner < 0) { fprintf(stderr,"EP owner not found in group %d\n", group_id); exit(EXIT_FAILURE); }
+      int e_local = e_glob - g_expert_shard[owner].e_start;
+
+      HIP_CHECK(hipSetDevice(owner));
+      auto& devw = g_weights[owner];
+      auto& st   = g_state[owner];
+      HIP_CHECK(hipMemcpy(st.d_t, t.data(), D*sizeof(float), hipMemcpyHostToDevice));
+
+      const hip_bfloat16* W1 = devw.d_w_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I) * D;
+      const float*        B1 = devw.d_b_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I);
+
+      dim3 g1((2*I), 1, 1), b1(256, 1, 1);
+      k_matvec_bf16_fp32<<<g1, b1>>>(W1, st.d_t, st.d_mlp1_out, D, 2*I);
+      HIP_CHECK(hipGetLastError());
+      k_add_bias<<<((2*I)+255)/256, 256>>>(st.d_mlp1_out, B1, 2*I);
+      HIP_CHECK(hipGetLastError());
+
+      std::vector<float> h_mlp1(2*I);
+      HIP_CHECK(hipMemcpy(h_mlp1.data(), st.d_mlp1_out, (size_t)2*I*sizeof(float), hipMemcpyDeviceToHost));
+      std::vector<float> h_gate_up(I);
+      const float clampU = tr->config.swiglu_limit;
+      const float clampL = -tr->config.swiglu_limit;
+      for (int i = 0; i < I; ++i) {
+        float g = h_mlp1[2*i+0];
+        float u = h_mlp1[2*i+1];
+        g = fminf(g, clampU);
+        u = fminf(fmaxf(u, clampL), clampU);
+        h_gate_up[i] = silu(g) * (u + 1.0f);
+      }
+      HIP_CHECK(hipMemcpy(st.d_gate_up, h_gate_up.data(), I*sizeof(float), hipMemcpyHostToDevice));
+
+      const hip_bfloat16* W2 = devw.d_w_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D * I;
+      const float*        B2 = devw.d_b_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D;
+      dim3 g2(D, 1, 1), b2d(256, 1, 1);
+      k_matvec_bf16_fp32<<<g2, b2d>>>(W2, st.d_gate_up, st.d_ffn_out, I, D);
+      HIP_CHECK(hipGetLastError());
+      k_add_bias<<<(D+255)/256, 256>>>(st.d_ffn_out, B2, D);
+      HIP_CHECK(hipGetLastError());
+
+      std::vector<float> h_ffn(D);
+      memcpyDtoH_chunked(h_ffn.data(), st.d_ffn_out, D*sizeof(float));
+      for (int i = 0; i < D; ++i) e_agg[i] += ew * h_ffn[i];
+    }
+
+    for (int i = 0; i < D; ++i) x[i] += e_agg[i];
+  }
+
+  // Final RMSNorm + logits on group root
+  HIP_CHECK(hipSetDevice(root));
+  {
+    auto& devwr = g_weights[root];
+    auto& str   = g_state[root];
+    HIP_CHECK(hipMemcpy(str.d_x, x.data(), D*sizeof(float), hipMemcpyHostToDevice));
+    k_rmsnorm_vec<<<1,256>>>(str.d_x, devwr.d_rms_out_w, str.d_x, D);
+    HIP_CHECK(hipGetLastError());
+  }
+
+  int next_token;
+  {
+    HIP_CHECK(hipSetDevice(root));
+    auto& devwr = g_weights[root];
+    auto& str   = g_state[root];
+    int Dv = tr->config.hidden_dim;
+    int V  = tr->config.vocab_size;
+    HIP_CHECK(hipMemcpy(str.d_t, str.d_x, (size_t)Dv * sizeof(float), hipMemcpyDeviceToDevice));
+    dim3 gL(V), bL(256);
+    k_matvec_fp32<<<gL, bL>>>(devwr.d_w_out, str.d_t, str.d_logits, Dv, V);
+    HIP_CHECK(hipGetLastError());
+    const size_t shmem_bytes = (size_t)1024 * (sizeof(float) + sizeof(int));
+    k_argmax<<<1, 1024, shmem_bytes>>>(str.d_logits, V, str.d_next_token);
+    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipMemcpy(&next_token, str.d_next_token, sizeof(int), hipMemcpyDeviceToHost));
+  }
+
+  return next_token;
+}
+
+// ---------------------------------------------
+// One-token forward for a DP group with batch size B (lock-step)
+// ---------------------------------------------
+static void forward_one_group_batched(Transformer* tr, int group_id,
+                                      int B,
+                                      const int* tokens, int pos,
+                                      std::vector<float>& xB, // size B*D
+                                      std::vector<float>& tB  // size B*D
+                                      , std::vector<int>& next_tokens_out) {
+  Config* p = &tr->config;
+  const int L  = p->n_layers;
+  const int D  = p->hidden_dim;
+  const int hd = p->head_dim;
+  const int kv_mul = p->n_attn_heads / p->n_kv_heads;
+  const int I  = p->intermediate_dim;
+  const int E  = p->n_experts;
+
+  const int base = group_base_rank(group_id);
+  const int root = base; // mp_rank==0 device in group
+
+  // Prepare embeddings on host xB (B*D)
+  for (int b = 0; b < B; ++b) {
+    const float* emb_row = tr->weights.token_embedding_table + (size_t)tokens[b] * D;
+    std::copy(emb_row, emb_row + D, xB.begin() + (size_t)b * D);
+  }
+
+  // Layers
+  for (int l = 0; l < L; ++l) {
+    // 1) RMSNorm tB = rms(xB)
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      auto& devw = g_weights[r];
+      auto& st   = g_state[r];
+      HIP_CHECK(hipMemcpy(st.d_x, xB.data(), (size_t)B*D*sizeof(float), hipMemcpyHostToDevice));
+      const float* w_attn = devw.d_rms_attn_w + (size_t)l * D;
+      dim3 grid(1, B), block(256);
+      k_rmsnorm_vec_batched<<<grid, block>>>(st.d_x, w_attn, st.d_t, D);
+      HIP_CHECK(hipGetLastError());
+    }
+
+    // 2) QKV matvec + bias per shard (batched)
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      auto& devw = g_weights[r];
+      auto& st   = g_state[r];
+      int rows = devw.rows_per_layer_local;
+      const hip_bfloat16* W = devw.d_w_qkv_rows + (size_t)l * devw.w_qkv_rows_stride;
+      dim3 grid(rows, B), block(256);
+      k_matvec_bf16_fp32_batched<<<grid, block>>>(W, st.d_t, st.d_qkv, D, rows);
+      HIP_CHECK(hipGetLastError());
+      float* b = devw.d_b_qkv_rows + (size_t)l * rows;
+      dim3 gridb((rows+255)/256, B);
+      k_add_bias_batched<<<gridb, 256>>>(st.d_qkv, b, rows);
+      HIP_CHECK(hipGetLastError());
+    }
+
+    // 3) RoPE and KV cache update, extract local Q (batched)
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      auto& hs = g_head_shard[r];
+      auto& st = g_state[r];
+      int q_rows = hs.q_count * hd;
+      int kv_rows = hs.kv_count * hd;
+
+      // compute cos/sin once per device
+      dim3 grid_cs(((p->head_dim/2) + 255)/256), block_cs(256);
+      k_compute_cos_sin<<<grid_cs, block_cs>>>(pos, p->rope_theta, p->head_dim,
+          p->rope_scaling_factor, p->initial_context_length, 32.0f, 1.0f,
+          st.d_cos, st.d_sin);
+      HIP_CHECK(hipGetLastError());
+
+      // Apply to Q and K in batched buffers
+      float* q_ptr_b = st.d_qkv; // samples separated by sample_stride = (q_rows + 2*kv_rows)
+      float* k_ptr_b = st.d_qkv + q_rows;
+      int sample_stride = q_rows + 2*kv_rows;
+      dim3 grid_q(hs.q_count, B), block_q(hd/2);
+      k_apply_rotary_batched_strided<<<grid_q, block_q>>>(q_ptr_b, st.d_cos, st.d_sin, hs.q_count, hd, sample_stride);
+      HIP_CHECK(hipGetLastError());
+      dim3 grid_k(hs.kv_count, B), block_k(hd/2);
+      k_apply_rotary_batched_strided<<<grid_k, block_k>>>(k_ptr_b, st.d_cos, st.d_sin, hs.kv_count, hd, sample_stride);
+      HIP_CHECK(hipGetLastError());
+
+      // Save K/V to cache for each b
+      int kv_dim_local = hs.kv_count * hd;
+      size_t kv_block = (size_t)p->seq_len * kv_dim_local;
+      float* k_cache_layer_base = st.d_kv_k + (size_t)l * GROUP_BATCH * kv_block;
+      float* v_cache_layer_base = st.d_kv_v + (size_t)l * GROUP_BATCH * kv_block;
+      for (int b = 0; b < B; ++b) {
+        const float* k_ptr = st.d_qkv + (size_t)b * (q_rows + 2*kv_rows) + q_rows;
+        const float* v_ptr = st.d_qkv + (size_t)b * (q_rows + 2*kv_rows) + q_rows + kv_rows;
+        float* k_cache_b = k_cache_layer_base + (size_t)b * kv_block;
+        float* v_cache_b = v_cache_layer_base + (size_t)b * kv_block;
+        HIP_CHECK(hipMemcpy(k_cache_b + (size_t)pos * kv_dim_local, k_ptr, kv_dim_local*sizeof(float), hipMemcpyDeviceToDevice));
+        HIP_CHECK(hipMemcpy(v_cache_b + (size_t)pos * kv_dim_local, v_ptr, kv_dim_local*sizeof(float), hipMemcpyDeviceToDevice));
+      }
+
+      // Copy Q local into contiguous B buffer
+      for (int b = 0; b < B; ++b) {
+        const float* q_ptr = st.d_qkv + (size_t)b * (q_rows + 2*kv_rows);
+        float* qdst = st.d_q_local + (size_t)b * q_rows;
+        HIP_CHECK(hipMemcpy(qdst, q_ptr, q_rows*sizeof(float), hipMemcpyDeviceToDevice));
+      }
+    }
+
+    // 4) Attention (batched) -> tb_local_b
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      auto& hs = g_head_shard[r];
+      auto& st = g_state[r];
+      int kv_dim_local = hs.kv_count * hd;
+      size_t kv_block = (size_t)p->seq_len * kv_dim_local;
+      const float* k_cache_layer_base = st.d_kv_k + (size_t)l * GROUP_BATCH * kv_block;
+      const float* v_cache_layer_base = st.d_kv_v + (size_t)l * GROUP_BATCH * kv_block;
+      const float* mask_row = nullptr;
+      if (st.d_mask) mask_row = st.d_mask + (size_t)pos * p->seq_len;
+      const float* sinks_l = nullptr;
+      if (g_weights[r].d_attn_sinks) sinks_l = g_weights[r].d_attn_sinks + (size_t)l * g_head_shard[r].q_count;
+
+      size_t smem = (size_t)(pos + 2) * sizeof(float);
+      dim3 grid(hs.q_count, B), block(hd);
+      k_attention_step_batched<<<grid, block, smem>>>(
+        st.d_q_local,
+        k_cache_layer_base,
+        v_cache_layer_base,
+        st.d_tb_local,
+        pos+1, hd, hs.q_count, hs.kv_count, kv_mul,
+        (int)((size_t)p->seq_len * kv_dim_local),
+        mask_row, sinks_l);
+      HIP_CHECK(hipGetLastError());
+    }
+
+    // 5) W_o matvec (batched) per shard
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      auto& devw = g_weights[r];
+      auto& st   = g_state[r];
+      const hip_bfloat16* Wcols = devw.d_w_o_cols + (size_t)l * (size_t)D * devw.cols_per_layer_local;
+      dim3 grid(D, B), block(256);
+      k_matvec_colslice_bf16_batched<<<grid, block>>>(Wcols, st.d_tb_local, st.d_tb2_partial, D, devw.cols_per_layer_local);
+      HIP_CHECK(hipGetLastError());
+    }
+
+    // 6) Host reduce across shards per batch
+    std::vector<float> tb2_sum_local((size_t)B * D, 0.f);
+    for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+      HIP_CHECK(hipSetDevice(r));
+      std::vector<float> tmp((size_t)B * D);
+      memcpyDtoH_chunked(tmp.data(), g_state[r].d_tb2_partial, (size_t)B * D * sizeof(float));
+      for (int b = 0; b < B; ++b) {
+        float* dst = tb2_sum_local.data() + (size_t)b * D;
+        float* src = tmp.data() + (size_t)b * D;
+        for (int i = 0; i < D; ++i) dst[i] += src[i];
+      }
+    }
+    const float* b_o = tr->weights.b_o + 1ll*l*D;
+    for (int b = 0; b < B; ++b) {
+      float* xb = xB.data() + (size_t)b * D;
+      float* tbs = tb2_sum_local.data() + (size_t)b * D;
+      for (int i = 0; i < D; ++i) xb[i] += (tbs[i] + b_o[i]);
+    }
+
+    // 7) FFN RMSNorm on root (batched); copy tB back
+    {
+      HIP_CHECK(hipSetDevice(root));
+      auto& devwr = g_weights[root];
+      auto& str   = g_state[root];
+      HIP_CHECK(hipMemcpy(str.d_x, xB.data(), (size_t)B * D * sizeof(float), hipMemcpyHostToDevice));
+      const float* w_ffn = devwr.d_rms_ffn_w + (size_t)l * D;
+      dim3 grid(1, B), block(256);
+      k_rmsnorm_vec_batched<<<grid, block>>>(str.d_x, w_ffn, str.d_t, D);
+      HIP_CHECK(hipGetLastError());
+      memcpyDtoH_chunked(tB.data(), str.d_t, (size_t)B * D * sizeof(float));
+    }
+
+    // 8) Router matvec on root (batched) + bias; copy to host
+    std::vector<float> router((size_t)B * E);
+    {
+      HIP_CHECK(hipSetDevice(root));
+      auto& devwr = g_weights[root];
+      auto& str   = g_state[root];
+      const float* Wrouter_l = devwr.d_w_router + (size_t)l * (size_t)E * D;
+      dim3 grid(E, B), block(256);
+      k_matvec_fp32_batched<<<grid, block>>>(Wrouter_l, str.d_t, str.d_router, D, E);
+      HIP_CHECK(hipGetLastError());
+      dim3 gridb((E+255)/256, B);
+      const float* b_router_l = devwr.d_b_router + (size_t)l * E;
+      k_add_bias_batched<<<gridb, 256>>>(str.d_router, b_router_l, E);
+      HIP_CHECK(hipGetLastError());
+      memcpyDtoH_chunked(router.data(), str.d_router, (size_t)B * E * sizeof(float));
+    }
+
+    // 9) Per-sample top-k and expert MLPs (not batched due to variable owners)
+    for (int b = 0; b < B; ++b) {
+      int K = tr->config.experts_per_token;
+      std::vector<int> idx(E); for (int i=0;i<E;++i) idx[i]=i;
+      float* rrow = router.data() + (size_t)b * E;
+      std::partial_sort(idx.begin(), idx.begin()+K, idx.end(),
+                        [&](int a,int b2){return rrow[a]>rrow[b2];});
+      std::vector<int> topk_idx(K);
+      std::vector<float> topk_val(K);
+      for (int i=0;i<K;++i){ topk_idx[i]=idx[i]; topk_val[i]=rrow[idx[i]]; }
+      float maxv = -INFINITY;
+      for (float v: topk_val) if (v > maxv) maxv = v;
+      float sum = 0.f; for (float &v: topk_val) { v = expf(v - maxv); sum += v; }
+      float inv = 1.f / sum; for (float &v: topk_val) v *= inv;
+
+      std::vector<float> e_agg(D, 0.f);
+      for (int ki = 0; ki < K; ++ki) {
+        int e_glob = topk_idx[ki]; float ew = topk_val[ki];
+        int owner = -1;
+        for (int r = base; r < base + MP_GROUP_SIZE; ++r) {
+          if (e_glob >= g_expert_shard[r].e_start && e_glob < g_expert_shard[r].e_start + g_expert_shard[r].e_count) { owner = r; break; }
+        }
+        if (owner < 0) { fprintf(stderr,"EP owner not found in group %d\n", group_id); exit(EXIT_FAILURE); }
+        int e_local = e_glob - g_expert_shard[owner].e_start;
+        HIP_CHECK(hipSetDevice(owner));
+        auto& devw = g_weights[owner];
+        auto& st   = g_state[owner];
+        // write t for this b to device
+        HIP_CHECK(hipMemcpy(st.d_t, tB.data() + (size_t)b * D, D*sizeof(float), hipMemcpyHostToDevice));
+        const hip_bfloat16* W1 = devw.d_w_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I) * D;
+        const float*        B1 = devw.d_b_mlp1 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)(2*I);
+        dim3 g1((2*I), 1, 1), b1(256, 1, 1);
+        k_matvec_bf16_fp32<<<g1, b1>>>(W1, st.d_t, st.d_mlp1_out, D, 2*I);
+        HIP_CHECK(hipGetLastError());
+        k_add_bias<<<((2*I)+255)/256, 256>>>(st.d_mlp1_out, B1, 2*I);
+        HIP_CHECK(hipGetLastError());
+        std::vector<float> h_mlp1(2*I);
+        HIP_CHECK(hipMemcpy(h_mlp1.data(), st.d_mlp1_out, (size_t)2*I*sizeof(float), hipMemcpyDeviceToHost));
+        std::vector<float> h_gate_up(I);
+        const float clampU = tr->config.swiglu_limit;
+        const float clampL = -tr->config.swiglu_limit;
+        for (int i = 0; i < I; ++i) {
+          float g = h_mlp1[2*i+0];
+          float u = h_mlp1[2*i+1];
+          g = fminf(g, clampU);
+          u = fminf(fmaxf(u, clampL), clampU);
+          h_gate_up[i] = silu(g) * (u + 1.0f);
+        }
+        HIP_CHECK(hipMemcpy(st.d_gate_up, h_gate_up.data(), I*sizeof(float), hipMemcpyHostToDevice));
+        const hip_bfloat16* W2 = devw.d_w_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D * I;
+        const float*        B2 = devw.d_b_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D;
+        dim3 g2(D, 1, 1), b2d(256, 1, 1);
+        k_matvec_bf16_fp32<<<g2, b2d>>>(W2, st.d_gate_up, st.d_ffn_out, I, D);
+        HIP_CHECK(hipGetLastError());
+        k_add_bias<<<(D+255)/256, 256>>>(st.d_ffn_out, B2, D);
+        HIP_CHECK(hipGetLastError());
+        std::vector<float> h_ffn(D);
+        memcpyDtoH_chunked(h_ffn.data(), st.d_ffn_out, D*sizeof(float));
+        for (int i = 0; i < D; ++i) e_agg[i] += ew * h_ffn[i];
+      }
+      float* xb = xB.data() + (size_t)b * D;
+      for (int i = 0; i < D; ++i) xb[i] += e_agg[i];
+    }
+  }
+
+  // Final RMSNorm + logits (batched) and argmax on root
+  HIP_CHECK(hipSetDevice(root));
+  {
+    auto& devwr = g_weights[root];
+    auto& str   = g_state[root];
+    HIP_CHECK(hipMemcpy(str.d_x, xB.data(), (size_t)B*D*sizeof(float), hipMemcpyHostToDevice));
+    dim3 gridN(1, B), blockN(256);
+    k_rmsnorm_vec_batched<<<gridN, blockN>>>(str.d_x, devwr.d_rms_out_w, str.d_x, D);
+    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipMemcpy(str.d_t, str.d_x, (size_t)B*D*sizeof(float), hipMemcpyDeviceToDevice));
+    int V = tr->config.vocab_size;
+    dim3 gridL(V, B), blockL(256);
+    k_matvec_fp32_batched<<<gridL, blockL>>>(devwr.d_w_out, str.d_t, str.d_logits, D, V);
+    HIP_CHECK(hipGetLastError());
+    const size_t shmem_bytes = (size_t)1024 * (sizeof(float) + sizeof(int));
+    k_argmax_batched<<<B, 1024, shmem_bytes>>>(str.d_logits, B, V, str.d_next_token);
+    HIP_CHECK(hipGetLastError());
+    next_tokens_out.resize(B);
+    HIP_CHECK(hipMemcpy(next_tokens_out.data(), str.d_next_token, (size_t)B * sizeof(int), hipMemcpyDeviceToHost));
+  }
+}
+
+// ---------------------------------------------
 // Token generation for one request (GPU path)
 // ---------------------------------------------
-long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
-                               Sampler *sampler, const char *input_seq,
+static long long simple_getp_generate_group(Transformer *transformer, Tokenizer *tokenizer,
+                               Sampler *sampler, int group_id, const char *input_seq,
                                int *output_tokens, int steps) {
   const char *empty_prompt = "";
   if (input_seq == NULL) input_seq = empty_prompt;
@@ -1277,7 +2104,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   safe_printf(first_piece); fflush(stdout);
 
   while (pos < steps) {
-    int sampled = forward_one(transformer, sampler, token, pos, x, t, tb2_sum);
+    int sampled = forward_one_group(transformer, sampler, group_id, token, pos, x, t);
 
     pos++;
     if (pos < num_prompt_tokens) {
@@ -1297,20 +2124,108 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   return pos - num_prompt_tokens + 1;
 }
 
+// Backward-compatible single-group generate (defaults to group 0)
+long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
+                               Sampler *sampler, const char *input_seq,
+                               int *output_tokens, int steps) {
+  return simple_getp_generate_group(transformer, tokenizer, sampler, 0,
+                                    input_seq, output_tokens, steps);
+}
+
+// Batched generate for a group: processes B sequences lock-step with shared kernels
+static long long simple_getp_generate_group_batched(Transformer* transformer, Tokenizer* tokenizer,
+                                Sampler* sampler, int group_id,
+                                const char** input_seqs, int B,
+                                int** output_tokens_batch, int steps) {
+  if (steps == 0 || steps > transformer->config.seq_len)
+    steps = transformer->config.seq_len;
+
+  std::vector<int> num_prompt_tokens(B);
+  std::vector<std::vector<int>> prompt_tokens(B);
+  for (int b = 0; b < B; ++b) {
+    int npt = 0;
+    prompt_tokens[b].resize(strlen(input_seqs[b]) + 3);
+    encode(tokenizer, input_seqs[b], -1, -1, prompt_tokens[b].data(), &npt,
+           transformer->config.initial_context_length);
+    num_prompt_tokens[b] = npt;
+    if (npt < 1) { fprintf(stderr, "empty prompt in batch item %d\n", b); exit(EXIT_FAILURE);}    
+  }
+
+  int D = transformer->config.hidden_dim;
+  std::vector<float> xB((size_t)B * D, 0.f);
+  std::vector<float> tB((size_t)B * D, 0.f);
+
+  std::vector<int> token(B);
+  std::vector<int> pos(B, 0);
+  std::vector<int> next(B);
+  std::vector<int> done(B, 0);
+  for (int b = 0; b < B; ++b) token[b] = prompt_tokens[b][0];
+
+  long long tokens_out_total = 0;
+  int active = B;
+  for (int step = 0; step < steps && active > 0; ++step) {
+    // Run one batched forward step using shared kernels
+    forward_one_group_batched(transformer, group_id, B, token.data(), step, xB, tB, next);
+
+    // Advance each sequence
+    for (int b = 0; b < B; ++b) {
+      if (done[b]) continue;
+      pos[b]++;
+      int nt;
+      if (pos[b] < num_prompt_tokens[b]) {
+        nt = prompt_tokens[b][pos[b]];
+      } else {
+        nt = next[b];
+        output_tokens_batch[b][pos[b] - num_prompt_tokens[b]] = nt;
+        tokens_out_total++;
+      }
+      if (nt == 199999 || nt == 200002) { // eos
+        done[b] = 1; active--;
+      }
+      token[b] = nt;
+    }
+  }
+  for (int b = 0; b < B; ++b) output_tokens_batch[b][pos[b] - num_prompt_tokens[b] + 1] = -1;
+  return tokens_out_total;
+}
+
 // ---------------------------------------------
 // Inference driver for getp_eval.cpp
 // ---------------------------------------------
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
-  long long num_token_out = 0;
-  for (int idx = 0; idx < requests->num_reqs; ++idx) {
-    const char *input_seq = get_str_req_ptr(requests, idx);
-    int *output_tokens = get_tok_gen_ptr(requests, idx);
-    num_token_out +=
-        simple_getp_generate(transformer, tokenizer, sampler, input_seq,
-                             output_tokens, requests->max_seq_len);
+  // Continuous batching via DP_GROUPS worker threads. Each group runs its own
+  // request stream and keeps pulling next request as soon as it finishes.
+  std::atomic<int> next_idx{0};
+  std::atomic<long long> total_tokens{0};
+
+  auto worker = [&](int group_id) {
+    while (true) {
+      // Grab up to GROUP_BATCH requests for this microbatch
+      int idx_start = next_idx.fetch_add(GROUP_BATCH);
+      if (idx_start >= requests->num_reqs) break;
+      int B = std::min(GROUP_BATCH, requests->num_reqs - idx_start);
+      std::vector<const char*> inputs(B);
+      std::vector<int*> outputs(B);
+      for (int i = 0; i < B; ++i) {
+        inputs[i] = get_str_req_ptr(requests, idx_start + i);
+        outputs[i] = get_tok_gen_ptr(requests, idx_start + i);
+      }
+      long long n = simple_getp_generate_group_batched(transformer, tokenizer, sampler,
+                                                       group_id, inputs.data(), B,
+                                                       outputs.data(), requests->max_seq_len);
+      total_tokens.fetch_add(n);
+    }
+  };
+
+  // Launch DP_GROUPS workers (one per DP group)
+  std::vector<std::thread> threads;
+  int groups_to_launch = DP_GROUPS;
+  for (int g = 0; g < groups_to_launch; ++g) {
+    threads.emplace_back(worker, g);
   }
-  return num_token_out;
+  for (auto& th : threads) th.join();
+  return total_tokens.load();
 }
 
 #endif // GETP_RUN
