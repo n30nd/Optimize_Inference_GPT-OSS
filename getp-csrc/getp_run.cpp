@@ -1422,7 +1422,7 @@ static void forward_one_group_batched(Transformer* tr, int group_id,
       const float* sinks_l = nullptr;
       if (g_weights[r].d_attn_sinks) sinks_l = g_weights[r].d_attn_sinks + (size_t)l * g_head_shard[r].q_count;
 
-      size_t smem = (size_t)smem_len * sizeof(float);
+      size_t smem = ((size_t)smem_len + (size_t)hd) * sizeof(float);      
       dim3 grid(hs.q_count, B), block(hd);
       k_attention_step_batched<<<grid, block, smem>>>(
         st.d_q_local,
