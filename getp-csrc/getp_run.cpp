@@ -630,6 +630,16 @@ __global__ void k_matvec_colslice_bf16_batched(const hip_bfloat16* __restrict__ 
   if (tid == 0) Y[(size_t)b * hidden_dim + row] = sdata[0];
 }
 
+// Zero out per-sample rows if inactive (pos_list[b] < 0)
+__global__ void k_zero_inactive_rows(float* buf, const int* __restrict__ pos_list,
+                                     int row_size) {
+  int b = blockIdx.y;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pos_list[b] < 0 && i < row_size) {
+    buf[(size_t)b * row_size + i] = 0.0f;
+  }
+}
+
 // FP8-like (uint8 + per-row scale) matvec: out_rows x in_cols
 // Legacy path retained for future use; not used in current flow.
 #ifndef KEEP_FP8_UTILS
@@ -1412,6 +1422,12 @@ static void forward_one_group_batched(Transformer* tr, int group_id,
         st.d_mask, p->seq_len,
         sinks_l);
       HIP_CHECK(hipGetLastError());
+
+      // Zero tb_local for inactive samples to prevent W_o contributions
+      int row_size = hs.q_count * hd;
+      dim3 gz((row_size + 255)/256, B);
+      k_zero_inactive_rows<<<gz, 256>>>(st.d_tb_local, st.d_pos_list, row_size);
+      HIP_CHECK(hipGetLastError());
     }
 
     // 5) W_o matvec (batched) per shard
@@ -1573,48 +1589,75 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
   auto worker = [&](int group_id) {
     while (true) {
-      // Grab up to GROUP_BATCH requests for this microbatch
+      // Try to fill a new microbatch (up to GROUP_BATCH)
       int idx_start = next_idx.fetch_add(GROUP_BATCH);
       if (idx_start >= requests->num_reqs) break;
       int B = std::min(GROUP_BATCH, requests->num_reqs - idx_start);
-      std::vector<const char*> inputs(B);
-      std::vector<int*> outputs(B);
-      for (int i = 0; i < B; ++i) {
-        inputs[i] = get_str_req_ptr(requests, idx_start + i);
-        outputs[i] = get_tok_gen_ptr(requests, idx_start + i);
-      }
-      // Inline merged simple_getp_generate_group_batched
-      int steps = requests->max_seq_len;
-      if (steps == 0 || steps > transformer->config.seq_len)
-        steps = transformer->config.seq_len;
 
-      std::vector<int> num_prompt_tokens(B);
+      // Per-slot state
+      std::vector<const char*> inputs(B, nullptr);
+      std::vector<int*> outputs(B, nullptr);
+      std::vector<int> num_prompt_tokens(B, 0);
       std::vector<std::vector<int>> prompt_tokens(B);
-      for (int b = 0; b < B; ++b) {
+      std::vector<int> token(B, 0);
+      std::vector<int> pos(B, -1);  // -1 means inactive
+      std::vector<char> active(B, 0);
+
+      for (int i = 0; i < B; ++i) {
+        int ridx = idx_start + i;
+        inputs[i] = get_str_req_ptr(requests, ridx);
+        outputs[i] = get_tok_gen_ptr(requests, ridx);
         int npt = 0;
-        prompt_tokens[b].resize(strlen(inputs[b]) + 3);
-        encode(tokenizer, inputs[b], -1, -1, prompt_tokens[b].data(), &npt,
+        prompt_tokens[i].resize(strlen(inputs[i]) + 3);
+        encode(tokenizer, inputs[i], -1, -1, prompt_tokens[i].data(), &npt,
                transformer->config.initial_context_length);
-        num_prompt_tokens[b] = npt;
-        if (npt < 1) { fprintf(stderr, "empty prompt in batch item %d\n", b); exit(EXIT_FAILURE);}    
+        num_prompt_tokens[i] = npt;
+        if (npt < 1) { fprintf(stderr, "empty prompt in batch item %d\n", i); exit(EXIT_FAILURE);}    
+        token[i] = prompt_tokens[i][0];
+        pos[i] = 0;
+        active[i] = 1;
       }
 
       int D = transformer->config.hidden_dim;
+      int steps = requests->max_seq_len;
+      if (steps == 0 || steps > transformer->config.seq_len) steps = transformer->config.seq_len;
       std::vector<float> xB((size_t)B * D, 0.f);
       std::vector<float> tB((size_t)B * D, 0.f);
-
-      std::vector<int> token(B);
-      std::vector<int> pos(B, 0);
-      std::vector<int> next(B);
-      std::vector<int> done(B, 0);
-      for (int b = 0; b < B; ++b) token[b] = prompt_tokens[b][0];
+      std::vector<int> next(B, 0);
 
       long long tokens_out_total = 0;
-      int active = B;
-      for (int step = 0; step < steps && active > 0; ++step) {
-        forward_one_group_batched(transformer, group_id, B, token.data(), pos.data(), xB, tB, next);
+      auto count_active = [&](){ int c=0; for(char a:active) if(a) ++c; return c; };
+
+      while (true) {
+        // If no active slots, attempt to refill
+        if (count_active() == 0) {
+          bool refilled = false;
+          for (int b = 0; b < B; ++b) {
+            if (active[b]) continue;
+            int ridx = next_idx.fetch_add(1);
+            if (ridx >= requests->num_reqs) break;
+            inputs[b] = get_str_req_ptr(requests, ridx);
+            outputs[b] = get_tok_gen_ptr(requests, ridx);
+            int npt = 0;
+            prompt_tokens[b].resize(strlen(inputs[b]) + 3);
+            encode(tokenizer, inputs[b], -1, -1, prompt_tokens[b].data(), &npt,
+                   transformer->config.initial_context_length);
+            num_prompt_tokens[b] = npt;
+            token[b] = prompt_tokens[b][0];
+            pos[b] = 0;
+            active[b] = 1;
+            refilled = true;
+          }
+          if (!refilled) break; // no work left globally
+        }
+
+        // Build pos_list (inactive => -1)
+        std::vector<int> pos_list = pos;
+        forward_one_group_batched(transformer, group_id, B, token.data(), pos_list.data(), xB, tB, next);
+
+        // Advance active slots, finalize EOS, and refill as needed
         for (int b = 0; b < B; ++b) {
-          if (done[b]) continue;
+          if (!active[b]) continue;
           pos[b]++;
           int nt;
           if (pos[b] < num_prompt_tokens[b]) {
@@ -1624,11 +1667,32 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
             outputs[b][pos[b] - num_prompt_tokens[b]] = nt;
             tokens_out_total++;
           }
-          if (nt == 199999 || nt == 200002) { done[b] = 1; active--; }
-          token[b] = nt;
+          bool hit_eos = (nt == 199999 || nt == 200002);
+          bool hit_steps = (pos[b] >= steps);
+          if (hit_eos || hit_steps) {
+            // finalize current request
+            outputs[b][pos[b] - num_prompt_tokens[b] + 1] = -1;
+            active[b] = 0;
+            pos[b] = -1; // mark inactive for kernels
+            // refill immediately if available
+            int ridx = next_idx.fetch_add(1);
+            if (ridx < requests->num_reqs) {
+              inputs[b] = get_str_req_ptr(requests, ridx);
+              outputs[b] = get_tok_gen_ptr(requests, ridx);
+              int npt = 0;
+              prompt_tokens[b].resize(strlen(inputs[b]) + 3);
+              encode(tokenizer, inputs[b], -1, -1, prompt_tokens[b].data(), &npt,
+                     transformer->config.initial_context_length);
+              num_prompt_tokens[b] = npt;
+              token[b] = prompt_tokens[b][0];
+              pos[b] = 0;
+              active[b] = 1;
+            }
+          } else {
+            token[b] = nt;
+          }
         }
       }
-      for (int b = 0; b < B; ++b) outputs[b][pos[b] - num_prompt_tokens[b] + 1] = -1;
       total_tokens.fetch_add(tokens_out_total);
     }
   };
