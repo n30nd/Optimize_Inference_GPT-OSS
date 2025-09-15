@@ -36,9 +36,9 @@
 #define WORLD_GPUS (DP_GROUPS * MP_GROUP_SIZE)
 #endif
 
-// Compatibility alias for legacy code paths
-#ifndef NUM_GPUS
-#define NUM_GPUS MP_GROUP_SIZE
+// Default micro-batch size per DP group
+#ifndef GROUP_BATCH
+#define GROUP_BATCH 4
 #endif
 
 #ifndef CHUNK_BYTES_MB
@@ -60,10 +60,6 @@ static inline int group_id_from_rank(int r) { return r / MP_GROUP_SIZE; }
 static inline int mp_rank_from_rank(int r) { return r % MP_GROUP_SIZE; }
 static inline int group_base_rank(int g) { return g * MP_GROUP_SIZE; }
 
-// Default micro-batch size per DP group
-#ifndef GROUP_BATCH
-#define GROUP_BATCH 4
-#endif
 
 // ---------------------------------------------
 // Small helpers: BF16 <-> FP32 and chunked copy
