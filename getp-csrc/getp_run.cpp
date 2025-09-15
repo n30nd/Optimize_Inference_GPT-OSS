@@ -41,6 +41,9 @@
 #define GROUP_BATCH 4
 #endif
 
+// Runtime-configurable microbatch size (defaults to GROUP_BATCH)
+static int g_group_batch = GROUP_BATCH;
+
 #ifndef CHUNK_BYTES_MB
 #define CHUNK_BYTES_MB 512  // set to 1024 for 1GB chunks if you prefer
 #endif
@@ -1056,25 +1059,25 @@ static void gpu_malloc_run_state(Transformer* transformer, int r) {
   printf("[GPU%d] Allocating KV cache...\n", r);
   int kv_dim_local = hs.kv_count * hd;
   size_t kv_cache_size_one = (size_t)L * seq * kv_dim_local * sizeof(float);
-  size_t kv_cache_size_all = (size_t)GROUP_BATCH * kv_cache_size_one;
-  printf("[GPU%d]   - KV cache (K): %.2f MB x B=%d\n", r, kv_cache_size_one / (1024.0*1024.0), GROUP_BATCH);
-  printf("[GPU%d]   - KV cache (V): %.2f MB x B=%d\n", r, kv_cache_size_one / (1024.0*1024.0), GROUP_BATCH);
+  size_t kv_cache_size_all = (size_t)g_group_batch * kv_cache_size_one;
+  printf("[GPU%d]   - KV cache (K): %.2f MB x B=%d\n", r, kv_cache_size_one / (1024.0*1024.0), g_group_batch);
+  printf("[GPU%d]   - KV cache (V): %.2f MB x B=%d\n", r, kv_cache_size_one / (1024.0*1024.0), g_group_batch);
   HIP_CHECK(hipMalloc(&st.d_kv_k, kv_cache_size_all));
   HIP_CHECK(hipMalloc(&st.d_kv_v, kv_cache_size_all));
 
   // Allocate working buffers
   printf("[GPU%d] Allocating working buffers...\n", r);
-  HIP_CHECK(hipMalloc(&st.d_x, (size_t)GROUP_BATCH * D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_t, (size_t)GROUP_BATCH * D * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_qkv, (size_t)GROUP_BATCH * devw.rows_per_layer_local * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_q_local, (size_t)GROUP_BATCH * hs.q_count * hd * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_tb_local, (size_t)GROUP_BATCH * hs.q_count * hd * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_tb2_partial, (size_t)GROUP_BATCH * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_x, (size_t)g_group_batch * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_t, (size_t)g_group_batch * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_qkv, (size_t)g_group_batch * devw.rows_per_layer_local * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_q_local, (size_t)g_group_batch * hs.q_count * hd * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_tb_local, (size_t)g_group_batch * hs.q_count * hd * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_tb2_partial, (size_t)g_group_batch * D * sizeof(float)));
 
   const int I = p->intermediate_dim;
-  HIP_CHECK(hipMalloc(&st.d_mlp1_out, (size_t)GROUP_BATCH * (size_t)(2*I) * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_gate_up,  (size_t)GROUP_BATCH * I * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_ffn_out,  (size_t)GROUP_BATCH * D * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_mlp1_out, (size_t)g_group_batch * (size_t)(2*I) * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_gate_up,  (size_t)g_group_batch * I * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_ffn_out,  (size_t)g_group_batch * D * sizeof(float)));
 
   // Rotary buffers
   printf("[GPU%d] Allocating rotary buffers...\n", r);
@@ -1093,12 +1096,12 @@ static void gpu_malloc_run_state(Transformer* transformer, int r) {
   }
 
   // Router temporaries and logits buffer (group root)
-  HIP_CHECK(hipMalloc(&st.d_router, (size_t)GROUP_BATCH * (size_t)p->n_experts * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_topk,   (size_t)GROUP_BATCH * (size_t)p->experts_per_token * sizeof(float)));
-  HIP_CHECK(hipMalloc(&st.d_pos_list, (size_t)GROUP_BATCH * sizeof(int)));
+  HIP_CHECK(hipMalloc(&st.d_router, (size_t)g_group_batch * (size_t)p->n_experts * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_topk,   (size_t)g_group_batch * (size_t)p->experts_per_token * sizeof(float)));
+  HIP_CHECK(hipMalloc(&st.d_pos_list, (size_t)g_group_batch * sizeof(int)));
   if (mp_rank_from_rank(r) == 0) {
-    HIP_CHECK(hipMalloc(&st.d_logits, (size_t)GROUP_BATCH * (size_t)p->vocab_size * sizeof(float)));
-    HIP_CHECK(hipMalloc(&st.d_next_token, (size_t)GROUP_BATCH * sizeof(int)));
+    HIP_CHECK(hipMalloc(&st.d_logits, (size_t)g_group_batch * (size_t)p->vocab_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&st.d_next_token, (size_t)g_group_batch * sizeof(int)));
   }
 }
 
@@ -1175,6 +1178,14 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   printf("[WARMUP] Model config: %d layers, %d hidden_dim, %d head_dim, %d experts\n", 
          p->n_layers, p->hidden_dim, p->head_dim, p->n_experts);
   fflush(stdout);
+
+  // Read GROUP_BATCH from environment if provided
+  const char* env_gb = getenv("GROUP_BATCH");
+  if (env_gb && *env_gb) {
+    int v = atoi(env_gb);
+    if (v > 0) g_group_batch = v;
+  }
+  printf("[WARMUP] Using GROUP_BATCH=%d (env override supported)\n", g_group_batch);
 
   int device_count = 0;
   HIP_CHECK(hipGetDeviceCount(&device_count));
@@ -1369,8 +1380,8 @@ static void forward_one_group_batched(Transformer* tr, int group_id,
       // Save K/V to cache for each b
       int kv_dim_local = hs.kv_count * hd;
       size_t kv_block = (size_t)p->seq_len * kv_dim_local;
-      float* k_cache_layer_base = st.d_kv_k + (size_t)l * GROUP_BATCH * kv_block;
-      float* v_cache_layer_base = st.d_kv_v + (size_t)l * GROUP_BATCH * kv_block;
+      float* k_cache_layer_base = st.d_kv_k + (size_t)l * g_group_batch * kv_block;
+      float* v_cache_layer_base = st.d_kv_v + (size_t)l * g_group_batch * kv_block;
       for (int b = 0; b < B; ++b) {
         int pos_b = pos_list[b];
         if (pos_b < 0) continue; // inactive
@@ -1397,8 +1408,8 @@ static void forward_one_group_batched(Transformer* tr, int group_id,
       auto& st = g_state[r];
       int kv_dim_local = hs.kv_count * hd;
       size_t kv_block = (size_t)p->seq_len * kv_dim_local;
-      const float* k_cache_layer_base = st.d_kv_k + (size_t)l * GROUP_BATCH * kv_block;
-      const float* v_cache_layer_base = st.d_kv_v + (size_t)l * GROUP_BATCH * kv_block;
+      const float* k_cache_layer_base = st.d_kv_k + (size_t)l * g_group_batch * kv_block;
+      const float* v_cache_layer_base = st.d_kv_v + (size_t)l * g_group_batch * kv_block;
       int max_pos = -1;
       for (int b = 0; b < B; ++b) if (pos_list[b] > max_pos) max_pos = pos_list[b];
       int smem_len = (max_pos >= 0 ? (max_pos + 2) : 1);
@@ -1585,10 +1596,10 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 
   auto worker = [&](int group_id) {
     while (true) {
-      // Try to fill a new microbatch (up to GROUP_BATCH)
-      int idx_start = next_idx.fetch_add(GROUP_BATCH);
+      // Try to fill a new microbatch (up to g_group_batch)
+      int idx_start = next_idx.fetch_add(g_group_batch);
       if (idx_start >= requests->num_reqs) break;
-      int B = std::min(GROUP_BATCH, requests->num_reqs - idx_start);
+      int B = std::min(g_group_batch, requests->num_reqs - idx_start);
 
       // Per-slot state
       std::vector<const char*> inputs(B, nullptr);
