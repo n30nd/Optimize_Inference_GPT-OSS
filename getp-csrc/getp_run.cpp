@@ -275,6 +275,18 @@ static void enable_peer_access_if_possible(int src_device, int dst_device) {
   }
 }
 
+static inline void clone_peer_bf16_array(hip_bfloat16 **dst, hip_bfloat16 *src,
+                                         size_t count, int dst_device, int src_device,
+                                         hipStream_t stream) {
+  if (!src || count == 0) {
+    *dst = nullptr;
+    return;
+  }
+  HIP_CHECK(hipMalloc(dst, count * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMemcpyPeerAsync(*dst, dst_device, src, src_device,
+                               count * sizeof(hip_bfloat16), stream));
+}
+
 
 // ------------------------- KV Cache Management -------------------------
 
@@ -2006,6 +2018,13 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
 // ------------------------- Alloc/Free run state -------------------------
 void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch, const PipelineStageInfo &stage);
 void gpu_free_run_state(GPURunState *s);
+static void gpu_clone_weights_from_peer(GPUTransformerWeights *dst,
+                                        const GPUTransformerWeights *src,
+                                        Config *p,
+                                        const PipelineStageInfo &stage,
+                                        int dst_device,
+                                        int src_device,
+                                        hipStream_t stream);
 
 
 // ------------------------- Chunked copy+convert of weights -------------------------
@@ -2601,8 +2620,19 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   Config *cfg = &transformer->config;
 
+  struct PendingWeightClone {
+    int device_id;
+    hipStream_t stream;
+  };
+  std::vector<PendingWeightClone> pending_weight_clones;
+  pending_weight_clones.reserve(std::max(0, total_devices - pipeline_stages));
+
+  for (auto &group : pipeline_groups) {
+    group.stages.clear();
+  }
+
   for (int g = 0; g < groups; ++g) {
-    PipelineGroup group;
+    PipelineGroup &group = pipeline_groups[g];
     group.group_id = g;
     group.max_batch = INT_MAX;
     for (int s = 0; s < pipeline_stages; ++s) {
@@ -2623,27 +2653,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
       ctx.max_batch = mb;
       group.max_batch = std::min(group.max_batch, mb);
 
-      log_gpu_mem(ctx.device_id, "[GPU] Before memory allocation on device:");
-      gpu_copy_weights(&ctx.weights, &transformer->weights, cfg, ctx.stage);
-      log_gpu_mem(ctx.device_id, "[GPU] After weight allocation on device:");
-      gpu_malloc_run_state(&ctx.state, cfg, ctx.max_batch, ctx.stage);
-      log_gpu_mem(ctx.device_id, "[GPU] After run state allocation on device:");
-
-      HIP_CHECK(hipStreamCreateWithFlags(&ctx.batch_stream, hipStreamNonBlocking));
-      HIP_CHECK(hipStreamCreateWithFlags(&ctx.comm_stream, hipStreamNonBlocking));
-      HIP_CHECK(hipMalloc(&ctx.d_slot_ids,  ctx.max_batch * sizeof(int)));
-      HIP_CHECK(hipMalloc(&ctx.d_pos_list,  ctx.max_batch * sizeof(int)));
-      HIP_CHECK(hipMalloc(&ctx.d_token_ids, ctx.max_batch * sizeof(int)));
-      HIP_CHECK(hipMalloc(&ctx.d_next_tokens, ctx.max_batch * sizeof(int)));
-      HIP_CHECK(hipMalloc(&ctx.d_batch_iota, ctx.max_batch * sizeof(int)));
-      {
-        dim3 threads(256);
-        dim3 blocks((unsigned int)((ctx.max_batch + threads.x - 1) / threads.x));
-        iota_kernel<<<blocks, threads>>>(ctx.d_batch_iota, ctx.max_batch);
-        HIP_CHECK(hipGetLastError());
-        HIP_CHECK(hipDeviceSynchronize());
-      }
-
       group.stages.push_back(&ctx);
     }
     if (group.max_batch == INT_MAX) group.max_batch = 0;
@@ -2656,7 +2665,60 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     for (auto *stage_ctx : group.stages) {
       stage_ctx->stage.total_stages = (int)group.stages.size();
     }
-    pipeline_groups[g] = group;
+  }
+
+  if (!pipeline_groups.empty()) {
+    PipelineGroup &base_group = pipeline_groups.front();
+    for (int s = 0; s < pipeline_stages; ++s) {
+      if (s >= (int)base_group.stages.size()) break;
+      GPUContext *base_ctx = base_group.stages[s];
+      HIP_CHECK(hipSetDevice(base_ctx->device_id));
+      log_gpu_mem(base_ctx->device_id, "[GPU] Before memory allocation on device:");
+      gpu_copy_weights(&base_ctx->weights, &transformer->weights, cfg, base_ctx->stage);
+      log_gpu_mem(base_ctx->device_id, "[GPU] After weight allocation on device:");
+
+      for (int g = 1; g < groups; ++g) {
+        PipelineGroup &clone_group = pipeline_groups[g];
+        if (s >= (int)clone_group.stages.size()) continue;
+        GPUContext *clone_ctx = clone_group.stages[s];
+        log_gpu_mem(clone_ctx->device_id, "[GPU] Before memory allocation on device:");
+        enable_peer_access_if_possible(clone_ctx->device_id, base_ctx->device_id);
+        enable_peer_access_if_possible(base_ctx->device_id, clone_ctx->device_id);
+        hipStream_t clone_stream;
+        HIP_CHECK(hipStreamCreateWithFlags(&clone_stream, hipStreamNonBlocking));
+        gpu_clone_weights_from_peer(&clone_ctx->weights, &base_ctx->weights, cfg, clone_ctx->stage,
+                                    clone_ctx->device_id, base_ctx->device_id, clone_stream);
+        pending_weight_clones.push_back({clone_ctx->device_id, clone_stream});
+        log_gpu_mem(clone_ctx->device_id, "[GPU] After weight allocation on device:");
+      }
+    }
+  }
+
+  for (auto &pending : pending_weight_clones) {
+    HIP_CHECK(hipSetDevice(pending.device_id));
+    HIP_CHECK(hipStreamSynchronize(pending.stream));
+    HIP_CHECK(hipStreamDestroy(pending.stream));
+  }
+
+  for (auto &ctx : gpu_contexts) {
+    HIP_CHECK(hipSetDevice(ctx.device_id));
+    gpu_malloc_run_state(&ctx.state, cfg, ctx.max_batch, ctx.stage);
+    log_gpu_mem(ctx.device_id, "[GPU] After run state allocation on device:");
+
+    HIP_CHECK(hipStreamCreateWithFlags(&ctx.batch_stream, hipStreamNonBlocking));
+    HIP_CHECK(hipStreamCreateWithFlags(&ctx.comm_stream, hipStreamNonBlocking));
+    HIP_CHECK(hipMalloc(&ctx.d_slot_ids,  ctx.max_batch * sizeof(int)));
+    HIP_CHECK(hipMalloc(&ctx.d_pos_list,  ctx.max_batch * sizeof(int)));
+    HIP_CHECK(hipMalloc(&ctx.d_token_ids, ctx.max_batch * sizeof(int)));
+    HIP_CHECK(hipMalloc(&ctx.d_next_tokens, ctx.max_batch * sizeof(int)));
+    HIP_CHECK(hipMalloc(&ctx.d_batch_iota, ctx.max_batch * sizeof(int)));
+    {
+      dim3 threads(256);
+      dim3 blocks((unsigned int)((ctx.max_batch + threads.x - 1) / threads.x));
+      iota_kernel<<<blocks, threads>>>(ctx.d_batch_iota, ctx.max_batch);
+      HIP_CHECK(hipGetLastError());
+      HIP_CHECK(hipDeviceSynchronize());
+    }
   }
 
   printf("[GPU] Warm-up initialized %d pipeline group(s) × %d stage(s).\n", (int)pipeline_groups.size(), pipeline_stages);
@@ -3052,6 +3114,143 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->padded_offsets));
   HIP_CHECK(hipFree(s->block_expert_ids));
   HIP_CHECK(hipFree(s->d_col_ids));
+}
+
+static void gpu_clone_weights_from_peer(GPUTransformerWeights *dst,
+                                        const GPUTransformerWeights *src,
+                                        Config *p,
+                                        const PipelineStageInfo &stage,
+                                        int dst_device,
+                                        int src_device,
+                                        hipStream_t stream) {
+  *dst = {};
+
+  int head_dim      = p->head_dim;
+  int total_layers  = p->n_layers;
+  int n_experts     = p->n_experts;
+  int hidden_dim    = p->hidden_dim;
+  int intermediate_dim = p->intermediate_dim;
+  int vocab_size    = p->vocab_size;
+  int n_attn_heads  = p->n_attn_heads;
+  int n_kv_heads    = p->n_kv_heads;
+
+  int layer_start = (stage.total_stages > 1) ? stage.layer_start : 0;
+  if (layer_start < 0) layer_start = 0;
+  if (layer_start > total_layers) layer_start = total_layers;
+  int layer_end = (stage.total_stages > 1) ? stage.layer_end : total_layers;
+  if (layer_end > total_layers) layer_end = total_layers;
+  int n_layers = layer_end - layer_start;
+  if (stage.total_stages <= 1 || n_layers <= 0) {
+    layer_start = 0;
+    layer_end = total_layers;
+    n_layers = total_layers;
+  }
+
+  bool stage_is_first = stage.is_first() || stage.total_stages <= 1;
+  bool stage_is_last = stage.is_last() || stage.total_stages <= 1;
+
+  int prev_device = -1;
+  HIP_CHECK(hipGetDevice(&prev_device));
+  HIP_CHECK(hipSetDevice(dst_device));
+
+  if (stage_is_first) {
+    size_t token_embed_count = (size_t)vocab_size * (size_t)hidden_dim;
+    clone_peer_bf16_array(&dst->token_embedding_table, src->token_embedding_table,
+                          token_embed_count, dst_device, src_device, stream);
+  }
+
+  if (stage_is_last) {
+    size_t token_embed_count = (size_t)vocab_size * (size_t)hidden_dim;
+    clone_peer_bf16_array(&dst->out, src->out,
+                          token_embed_count, dst_device, src_device, stream);
+    if (src->w_out_packed16) {
+      int M_out = vocab_size;
+      int K_out = hidden_dim;
+      int Mpad_out = round_up16_host(M_out);
+      int Kpad_out = round_up16_host(K_out);
+      size_t packed = (size_t)Mpad_out * (size_t)Kpad_out;
+      clone_peer_bf16_array(&dst->w_out_packed16, src->w_out_packed16,
+                            packed, dst_device, src_device, stream);
+    }
+    clone_peer_bf16_array(&dst->rms_out_w, src->rms_out_w,
+                          (size_t)hidden_dim, dst_device, src_device, stream);
+  }
+
+  if (n_layers > 0) {
+    size_t rms_count = (size_t)n_layers * (size_t)hidden_dim;
+    clone_peer_bf16_array(&dst->rms_attn_w, src->rms_attn_w,
+                          rms_count, dst_device, src_device, stream);
+    clone_peer_bf16_array(&dst->rms_ffn_w, src->rms_ffn_w,
+                          rms_count, dst_device, src_device, stream);
+
+    int M_qkv = head_dim * n_attn_heads + 2 * head_dim * n_kv_heads;
+    int K_qkv = hidden_dim;
+    int Mpad_qkv = round_up16_host(M_qkv);
+    int Kpad_qkv = round_up16_host(K_qkv);
+    size_t qkv_elems = (size_t)n_layers * (size_t)Mpad_qkv * (size_t)Kpad_qkv;
+    clone_peer_bf16_array(&dst->w_qkv_packed16, src->w_qkv_packed16,
+                          qkv_elems, dst_device, src_device, stream);
+    size_t qkv_b_count = (size_t)n_layers *
+                         ((size_t)head_dim * (size_t)n_attn_heads +
+                          (size_t)2 * (size_t)head_dim * (size_t)n_kv_heads);
+    clone_peer_bf16_array(&dst->b_qkv, src->b_qkv,
+                          qkv_b_count, dst_device, src_device, stream);
+
+    int M_o = hidden_dim;
+    int K_o = head_dim * n_attn_heads;
+    int Mpad_o = round_up16_host(M_o);
+    int Kpad_o = round_up16_host(K_o);
+    size_t o_elems = (size_t)n_layers * (size_t)Mpad_o * (size_t)Kpad_o;
+    clone_peer_bf16_array(&dst->w_o_packed16, src->w_o_packed16,
+                          o_elems, dst_device, src_device, stream);
+    size_t b_o_count = (size_t)n_layers * (size_t)hidden_dim;
+    clone_peer_bf16_array(&dst->b_o, src->b_o,
+                          b_o_count, dst_device, src_device, stream);
+    size_t attn_sinks_count = (size_t)n_layers * (size_t)n_attn_heads;
+    clone_peer_bf16_array(&dst->attn_sinks, src->attn_sinks,
+                          attn_sinks_count, dst_device, src_device, stream);
+
+    int M_router = n_experts;
+    int K_router = hidden_dim;
+    int Mpad_router = round_up16_host(M_router);
+    int Kpad_router = round_up16_host(K_router);
+    size_t router_elems = (size_t)n_layers * (size_t)Mpad_router * (size_t)Kpad_router;
+    clone_peer_bf16_array(&dst->w_router_packed16, src->w_router_packed16,
+                          router_elems, dst_device, src_device, stream);
+    size_t router_b_count = (size_t)n_layers * (size_t)n_experts;
+    clone_peer_bf16_array(&dst->b_router, src->b_router,
+                          router_b_count, dst_device, src_device, stream);
+
+    int layers_flat = n_layers * n_experts;
+    if (layers_flat > 0) {
+      int M_mlp1 = 2 * intermediate_dim;
+      int K_mlp1 = hidden_dim;
+      int Mpad_mlp1 = round_up16_host(M_mlp1);
+      int Kpad_mlp1 = round_up16_host(K_mlp1);
+      size_t mlp1_elems = (size_t)layers_flat * (size_t)Mpad_mlp1 * (size_t)Kpad_mlp1;
+      clone_peer_bf16_array(&dst->w_mlp1_packed16, src->w_mlp1_packed16,
+                            mlp1_elems, dst_device, src_device, stream);
+      size_t mlp1_b_count = (size_t)layers_flat * (size_t)2 * (size_t)intermediate_dim;
+      clone_peer_bf16_array(&dst->b_mlp1, src->b_mlp1,
+                            mlp1_b_count, dst_device, src_device, stream);
+
+      int M_mlp2 = hidden_dim;
+      int K_mlp2 = intermediate_dim;
+      int Mpad_mlp2 = round_up16_host(M_mlp2);
+      int Kpad_mlp2 = round_up16_host(K_mlp2);
+      size_t mlp2_elems = (size_t)layers_flat * (size_t)Mpad_mlp2 * (size_t)Kpad_mlp2;
+      clone_peer_bf16_array(&dst->w_mlp2_packed16, src->w_mlp2_packed16,
+                            mlp2_elems, dst_device, src_device, stream);
+      size_t mlp2_b_count = (size_t)layers_flat * (size_t)hidden_dim;
+      clone_peer_bf16_array(&dst->b_mlp2, src->b_mlp2,
+                            mlp2_b_count, dst_device, src_device, stream);
+    }
+  }
+
+  if (prev_device >= 0 && prev_device != dst_device) {
+    HIP_CHECK(hipSetDevice(prev_device));
+  }
+
 }
 
 void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p, const PipelineStageInfo &stage) {
