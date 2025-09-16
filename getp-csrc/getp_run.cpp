@@ -170,6 +170,24 @@ static void pack_tile_row_cpu(const float *layer_src, int M, int K, int tile_m,
   }
 }
 
+static void pack_tile_row_fp32_cpu(const float *layer_src, int M, int K, int tile_m,
+                                   int tiles_per_row, float *dst_row) {
+  const int base_row = tile_m * 16;
+  for (int tile_k = 0; tile_k < tiles_per_row; ++tile_k) {
+    for (int im = 0; im < 16; ++im) {
+      const int row = base_row + im;
+      const float *row_ptr = (row < M) ? (layer_src + (size_t)row * (size_t)K) : nullptr;
+      for (int ik = 0; ik < 16; ++ik) {
+        const int col = tile_k * 16 + ik;
+        const size_t dst_index = (size_t)tile_k * 256 + (size_t)im * 16 + (size_t)ik;
+        float val = 0.0f;
+        if (row_ptr && col < K) val = row_ptr[col];
+        dst_row[dst_index] = val;
+      }
+    }
+  }
+}
+
 static void pack_matrices_cpu_to_device(const float *src, int matrices, int M, int K,
                                         size_t src_stride, hip_bfloat16 *dst_device) {
   if (matrices <= 0) return;
@@ -195,6 +213,28 @@ static void pack_matrices_cpu_to_device(const float *src, int matrices, int M, i
                                hipMemcpyHostToDevice, stream));
     }
     sync_host_copy_streams();
+  }
+}
+
+static void pack_matrices_fp32_to_device(const float *src, int matrices, int M, int K,
+                                         size_t src_stride, float *dst_device) {
+  if (matrices <= 0) return;
+  int Mpad = round_up16_host(M);
+  int Kpad = round_up16_host(K);
+  int tiles_per_row = (Kpad + 15) / 16;
+  int tile_rows = (Mpad + 15) / 16;
+  size_t tile_row_elems = (size_t)tiles_per_row * 256;
+  std::vector<float> host_tile(tile_row_elems);
+  size_t per_mat_elems = (size_t)Mpad * (size_t)Kpad;
+
+  for (int mat = 0; mat < matrices; ++mat) {
+    const float *mat_src = src + (size_t)mat * src_stride;
+    float *mat_dst = dst_device + (size_t)mat * per_mat_elems;
+    for (int tile_m = 0; tile_m < tile_rows; ++tile_m) {
+      pack_tile_row_fp32_cpu(mat_src, M, K, tile_m, tiles_per_row, host_tile.data());
+      float *dst_row = mat_dst + (size_t)tile_m * tile_row_elems;
+      HIP_CHECK(hipMemcpy(dst_row, host_tile.data(), tile_row_elems * sizeof(float), hipMemcpyHostToDevice));
+    }
   }
 }
 
@@ -285,6 +325,18 @@ static inline void clone_peer_bf16_array(hip_bfloat16 **dst, hip_bfloat16 *src,
   HIP_CHECK(hipMalloc(dst, count * sizeof(hip_bfloat16)));
   HIP_CHECK(hipMemcpyPeerAsync(*dst, dst_device, src, src_device,
                                count * sizeof(hip_bfloat16), stream));
+}
+
+static inline void clone_peer_float_array(float **dst, const float *src,
+                                          size_t count, int dst_device, int src_device,
+                                          hipStream_t stream) {
+  if (!src || count == 0) {
+    *dst = nullptr;
+    return;
+  }
+  HIP_CHECK(hipMalloc(dst, count * sizeof(float)));
+  HIP_CHECK(hipMemcpyPeerAsync(*dst, dst_device, src, src_device,
+                               count * sizeof(float), stream));
 }
 
 
@@ -577,7 +629,7 @@ typedef struct {
   hip_bfloat16 *b_o;
   hip_bfloat16 *attn_sinks;
   hip_bfloat16 *w_router;
-  hip_bfloat16 *b_router;
+  float *b_router;
   hip_bfloat16 *w_mlp1;
   hip_bfloat16 *w_mlp2;
   hip_bfloat16 *b_mlp1;
@@ -585,7 +637,7 @@ typedef struct {
   // Packed (16x16 tiling) BF16 weights for GEMM core (convert to FP32 per tile in shared memory)
   hip_bfloat16 *w_qkv_packed16;   // [n_layers][Mpad * Kpad]
   hip_bfloat16 *w_o_packed16;     // [n_layers][Mpad * Kpad]
-  hip_bfloat16 *w_router_packed16;// [n_layers][Mpad * Kpad]
+  float *w_router_packed32;       // [n_layers][Mpad * Kpad] packed FP32 tiles
   hip_bfloat16 *w_mlp1_packed16;  // [n_layers*n_experts][Mpad * Kpad]
   hip_bfloat16 *w_mlp2_packed16;  // NEW: MLP2 packed 16x16 (H x I)
 
@@ -612,6 +664,7 @@ typedef struct {
   float *logits_fp32;        // final logits
   // Packed input buffer for MLP1 (BF16), size: K_max x Bpad_mlp1
   hip_bfloat16 *xpack_bf16;
+  float *xpack_f32;
 
   // Batched MoE staging (for grouped GEMMs across slots/experts)
   int   *sel_sids;        // [max_batch * experts_per_token]
@@ -892,6 +945,86 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias(
       if (row < M) {
         const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
         out_s[row] = dmn[i] + biasv;
+      }
+    }
+  }
+}
+
+
+__global__ __launch_bounds__(64)
+void gemm16x16_mfma_f32_router_scatter_bias(
+    const float* __restrict__ W_packed,
+    const float* __restrict__ Xpack,
+    float* __restrict__ dst,
+    const float* __restrict__ bias,
+    int M, int K, int B, int Bpad,
+    int out_stride,
+    const int* __restrict__ slot_ids,
+    int Mpad, int Kpad)
+{
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+  const int lane = ty * 16 + tx;
+
+  const int tile_m = blockIdx.x;
+  const int tile_n = blockIdx.y;
+  const int base_row = tile_m * 16;
+  const int base_col = tile_n * 16;
+
+  const int Ktiles = (Kpad + 15) / 16;
+  const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+
+  __shared__ __align__(16) float sW[16 * 16];
+  __shared__ __align__(16) float sX[16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v acc = {0.f, 0.f, 0.f, 0.f};
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    if (lane < 64) {
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      const float *w_src = W_packed + w_tile_base;
+      reinterpret_cast<float4v*>(sW)[lane] = reinterpret_cast<const float4v*>(w_src)[lane];
+    }
+
+    if (lane < 64) {
+      const int r   = lane % 16;
+      const int c4  = (lane / 16) * 4;
+      const int k_row = kk * 16 + r;
+      float *dst_vec = sX + r * 16 + c4;
+
+      if (k_row < K && (base_col + c4) < Bpad) {
+        const float *src_vec = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c4;
+        reinterpret_cast<float4v*>(dst_vec)[0] = reinterpret_cast<const float4v*>(src_vec)[0];
+      } else {
+        reinterpret_cast<float4v*>(dst_vec)[0] = float4v{0.f, 0.f, 0.f, 0.f};
+      }
+    }
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const int k4 = ty + 4 * t;
+      float amk = sW[tx * 16 + k4];
+      float bkn = sX[k4 * 16 + tx];
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, acc, 0, 0, 0);
+    }
+
+    __syncthreads();
+  }
+
+  const int col = base_col + tx;
+  if (col < B) {
+    const int sid = slot_ids[col];
+    float *out_s = dst + (size_t)sid * (size_t)out_stride;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = base_row + (ty * 4 + i);
+      if (row < M) {
+        const float biasv = bias ? bias[row] : 0.f;
+        float value = (i == 0) ? acc.x : (i == 1) ? acc.y : (i == 2) ? acc.z : acc.w;
+        out_s[row] = value + biasv;
       }
     }
   }
@@ -2356,7 +2489,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     }
 
     // -------- MoE batched & grouped across slots and experts --------
-    const hip_bfloat16 *b_router = gpu_ctx->weights.b_router + (size_t)local_l * (size_t)p->n_experts;
+    const float *b_router = gpu_ctx->weights.b_router + (size_t)local_l * (size_t)p->n_experts;
     int total_post_pad = 0;
     // 2) Router matmul + bias (batched across slots) via packed BF16 GEMM
     {
@@ -2365,15 +2498,15 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int Bpadr = ((batch + 15) / 16) * 16;
       int Mpadr = ((Mr + 15) / 16) * 16;
       int Kpadr = ((Kr + 15) / 16) * 16;
-      // Gather/pack t -> xpack_bf16
+      // Gather/pack t -> xpack_f32
       size_t total = (size_t)Kr * (size_t)Bpadr;
       dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
-      gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
-        gpu_ctx->state.t, gpu_ctx->state.xpack_bf16, Kr, batch, Bpadr, hidden_dim, gpu_ctx->d_slot_ids);
-      const hip_bfloat16 *w_router_packed = gpu_ctx->weights.w_router_packed16 + (size_t)local_l * (size_t)Mpadr * (size_t)Kpadr;
+      gather_pack_x_fp32_to_fp32_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+        gpu_ctx->state.t, gpu_ctx->state.xpack_f32, Kr, batch, Bpadr, hidden_dim, gpu_ctx->d_slot_ids);
+      const float *w_router_packed = gpu_ctx->weights.w_router_packed32 + (size_t)local_l * (size_t)Mpadr * (size_t)Kpadr;
       dim3 blockG(16, 4, 1), gridG((unsigned)(Mpadr + 15) / 16, (unsigned)(Bpadr + 15) / 16);
-      gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
-        w_router_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.router_score, b_router,
+      gemm16x16_mfma_f32_router_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+        w_router_packed, gpu_ctx->state.xpack_f32, gpu_ctx->state.router_score, b_router,
         Mr, Kr, batch, Bpadr, Mr, gpu_ctx->d_slot_ids, Mpadr, Kpadr);
     }
     // 3) Fused Router: Top-K + softmax + gather + histogram
@@ -3050,6 +3183,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch, const Pipeli
   });
   
   HIP_CHECK(hipMalloc(&s->xpack_bf16, Kmax_xpack * (size_t)Bpad_mlp1 * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->xpack_f32,  Kmax_xpack * (size_t)Bpad_mlp1 * sizeof(float)));
   // HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
   // HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
 
@@ -3114,6 +3248,7 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->padded_offsets));
   HIP_CHECK(hipFree(s->block_expert_ids));
   HIP_CHECK(hipFree(s->d_col_ids));
+  HIP_CHECK(hipFree(s->xpack_f32));
 }
 
 static void gpu_clone_weights_from_peer(GPUTransformerWeights *dst,
@@ -3215,10 +3350,10 @@ static void gpu_clone_weights_from_peer(GPUTransformerWeights *dst,
     int Mpad_router = round_up16_host(M_router);
     int Kpad_router = round_up16_host(K_router);
     size_t router_elems = (size_t)n_layers * (size_t)Mpad_router * (size_t)Kpad_router;
-    clone_peer_bf16_array(&dst->w_router_packed16, src->w_router_packed16,
+    clone_peer_float_array(&dst->w_router_packed32, src->w_router_packed32,
                           router_elems, dst_device, src_device, stream);
     size_t router_b_count = (size_t)n_layers * (size_t)n_experts;
-    clone_peer_bf16_array(&dst->b_router, src->b_router,
+    clone_peer_float_array(&dst->b_router, src->b_router,
                           router_b_count, dst_device, src_device, stream);
 
     int layers_flat = n_layers * n_experts;
@@ -3293,6 +3428,15 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     allocate_and_convert_array(cpu_data, count, gpu_data);
   };
 
+  auto copy_array_fp32 = [&](const float *cpu_data, float **gpu_data, size_t count) {
+    if (count == 0) {
+      *gpu_data = nullptr;
+      return;
+    }
+    HIP_CHECK(hipMalloc(gpu_data, count * sizeof(float)));
+    HIP_CHECK(hipMemcpy(*gpu_data, cpu_data, count * sizeof(float), hipMemcpyHostToDevice));
+  };
+
   auto pack_weights_fp32_rowmajor_to_bf16_tiles16 = [&](const float *cpu_data,
                                                         hip_bfloat16 **gpu_packed,
                                                         int layers, int M, int K,
@@ -3306,6 +3450,21 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     size_t per_layer_elems = (size_t)Mpad * (size_t)Kpad;
     HIP_CHECK(hipMalloc(gpu_packed, (size_t)layers * per_layer_elems * sizeof(hip_bfloat16)));
     pack_matrices_cpu_to_device(cpu_data, layers, M, K, src_stride, *gpu_packed);
+  };
+
+  auto pack_weights_fp32_rowmajor_to_fp32_tiles16 = [&](const float *cpu_data,
+                                                        float **gpu_packed,
+                                                        int layers, int M, int K,
+                                                        size_t src_stride) {
+    if (layers <= 0) {
+      *gpu_packed = nullptr;
+      return;
+    }
+    int Mpad = round_up16_host(M);
+    int Kpad = round_up16_host(K);
+    size_t per_layer_elems = (size_t)Mpad * (size_t)Kpad;
+    HIP_CHECK(hipMalloc(gpu_packed, (size_t)layers * per_layer_elems * sizeof(float)));
+    pack_matrices_fp32_to_device(cpu_data, layers, M, K, src_stride, *gpu_packed);
   };
 
 
@@ -3380,13 +3539,13 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   int K_router = hidden_dim;
   if (n_layers > 0) {
     const float *w_router_src = cpu_w->w_router + (size_t)layer_start * (size_t)M_router * (size_t)K_router;
-    pack_weights_fp32_rowmajor_to_bf16_tiles16(w_router_src, &gpu_w->w_router_packed16, n_layers, M_router, K_router,
+    pack_weights_fp32_rowmajor_to_fp32_tiles16(w_router_src, &gpu_w->w_router_packed32, n_layers, M_router, K_router,
                                                (size_t)M_router * (size_t)K_router);
     size_t router_b_count = (size_t)n_layers * (size_t)n_experts;
     const float *b_router_src = cpu_w->b_router + (size_t)layer_start * (size_t)n_experts;
-    copy_and_convert(b_router_src, &gpu_w->b_router, router_b_count);
+    copy_array_fp32(b_router_src, &gpu_w->b_router, router_b_count);
   } else {
-    gpu_w->w_router_packed16 = nullptr;
+    gpu_w->w_router_packed32 = nullptr;
     gpu_w->b_router = nullptr;
   }
 
@@ -3452,5 +3611,5 @@ void gpu_free_weights(GPUTransformerWeights *gpu_w) {
   if (gpu_w->b_mlp2)                HIP_CHECK(hipFree(gpu_w->b_mlp2));
   if (gpu_w->w_qkv_packed16)        HIP_CHECK(hipFree(gpu_w->w_qkv_packed16));
   if (gpu_w->w_o_packed16)          HIP_CHECK(hipFree(gpu_w->w_o_packed16));
-  if (gpu_w->w_router_packed16)     HIP_CHECK(hipFree(gpu_w->w_router_packed16));
+  if (gpu_w->w_router_packed32)     HIP_CHECK(hipFree(gpu_w->w_router_packed32));
 }
