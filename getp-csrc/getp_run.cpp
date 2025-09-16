@@ -24,6 +24,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <utility>
 
 // Model/data parallel sizing
 #ifndef DP_GROUPS
@@ -48,6 +49,10 @@ static int g_group_batch = GROUP_BATCH;
 #define CHUNK_BYTES_MB 512  // set to 1024 for 1GB chunks if you prefer
 #endif
 
+#ifndef RING_CHUNK_BYTES_MB
+#define RING_CHUNK_BYTES_MB 8  // chunk target for ring allreduce (MB)
+#endif
+
 #define HIP_CHECK(cmd) do { \
   hipError_t e = (cmd);     \
   if (e != hipSuccess) {    \
@@ -57,6 +62,7 @@ static int g_group_batch = GROUP_BATCH;
 } while(0)
 
 static size_t CHUNK_BYTES = (size_t)CHUNK_BYTES_MB * 1024ull * 1024ull;
+static size_t RING_CHUNK_BYTES = (size_t)RING_CHUNK_BYTES_MB * 1024ull * 1024ull;
 
 // Helpers for DP/MP rank mapping
 static inline int group_id_from_rank(int r) { return r / MP_GROUP_SIZE; }
@@ -1037,31 +1043,115 @@ static std::mutex g_reduce_mutex;
 static float* h_tb2_partials[WORLD_GPUS] = {};
 static float* h_tb2_sum = nullptr; // legacy; not used in group-forward path
 
-// Simple ring-allreduce using peer copies and in-place accumulation.
+// Ring allreduce using peer copies and in-place accumulation.
 // Operates over g_state[r].d_tb2_partial for r in [base, base+group_size).
-// Root‑only reduction: accumulate all shard partials into root's d_tb2_partial
+// After completion every rank owns the summed tensor; no broadcast step needed.
 static void root_reduce_tb2(int base, int group_size, int B, int D, int root) {
   size_t elems = (size_t)B * (size_t)D;
-  size_t bytes = elems * sizeof(float);
-  // Ensure producers finished computing tb2_partial on default streams
+  if (group_size <= 1 || elems == 0) return;
+  (void)root;  // ring allreduce makes every rank a peer; root kept for callsite symmetry
+
+  size_t target_chunk_elems = RING_CHUNK_BYTES / sizeof(float);
+  if (target_chunk_elems == 0) target_chunk_elems = 1;
+  size_t segments = std::max<size_t>((size_t)group_size,
+                                     (elems + target_chunk_elems - 1) / target_chunk_elems);
+  size_t chunk_elems = (elems + segments - 1) / segments;
+
+  auto chunk_extent = [&](size_t chunk) {
+    size_t start = chunk * chunk_elems;
+    if (start >= elems) return std::make_pair(elems, (size_t)0);
+    size_t remain = elems - start;
+    size_t count = remain < chunk_elems ? remain : chunk_elems;
+    return std::make_pair(start, count);
+  };
+
+  std::vector<hipEvent_t> ready_events(group_size);
+  std::vector<hipEvent_t> chunk_ready(group_size * segments);
+
+  // Create events per rank/chunk
   for (int off = 0; off < group_size; ++off) {
-    int r = base + off;
-    HIP_CHECK(hipSetDevice(r));
-    HIP_CHECK(hipDeviceSynchronize());
+    int dev = base + off;
+    HIP_CHECK(hipSetDevice(dev));
+    HIP_CHECK(hipEventCreateWithFlags(&ready_events[off], hipEventDisableTiming));
+    for (size_t c = 0; c < segments; ++c) {
+      HIP_CHECK(hipEventCreateWithFlags(&chunk_ready[(size_t)off * segments + c], hipEventDisableTiming));
+    }
   }
-  // Accumulate on root
-  HIP_CHECK(hipSetDevice(root));
-  int blocks = (int)((elems + 255) / 256);
+
+  // Ensure comm streams wait for matvec completion, then prime chunk readiness events.
   for (int off = 0; off < group_size; ++off) {
-    int r = base + off;
-    if (r == root) continue; // root already has its partial
-    HIP_CHECK(hipMemcpyPeerAsync(g_state[root].d_comm_tmp, root,
-                                 g_state[r].d_tb2_partial, r,
-                                 bytes, g_state[root].comm_stream));
-    k_add_inplace<<<blocks, 256, 0, g_state[root].comm_stream>>>(
-        g_state[root].d_tb2_partial, g_state[root].d_comm_tmp, elems);
-    HIP_CHECK(hipGetLastError());
-    HIP_CHECK(hipStreamSynchronize(g_state[root].comm_stream));
+    int dev = base + off;
+    HIP_CHECK(hipSetDevice(dev));
+    hipStream_t stream = g_state[dev].comm_stream;
+    HIP_CHECK(hipEventRecord(ready_events[off], nullptr));
+    HIP_CHECK(hipStreamWaitEvent(stream, ready_events[off], 0));
+    for (size_t c = 0; c < segments; ++c) {
+      HIP_CHECK(hipEventRecord(chunk_ready[(size_t)off * segments + c], stream));
+    }
+  }
+
+  // Scatter-reduce phase: accumulate chunk sums onto their owners.
+  for (int step = 0; step < group_size - 1; ++step) {
+    for (int off = 0; off < group_size; ++off) {
+      int dev = base + off;
+      int prev = base + ((off - 1 + group_size) % group_size);
+      size_t recv_chunk = ((size_t)off + segments - 1 - (size_t)step) % segments;
+      auto [recv_start, recv_count] = chunk_extent(recv_chunk);
+
+      HIP_CHECK(hipSetDevice(dev));
+      hipStream_t stream = g_state[dev].comm_stream;
+      HIP_CHECK(hipStreamWaitEvent(stream, chunk_ready[(size_t)(prev - base) * segments + recv_chunk], 0));
+      if (recv_count > 0) {
+        HIP_CHECK(hipMemcpyPeerAsync(g_state[dev].d_comm_tmp, dev,
+                                     g_state[prev].d_tb2_partial + recv_start, prev,
+                                     recv_count * sizeof(float), stream));
+        int blocks = (int)((recv_count + 255) / 256);
+        if (blocks > 0) {
+          k_add_inplace<<<blocks, 256, 0, stream>>>(
+              g_state[dev].d_tb2_partial + recv_start,
+              g_state[dev].d_comm_tmp,
+              recv_count);
+          HIP_CHECK(hipGetLastError());
+        }
+      }
+      HIP_CHECK(hipEventRecord(chunk_ready[(size_t)off * segments + recv_chunk], stream));
+    }
+  }
+
+  // Allgather phase: circulate the reduced chunks so every rank has the sum.
+  for (int step = 0; step < group_size - 1; ++step) {
+    for (int off = 0; off < group_size; ++off) {
+      int dev = base + off;
+      int prev = base + ((off - 1 + group_size) % group_size);
+      size_t recv_chunk = ((size_t)off + segments - 1 - (size_t)step) % segments;
+      auto [recv_start, recv_count] = chunk_extent(recv_chunk);
+
+      HIP_CHECK(hipSetDevice(dev));
+      hipStream_t stream = g_state[dev].comm_stream;
+      HIP_CHECK(hipStreamWaitEvent(stream, chunk_ready[(size_t)(prev - base) * segments + recv_chunk], 0));
+      if (recv_count > 0) {
+        HIP_CHECK(hipMemcpyPeerAsync(g_state[dev].d_tb2_partial + recv_start, dev,
+                                     g_state[prev].d_tb2_partial + recv_start, prev,
+                                     recv_count * sizeof(float), stream));
+      }
+      HIP_CHECK(hipEventRecord(chunk_ready[(size_t)off * segments + recv_chunk], stream));
+    }
+  }
+
+  // Ensure all comm streams complete before destroying events and returning.
+  for (int off = 0; off < group_size; ++off) {
+    int dev = base + off;
+    HIP_CHECK(hipSetDevice(dev));
+    HIP_CHECK(hipStreamSynchronize(g_state[dev].comm_stream));
+  }
+
+  for (int off = 0; off < group_size; ++off) {
+    int dev = base + off;
+    HIP_CHECK(hipSetDevice(dev));
+    HIP_CHECK(hipEventDestroy(ready_events[off]));
+    for (size_t c = 0; c < segments; ++c) {
+      HIP_CHECK(hipEventDestroy(chunk_ready[(size_t)off * segments + c]));
+    }
   }
 }
 
