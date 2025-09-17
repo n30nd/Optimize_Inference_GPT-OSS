@@ -369,36 +369,114 @@ __global__ void pack_convert_fp32_to_bf16_tiles16_kernel(const float *src_fp32,
   dst_packed[dst_index] = float_to_bf16_dev(src_fp32[idx]);
 }
 
-// Batched BF16xFP32 matvec: Y[b,out] = W[out,in] @ X[b,in]
-__global__ void k_mlp2_matvec_bf16_fp32_batched(const hip_bfloat16* __restrict__ W,
-                                           const float*        __restrict__ X,
-                                           float*              __restrict__ Y,
-                                           int in_features, int out_features) {
-  int row = blockIdx.x;
-  int b   = blockIdx.y;
-  if (row >= out_features) return;
-  const hip_bfloat16* wrow = W + (size_t)row * in_features;
-  const float* x = X + (size_t)b * in_features;
-  float sum = 0.f;
-  for (int j = threadIdx.x; j < in_features; j += blockDim.x) {
-    float w = bf16_to_fp32_bi(wrow[j]);
-    sum += w * x[j];
+// Batched BF16xFP32 matvec with packed weights and fused bias.
+__global__ __launch_bounds__(64)
+void k_mlp2_matvec_bf16_fp32_batched(const hip_bfloat16* __restrict__ W_packed,
+                                     const float* __restrict__ X,
+                                     const float* __restrict__ bias,
+                                     float* __restrict__ Y,
+                                     int in_features,
+                                     int out_features,
+                                     int batch,
+                                     int Mpad,
+                                     int Kpad) {
+  using float4v = __attribute__((ext_vector_type(4))) float;
+
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+  const int lane = ty * blockDim.x + tx;
+
+  const int tile_m = blockIdx.x;
+  const int row0 = tile_m * 16;
+  const int col0 = blockIdx.y * 16;
+  const bool has_bias = (bias != nullptr);
+  (void)Mpad;
+
+  __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
+  __shared__ __align__(16) float        sWf[16 * 16];
+  __shared__ __align__(16) float        sX [16 * 16];
+  __shared__ float sBias[16];
+
+  if (has_bias && lane < 16) {
+    const int r = row0 + lane;
+    sBias[lane] = (r < out_features) ? bias[r] : 0.f;
   }
-  __shared__ float sdata[256];
-  int tid = threadIdx.x;
-  sdata[tid] = sum; __syncthreads();
-  if (blockDim.x >= 256) { if (tid < 128) sdata[tid] += sdata[tid + 128]; __syncthreads(); }
-  if (blockDim.x >= 128) { if (tid <  64) sdata[tid] += sdata[tid +  64]; __syncthreads(); }
-  if (tid < 32) {
-    volatile float* v = sdata;
-    v[tid] += v[tid + 32];
-    v[tid] += v[tid + 16];
-    v[tid] += v[tid +  8];
-    v[tid] += v[tid +  4];
-    v[tid] += v[tid +  2];
-    v[tid] += v[tid +  1];
+  __syncthreads();
+
+  float4v acc = {0.f, 0.f, 0.f, 0.f};
+
+  const int Ktiles = (Kpad + 15) / 16;
+  const size_t tiles_per_row = (size_t)((Kpad + 15) / 16);
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    if (lane < 32) {
+      const size_t tile_base = ((size_t)tile_m * tiles_per_row + (size_t)kk) * (size_t)256;
+      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(W_packed + tile_base)[lane];
+    }
+
+    const int col = col0 + tx;
+    const int x_base = kk * 16 + ty * 4;
+    float xvals[4] = {0.f, 0.f, 0.f, 0.f};
+    if (col < batch && x_base < in_features) {
+      const float* x_col = X + (size_t)col * (size_t)in_features;
+      if (x_base + 3 < in_features) {
+        float4v pack = reinterpret_cast<const float4v*>(x_col + x_base)[0];
+        xvals[0] = pack.x;
+        xvals[1] = pack.y;
+        xvals[2] = pack.z;
+        xvals[3] = pack.w;
+      } else {
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+          int idx = x_base + t;
+          if (idx < in_features) xvals[t] = x_col[idx];
+        }
+      }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const int k_local = ty * 4 + t;
+      sX[k_local * 16 + tx] = xvals[t];
+    }
+
+    __syncthreads();
+
+    int idx4 = lane * 4;
+    if (idx4 < 256) {
+      sWf[idx4 + 0] = bf16_to_fp32_bi(sWb[idx4 + 0]);
+      sWf[idx4 + 1] = bf16_to_fp32_bi(sWb[idx4 + 1]);
+      sWf[idx4 + 2] = bf16_to_fp32_bi(sWb[idx4 + 2]);
+      sWf[idx4 + 3] = bf16_to_fp32_bi(sWb[idx4 + 3]);
+    }
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      const int k4 = ty + 4 * t;
+      float a = sWf[tx * 16 + k4];
+      float b = sX[k4 * 16 + tx];
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a, b, acc, 0, 0, 0);
+    }
+
+    __syncthreads();
   }
-  if (tid == 0) Y[(size_t)b * out_features + row] = sdata[0];
+
+  const int col = col0 + tx;
+  if (col >= batch) return;
+
+  float* out_col = Y + (size_t)col * (size_t)out_features;
+
+  #pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int row = row0 + ty * 4 + i;
+    if (row < out_features) {
+      float val = (i == 0) ? acc.x : (i == 1) ? acc.y : (i == 2) ? acc.z : acc.w;
+      if (has_bias) val += sBias[ty * 4 + i];
+      out_col[row] = val;
+    }
+  }
 }
 
 // RMSNorm for a single vector: y = weight * x / sqrt(mean(x^2)+eps)
@@ -1064,7 +1142,9 @@ struct GPUTransformerWeights {
 #endif
   float*   d_b_mlp1 = nullptr;
 
-  hip_bfloat16* d_w_mlp2 = nullptr;
+  hip_bfloat16* d_w_mlp2_packed = nullptr;
+  int mlp2_Mpad = 0;
+  int mlp2_Kpad = 0;
   float*        d_b_mlp2 = nullptr;
 
   // Router (FP32) per layer
@@ -1621,13 +1701,13 @@ static void forward_one_group_batched_compact(Transformer* tr, int group_id,
             W1, st.d_in_batch, st.d_gate_up, B1, D, 2*I, nb, clampU, clampL,
             devw.mlp1_Mpad, devw.mlp1_Kpad);
         HIP_CHECK(hipGetLastError());
-        const hip_bfloat16* W2 = devw.d_w_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D * I;
+        size_t mlp2_stride = (size_t)devw.mlp2_Mpad * (size_t)devw.mlp2_Kpad;
+        const hip_bfloat16* W2 = devw.d_w_mlp2_packed + ((size_t)l* g_expert_shard[owner].e_count + e_local) * mlp2_stride;
         const float*        B2 = devw.d_b_mlp2 + ((size_t)l* g_expert_shard[owner].e_count + e_local) * (size_t)D;
-        dim3 g2(D, nb), b2d(256);
-        k_mlp2_matvec_bf16_fp32_batched<<<g2, b2d, 0, st.comm_stream>>>(W2, st.d_gate_up, st.d_ffn_out, I, D);
-        HIP_CHECK(hipGetLastError());
-        dim3 gb2((D+255)/256, nb);
-        k_add_bias_batched<<<gb2, 256, 0, st.comm_stream>>>(st.d_ffn_out, B2, D);
+        dim3 b_mlp2(16, 4);
+        dim3 g_mlp2((unsigned int)((D + 15) / 16), (unsigned int)((nb + 15) / 16));
+        k_mlp2_matvec_bf16_fp32_batched<<<g_mlp2, b_mlp2, 0, st.comm_stream>>>(
+            W2, st.d_gate_up, B2, st.d_ffn_out, I, D, nb, devw.mlp2_Mpad, devw.mlp2_Kpad);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipStreamSynchronize(st.comm_stream));
         // Copy back to root and scatter-add with weights
@@ -1918,7 +1998,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     safeHipFree(devw.d_w_o_cols);
     safeHipFree(devw.d_w_mlp1_packed);
     safeHipFree(devw.d_b_mlp1);
-    safeHipFree(devw.d_w_mlp2);
+    safeHipFree(devw.d_w_mlp2_packed);
     safeHipFree(devw.d_b_mlp2);
     safeHipFree(devw.d_w_router);
     safeHipFree(devw.d_b_router);
@@ -2064,13 +2144,17 @@ static void gpu_copy_weights(Transformer* transformer, int r) {
   const int E_local = es.e_count;
   printf("[GPU%d] Allocating MLP weights for %d local experts...\n", r, E_local);
   size_t mlp1_rows_per_block = 2 * (size_t)I;
-  int Mpad = ((2 * I + 15) / 16) * 16;
-  int Kpad = ((D + 15) / 16) * 16;
-  size_t mlp1_packed_elems = (size_t)Mpad * (size_t)Kpad;
+  int mlp1_Mpad = ((2 * I + 15) / 16) * 16;
+  int mlp1_Kpad = ((D + 15) / 16) * 16;
+  size_t mlp1_packed_elems = (size_t)mlp1_Mpad * (size_t)mlp1_Kpad;
+
+  int mlp2_Mpad = ((D + 15) / 16) * 16;
+  int mlp2_Kpad = ((I + 15) / 16) * 16;
+  size_t mlp2_packed_elems = (size_t)mlp2_Mpad * (size_t)mlp2_Kpad;
 
   size_t mlp1_weights_size = (size_t)L * E_local * mlp1_packed_elems * sizeof(hip_bfloat16);
   size_t mlp1_bias_size    = (size_t)L * E_local * mlp1_rows_per_block * sizeof(float);
-  size_t mlp2_weights_size = (size_t)L * E_local * (size_t)D * I * sizeof(hip_bfloat16);
+  size_t mlp2_weights_size = (size_t)L * E_local * mlp2_packed_elems * sizeof(hip_bfloat16);
   size_t mlp2_bias_size    = (size_t)L * E_local * (size_t)D * sizeof(float);
   printf("[GPU%d]   - MLP1 weights (BF16): %.2f MB\n", r, mlp1_weights_size / (1024.0*1024.0));
   printf("[GPU%d]   - MLP1 bias: %.2f MB\n", r, mlp1_bias_size / (1024.0*1024.0));
@@ -2078,10 +2162,12 @@ static void gpu_copy_weights(Transformer* transformer, int r) {
   printf("[GPU%d]   - MLP2 bias: %.2f MB\n", r, mlp2_bias_size / (1024.0*1024.0));
 
   HIP_CHECK(hipMalloc(&devw.d_w_mlp1_packed, mlp1_weights_size));
-  devw.mlp1_Mpad = Mpad;
-  devw.mlp1_Kpad = Kpad;
+  devw.mlp1_Mpad = mlp1_Mpad;
+  devw.mlp1_Kpad = mlp1_Kpad;
   HIP_CHECK(hipMalloc(&devw.d_b_mlp1, mlp1_bias_size));
-  HIP_CHECK(hipMalloc(&devw.d_w_mlp2, mlp2_weights_size));
+  HIP_CHECK(hipMalloc(&devw.d_w_mlp2_packed, mlp2_weights_size));
+  devw.mlp2_Mpad = mlp2_Mpad;
+  devw.mlp2_Kpad = mlp2_Kpad;
   HIP_CHECK(hipMalloc(&devw.d_b_mlp2, mlp2_bias_size));
 
   // Load MLP weights
@@ -2089,22 +2175,25 @@ static void gpu_copy_weights(Transformer* transformer, int r) {
   {
     const int M_mlp1 = 2 * I;
     const int K_mlp1 = D;
+    const int M_mlp2 = D;
+    const int K_mlp2 = I;
     HIP_CHECK(hipMemset(devw.d_w_mlp1_packed, 0, mlp1_weights_size));
+    HIP_CHECK(hipMemset(devw.d_w_mlp2_packed, 0, mlp2_weights_size));
 
     const size_t STAGING_BYTES = (size_t)512 * 1024 * 1024;
     size_t staging_elems = std::max((size_t)1, STAGING_BYTES / sizeof(float));
     const size_t INT_MAX_ELEMS = (size_t)std::numeric_limits<int>::max() - 1024;
     if (staging_elems > INT_MAX_ELEMS) staging_elems = INT_MAX_ELEMS;
-    size_t max_rows = staging_elems / (size_t)K_mlp1;
+    size_t stage_cols = std::max((size_t)K_mlp1, (size_t)K_mlp2);
+    size_t max_rows = staging_elems / stage_cols;
     if (max_rows < 1) max_rows = 1;
 
     float *d_stage_fp32 = nullptr;
-    HIP_CHECK(hipMalloc(&d_stage_fp32, (size_t)max_rows * (size_t)K_mlp1 * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_stage_fp32, (size_t)max_rows * stage_cols * sizeof(float)));
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
 
     std::vector<float>        tmp_b1(mlp1_rows_per_block);
-    std::vector<hip_bfloat16> tmp_w2((size_t)D * I);
     std::vector<float>        tmp_b2(D);
 
     const dim3 block(256);
@@ -2134,7 +2223,7 @@ static void gpu_copy_weights(Transformer* transformer, int r) {
           size_t total = (size_t)rows * (size_t)K_mlp1;
           dim3 grid((unsigned int)((total + block.x - 1) / block.x));
           pack_convert_fp32_to_bf16_tiles16_kernel<<<grid, block, 0, stream>>>(
-              d_stage_fp32, row_off, rows, M_mlp1, K_mlp1, dst_w1, Mpad, Kpad);
+              d_stage_fp32, row_off, rows, M_mlp1, K_mlp1, dst_w1, devw.mlp1_Mpad, devw.mlp1_Kpad);
           HIP_CHECK(hipGetLastError());
         }
         std::copy(B1, B1 + 2ll*I, tmp_b1.begin());
@@ -2142,12 +2231,24 @@ static void gpu_copy_weights(Transformer* transformer, int r) {
 
         const float* W2 = w->w_mlp2 + 1ll*(l*p->n_experts + e_global) * (size_t)D * I;
         const float* B2 = w->b_mlp2 + 1ll*(l*p->n_experts + e_global) * D;
-        for (int i = 0; i < D*I; ++i) tmp_w2[i] = fp32_to_bf16_host(W2[i]);
         std::copy(B2, B2 + D, tmp_b2.begin());
 
-        hip_bfloat16* dst_w2 = devw.d_w_mlp2 + ((size_t)l*E_local + ei) * (size_t)D * I;
+        hip_bfloat16* dst_w2 = devw.d_w_mlp2_packed + ((size_t)l*E_local + ei) * mlp2_packed_elems;
         float*        dst_b2 = devw.d_b_mlp2 + ((size_t)l*E_local + ei) * (size_t)D;
-        memcpyHtoD_chunked(dst_w2, tmp_w2.data(), tmp_w2.size() * sizeof(hip_bfloat16));
+        for (int row_off = 0; row_off < M_mlp2; row_off += (int)max_rows) {
+          int rows = std::min((int)max_rows, M_mlp2 - row_off);
+          size_t tile_bytes = (size_t)rows * (size_t)K_mlp2 * sizeof(float);
+          HIP_CHECK(hipMemcpyAsync(d_stage_fp32,
+                                   W2 + (size_t)row_off * (size_t)K_mlp2,
+                                   tile_bytes,
+                                   hipMemcpyHostToDevice,
+                                   stream));
+          size_t total = (size_t)rows * (size_t)K_mlp2;
+          dim3 grid((unsigned int)((total + block.x - 1) / block.x));
+          pack_convert_fp32_to_bf16_tiles16_kernel<<<grid, block, 0, stream>>>(
+              d_stage_fp32, row_off, rows, M_mlp2, K_mlp2, dst_w2, devw.mlp2_Mpad, devw.mlp2_Kpad);
+          HIP_CHECK(hipGetLastError());
+        }
         memcpyHtoD_chunked(dst_b2, tmp_b2.data(), tmp_b2.size() * sizeof(float));
 
         total_experts_loaded++;
