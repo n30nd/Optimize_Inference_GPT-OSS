@@ -3,7 +3,7 @@
 // Default targets DP=2 and TP+EP per group=4 (total WORLD_GPUS=8),
 // where each DP group owns 4 GPUs and runs the same per-token inputs.
 // - No external GPU libs. Naive HIP kernels focused on correctness.
-// - Weights:    All stored as BF16 (MLP1 now BF16, previously FP8-like)
+// - Weights:    All stored as BF16 (MLP1 now BF16
 // - Activations: FP32 (GPURunState concept)
 // - All-reduce: P2P ring (hipMemcpyPeerAsync) for Attention W_o partials
 // - Warm-up does sharding + chunked copy (512 MB default)
@@ -891,29 +891,6 @@ __global__ void k_zero_inactive_rows(float* buf, const int* __restrict__ pos_lis
   }
 }
 
-// FP8-like (uint8 + per-row scale) matvec: out_rows x in_cols
-// Legacy path retained for future use; not used in current flow.
-#ifndef KEEP_FP8_UTILS
-#define KEEP_FP8_UTILS 1
-#endif
-#if KEEP_FP8_UTILS
-__global__ void k_matvec_fp8_rowscale(const uint8_t* __restrict__ W_u8,
-                                      const float*   __restrict__ scale_rows,
-                                      const float*   __restrict__ x,
-                                      float*               y,
-                                      int in_cols, int out_rows) {
-  int r = blockIdx.x * blockDim.x + threadIdx.x;
-  if (r >= out_rows) return;
-  const uint8_t* row = W_u8 + (size_t)r * in_cols;
-  float s = scale_rows[r];
-  float acc = 0.f;
-  for (int j = 0; j < in_cols; ++j) {
-    float w = (float)((int)row[j] - 128) * s;
-    acc += w * x[j];
-  }
-  y[r] = acc;
-}
-#endif
 
 // ---------------------------------------------
 // Sharding helpers
@@ -956,11 +933,7 @@ struct GPUTransformerWeights {
   int cols_per_layer_local = 0;
 
   hip_bfloat16* d_w_mlp1 = nullptr; // MLP1 as BF16
-#if KEEP_FP8_UTILS
-  // Legacy FP8 packing kept for future experiments
-  uint8_t* d_w_mlp1_u8 = nullptr;
-  float*   d_w_mlp1_scale = nullptr;
-#endif
+
   float*   d_b_mlp1 = nullptr;
 
   hip_bfloat16* d_w_mlp2 = nullptr;
@@ -1133,24 +1106,6 @@ static void pack_layer_w_o_colslice_bf16(const TransformerWeights* w, const Conf
   }
 }
 
-// Legacy: keep rowwise FP8 pack util for future use
-#if KEEP_FP8_UTILS
-static void pack_rowwise_fp8_u8(const float* src, uint8_t* dst_u8, float* scale_rows,
-                                int out_rows, int in_cols) {
-  for (int r = 0; r < out_rows; ++r) {
-    const float* row = src + 1ll*r*in_cols;
-    float amax = 0.f;
-    for (int j = 0; j < in_cols; ++j) amax = std::max(amax, fabsf(row[j]));
-    float s = (amax > 0.f) ? (amax / 127.f) : 1.f;
-    scale_rows[r] = s;
-    for (int j = 0; j < in_cols; ++j) {
-      int v = (int)lrintf(row[j] / s);
-      v = std::max(-127, std::min(127, v));
-      dst_u8[1ll*r*in_cols + j] = (uint8_t)(v + 128);
-    }
-  }
-}
-#endif
 
 // ---------------------------------------------
 // Memory utility functions
@@ -1829,10 +1784,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     safeHipFree(devw.d_rms_out_w);
     safeHipFree(devw.d_attn_sinks);
     safeHipFree(devw.d_b_o);
-#if KEEP_FP8_UTILS
-    safeHipFree(devw.d_w_mlp1_u8);
-    safeHipFree(devw.d_w_mlp1_scale);
-#endif
     safeHipFree(devw.d_w_out);
     // Run state
     safeHipFree(st.d_kv_k);
