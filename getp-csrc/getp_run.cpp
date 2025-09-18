@@ -12,6 +12,7 @@
 #include "getp_eval.cpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
+#include <cfloat>
 #include <limits>
 #include <stdint.h>
 #include <stdlib.h>
@@ -2053,19 +2054,51 @@ __global__ void flash_attention_kernel_optimized_batched(
 // (Fallback multi-head attention and env-based FlashAttention config removed to simplify code.)
 
 
-__global__ void sample_argmax_kernel(const float *logits, int *next_tokens, int batch, int vocab_size) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void sample_argmax_kernel(const float *logits, int *next_tokens,
+                                     int batch, int vocab_size) {
+    int b = blockIdx.x;
     if (b >= batch) return;
-    const float *logit = logits + b * vocab_size;
-    float max_val = logit[0];
-    int max_idx = 0;
-    for (int i = 1; i < vocab_size; ++i) {
-        if (logit[i] > max_val) {
-            max_val = logit[i];
-            max_idx = i;
+
+    const float *logit = logits + (size_t)b * (size_t)vocab_size;
+    int tid = threadIdx.x;
+
+    float max_val = -FLT_MAX;
+    int max_idx = -1;
+
+    // Each thread scans a strided subset of the vocabulary.
+    for (int idx = tid; idx < vocab_size; idx += blockDim.x) {
+        float val = logit[idx];
+        if (val > max_val) {
+            max_val = val;
+            max_idx = idx;
         }
     }
-    next_tokens[b] = max_idx;
+
+    extern __shared__ unsigned char smem[];
+    float *s_vals = reinterpret_cast<float*>(smem);
+    int *s_indices = reinterpret_cast<int*>(s_vals + blockDim.x);
+
+    s_vals[tid] = max_val;
+    s_indices[tid] = max_idx;
+    __syncthreads();
+
+    // Block-wide reduction to find the maximum value and its index.
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            float other_val = s_vals[tid + offset];
+            int other_idx = s_indices[tid + offset];
+            if (other_val > s_vals[tid] ||
+                (other_val == s_vals[tid] && other_idx < s_indices[tid])) {
+                s_vals[tid] = other_val;
+                s_indices[tid] = other_idx;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        next_tokens[b] = s_indices[0] >= 0 ? s_indices[0] : 0;
+    }
 }
 
 
@@ -3080,10 +3113,13 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       vocab, hidden_dim, batch, Bpad_logits, vocab,
       leader->d_batch_iota, leader->batch_stream);
 
-    dim3 block_argmax(64);
-    dim3 grid_argmax((batch + block_argmax.x - 1) / block_argmax.x);
-    sample_argmax_kernel<<<grid_argmax, block_argmax, 0, leader->batch_stream>>>(
-      leader->state.logits_fp32, leader->d_next_tokens, batch, p->vocab_size);
+    if (batch > 0) {
+      dim3 block_argmax(256);
+      dim3 grid_argmax(batch);
+      size_t shared_argmax = block_argmax.x * (sizeof(float) + sizeof(int));
+      sample_argmax_kernel<<<grid_argmax, block_argmax, shared_argmax, leader->batch_stream>>>(
+        leader->state.logits_fp32, leader->d_next_tokens, batch, p->vocab_size);
+    }
 
     HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, leader->d_next_tokens,
                              batch * sizeof(int), hipMemcpyDeviceToHost, leader->batch_stream));
