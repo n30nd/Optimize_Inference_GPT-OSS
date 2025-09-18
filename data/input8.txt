@@ -1,0 +1,9 @@
+8
+Hello
+Hello world
+Write a short haiku about the ocean.
+ฉันรักทะเล
+naïve façade — déjà vu
+🍣 sushi and 🍜 ramen
+email: test@example.com
+!@#$%^&*()_+-=[]{}|;:',.<>/?
