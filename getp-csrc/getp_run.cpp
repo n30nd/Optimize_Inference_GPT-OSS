@@ -65,8 +65,10 @@ typedef struct {
   hip_bfloat16 *attn_sinks;
   hip_bfloat16 *w_router;
   hip_bfloat16 *b_router;
-  hip_bfloat16 *w_mlp1;
-  hip_bfloat16 *w_mlp2;
+  uint8_t *w_mlp1_data;
+  uint8_t *w_mlp1_scales;
+  uint8_t *w_mlp2_data;
+  uint8_t *w_mlp2_scales;
   hip_bfloat16 *b_mlp1;
   hip_bfloat16 *b_mlp2;
 } GPUTransformerWeights;
@@ -150,6 +152,57 @@ __device__ __forceinline__ hip_bfloat16 float_to_bfloat16(float f) {
 }
 __device__ __host__ __forceinline__ float bfloat16_to_float(hip_bfloat16 bf) {
   return float(bf);
+}
+
+// ------------------------- MXFP4 utils -------------------------
+
+constexpr int MXFP4_BLOCK_SIZE = 32;
+constexpr float MXFP4_LEVEL_ABS_MAX = 6.0f;
+constexpr float MXFP4_LEVELS[16] = {
+  +0.0f, +0.5f, +1.0f, +1.5f,
+  +2.0f, +3.0f, +4.0f, +6.0f,
+  -0.0f, -0.5f, -1.0f, -1.5f,
+  -2.0f, -3.0f, -4.0f, -6.0f
+};
+constexpr float MXFP4_THRESHOLDS[7] = {
+  0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f
+};
+
+__host__ __device__ __forceinline__ float decode_e8m0(uint8_t code) {
+  int exp_unbiased = static_cast<int>(code) - 127;
+  return ldexpf(1.0f, exp_unbiased);
+}
+
+__host__ inline uint8_t encode_e8m0(float scale) {
+  if (!(scale > 0.0f) || !isfinite(scale)) {
+    return static_cast<uint8_t>(127); // pow2 exponent 0 -> scale 1.0f
+  }
+  float log2_scale = log2f(scale);
+  int exp_unbiased = static_cast<int>(ceilf(log2_scale));
+  if (exp_unbiased < -127) exp_unbiased = -127;
+  if (exp_unbiased > 128) exp_unbiased = 128;
+  int encoded = exp_unbiased + 127;
+  if (encoded < 0) encoded = 0;
+  if (encoded > 255) encoded = 255;
+  return static_cast<uint8_t>(encoded);
+}
+
+__host__ __device__ __forceinline__ float decode_mxfp4(uint8_t nibble) {
+  return MXFP4_LEVELS[nibble & 0x0F];
+}
+
+__host__ inline uint8_t encode_mxfp4(float v) {
+  if (!isfinite(v)) v = 0.0f;
+  float a = fabsf(v);
+  int idx = 0;
+  while (idx < 7 && a > MXFP4_THRESHOLDS[idx]) {
+    ++idx;
+  }
+  if (v < 0.0f) {
+    return static_cast<uint8_t>(idx + 8);
+  } else {
+    return static_cast<uint8_t>(idx);
+  }
 }
 
 // ------------------------- Kernels -------------------------
@@ -754,7 +807,10 @@ __global__ void gather_topk_pairs_kernel(const float *topv, const int *topi,
 
 // Grouped MLP1: for each (sid,e) pair compute y = W_mlp1[e] * t[sid] + b_mlp1[e]
 __global__ void mlp1_grouped_kernel_float(float *mlp1_out_all,
-                                          const float *t, const hip_bfloat16 *w_mlp1, const hip_bfloat16 *b_mlp1,
+                                          const float *t,
+                                          const uint8_t *w_mlp1_data,
+                                          const uint8_t *w_mlp1_scales,
+                                          const hip_bfloat16 *b_mlp1,
                                           const int *sel_sids, const int *sel_eids,
                                           int M, int hidden_dim, int intermediate_dim,
                                           int layer, int n_experts) {
@@ -778,11 +834,25 @@ __global__ void mlp1_grouped_kernel_float(float *mlp1_out_all,
   int out_dim = 2 * intermediate_dim;
   if (o < out_dim) {
     size_t base = ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)out_dim * (size_t)hidden_dim;
-    const hip_bfloat16 *w = w_mlp1 + base + (size_t)o * (size_t)hidden_dim;
+    size_t row_start = base + (size_t)o * (size_t)hidden_dim;
     float sum = 0.0f;
-    #pragma unroll 4
-    for (int j = 0; j < hidden_dim; ++j) {
-      sum += bfloat16_to_float(w[j]) * x_shared[j];
+    int j = 0;
+    while (j < hidden_dim) {
+      size_t elem_index = row_start + (size_t)j;
+      uint8_t scale_byte = w_mlp1_scales[elem_index / MXFP4_BLOCK_SIZE];
+      float scale = decode_e8m0(scale_byte);
+      int block_offset = static_cast<int>(elem_index % MXFP4_BLOCK_SIZE);
+      int span = hidden_dim - j;
+      int remaining = MXFP4_BLOCK_SIZE - block_offset;
+      if (span > remaining) span = remaining;
+      for (int t_idx = 0; t_idx < span; ++t_idx) {
+        size_t idx = elem_index + (size_t)t_idx;
+        uint8_t packed = w_mlp1_data[idx >> 1];
+        uint8_t nibble = (idx & 1ULL) ? (packed >> 4) : (packed & 0xF);
+        float wv = decode_mxfp4(nibble) * scale;
+        sum += wv * x_shared[j + t_idx];
+      }
+      j += span;
     }
     const hip_bfloat16 *b = b_mlp1 + ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)out_dim;
     mlp1_out_all[(size_t)m * (size_t)out_dim + (size_t)o] = sum + bfloat16_to_float(b[o]);
@@ -813,7 +883,9 @@ __global__ void swiglu_grouped_kernel_float(float *gate_up_all, const float *mlp
 // and atomically accumulate into e_agg[sid]
 __global__ void mlp2_accum_grouped_kernel_float(float *e_agg,
                                                 const float *gate_up_all,
-                                                const hip_bfloat16 *w_mlp2, const hip_bfloat16 *b_mlp2,
+                                                const uint8_t *w_mlp2_data,
+                                                const uint8_t *w_mlp2_scales,
+                                                const hip_bfloat16 *b_mlp2,
                                                 const int *sel_sids, const int *sel_eids, const float *sel_w,
                                                 int M, int hidden_dim, int intermediate_dim,
                                                 int layer, int n_experts, int eagg_stride) {
@@ -825,10 +897,25 @@ __global__ void mlp2_accum_grouped_kernel_float(float *e_agg,
     float ew = sel_w[m];
     const float *g = gate_up_all + (size_t)m * (size_t)intermediate_dim;
     size_t base = ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)hidden_dim * (size_t)intermediate_dim;
-    const hip_bfloat16 *w = w_mlp2 + base + (size_t)i * (size_t)intermediate_dim;
+    size_t row_start = base + (size_t)i * (size_t)intermediate_dim;
     float sum = 0.0f;
-    for (int j = 0; j < intermediate_dim; ++j) {
-      sum += bfloat16_to_float(w[j]) * g[j];
+    int j = 0;
+    while (j < intermediate_dim) {
+      size_t elem_index = row_start + (size_t)j;
+      uint8_t scale_byte = w_mlp2_scales[elem_index / MXFP4_BLOCK_SIZE];
+      float scale = decode_e8m0(scale_byte);
+      int block_offset = static_cast<int>(elem_index % MXFP4_BLOCK_SIZE);
+      int span = intermediate_dim - j;
+      int remaining = MXFP4_BLOCK_SIZE - block_offset;
+      if (span > remaining) span = remaining;
+      for (int t_idx = 0; t_idx < span; ++t_idx) {
+        size_t idx = elem_index + (size_t)t_idx;
+        uint8_t packed = w_mlp2_data[idx >> 1];
+        uint8_t nibble = (idx & 1ULL) ? (packed >> 4) : (packed & 0xF);
+        float wv = decode_mxfp4(nibble) * scale;
+        sum += wv * g[j + t_idx];
+      }
+      j += span;
     }
     const hip_bfloat16 *b = b_mlp2 + ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)hidden_dim;
     float y = sum + bfloat16_to_float(b[i]);
@@ -1417,7 +1504,10 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       // Use dynamic shared memory to cache input vector x per selection
       mlp1_grouped_kernel_float<<<grid, block, (size_t)hidden_dim * sizeof(float), gpu_ctx->batch_stream>>>(
         gpu_ctx->state.mlp1_out_all,
-        gpu_ctx->state.t, gpu_ctx->weights.w_mlp1, gpu_ctx->weights.b_mlp1,
+        gpu_ctx->state.t,
+        gpu_ctx->weights.w_mlp1_data,
+        gpu_ctx->weights.w_mlp1_scales,
+        gpu_ctx->weights.b_mlp1,
         gpu_ctx->state.sel_sids, gpu_ctx->state.sel_eids,
         M, hidden_dim, p->intermediate_dim,
         l, p->n_experts);
@@ -1435,7 +1525,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       mlp2_accum_grouped_kernel_float<<<grid, block, 0, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.e_agg,
         gpu_ctx->state.gate_up_all,
-        gpu_ctx->weights.w_mlp2, gpu_ctx->weights.b_mlp2,
+        gpu_ctx->weights.w_mlp2_data,
+        gpu_ctx->weights.w_mlp2_scales,
+        gpu_ctx->weights.b_mlp2,
         gpu_ctx->state.sel_sids, gpu_ctx->state.sel_eids, gpu_ctx->state.sel_w,
         M, hidden_dim, p->intermediate_dim,
         l, p->n_experts, hidden_dim);
@@ -1829,6 +1921,88 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipStreamDestroy(stream));
   };
 
+  auto copy_and_quantize_mxfp4 = [&](const float *cpu_data,
+                                     uint8_t **gpu_data,
+                                     uint8_t **gpu_scales,
+                                     size_t count) {
+    if (count == 0) {
+      *gpu_data = nullptr;
+      *gpu_scales = nullptr;
+      return;
+    }
+
+    size_t total_blocks = (count + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
+    size_t data_bytes = (count + 1) / 2;
+
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(gpu_data), data_bytes));
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(gpu_scales), total_blocks * sizeof(uint8_t)));
+
+    hipStream_t stream;
+    HIP_CHECK(hipStreamCreate(&stream));
+
+    const size_t MAX_BLOCKS_PER_TILE = 1 << 15; // 32K blocks per tile (1M elements)
+    std::vector<uint8_t> data_tile(((size_t)MAX_BLOCKS_PER_TILE * MXFP4_BLOCK_SIZE + 1) / 2);
+    std::vector<uint8_t> scale_tile(MAX_BLOCKS_PER_TILE);
+
+    size_t block_idx = 0;
+    while (block_idx < total_blocks) {
+      size_t blocks = total_blocks - block_idx;
+      if (blocks > MAX_BLOCKS_PER_TILE) blocks = MAX_BLOCKS_PER_TILE;
+
+      size_t tile_elem_start = block_idx * (size_t)MXFP4_BLOCK_SIZE;
+      size_t remaining_elems = count - tile_elem_start;
+      size_t tile_elem_count = blocks * (size_t)MXFP4_BLOCK_SIZE;
+      if (tile_elem_count > remaining_elems) tile_elem_count = remaining_elems;
+      size_t tile_data_bytes = (tile_elem_count + 1) / 2;
+
+      std::fill(data_tile.begin(), data_tile.begin() + tile_data_bytes, 0);
+
+      for (size_t b = 0; b < blocks; ++b) {
+        size_t global_block = block_idx + b;
+        size_t block_elem_start = global_block * (size_t)MXFP4_BLOCK_SIZE;
+        size_t block_elem_count = MXFP4_BLOCK_SIZE;
+        if (block_elem_start + block_elem_count > count) {
+          block_elem_count = count - block_elem_start;
+        }
+
+        const float *src = cpu_data + block_elem_start;
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < block_elem_count; ++i) {
+          float abs_val = fabsf(src[i]);
+          if (abs_val > max_abs) max_abs = abs_val;
+        }
+
+        float raw_scale = max_abs > 0.0f ? max_abs / MXFP4_LEVEL_ABS_MAX : 1.0f;
+        uint8_t scale_code = encode_e8m0(raw_scale);
+        scale_tile[b] = scale_code;
+        float scale = decode_e8m0(scale_code);
+
+        for (size_t i = 0; i < block_elem_count; ++i) {
+          size_t elem_index_in_tile = b * (size_t)MXFP4_BLOCK_SIZE + i;
+          float v = src[i] / scale;
+          uint8_t code = encode_mxfp4(v);
+          size_t byte_index = elem_index_in_tile >> 1;
+          if ((elem_index_in_tile & 1ULL) == 0ULL) {
+            data_tile[byte_index] = (data_tile[byte_index] & 0xF0) | (code & 0x0F);
+          } else {
+            data_tile[byte_index] = (data_tile[byte_index] & 0x0F) | ((code & 0x0F) << 4);
+          }
+        }
+      }
+
+      size_t dest_byte_offset = tile_elem_start >> 1;
+      HIP_CHECK(hipMemcpyAsync(*gpu_data + dest_byte_offset, data_tile.data(), tile_data_bytes,
+                               hipMemcpyHostToDevice, stream));
+      HIP_CHECK(hipMemcpyAsync(*gpu_scales + block_idx, scale_tile.data(), blocks * sizeof(uint8_t),
+                               hipMemcpyHostToDevice, stream));
+
+      block_idx += blocks;
+    }
+
+    HIP_CHECK(hipStreamSynchronize(stream));
+    HIP_CHECK(hipStreamDestroy(stream));
+  };
+
   // Counts as size_t to avoid overflow
   size_t token_embed_count = (size_t)vocab_size * (size_t)hidden_dim;
   copy_and_convert(cpu_w->token_embedding_table, &gpu_w->token_embedding_table, token_embed_count);
@@ -1865,13 +2039,13 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   copy_and_convert(cpu_w->b_router, &gpu_w->b_router, router_b_count);
 
   size_t mlp1_w_count = (size_t)n_layers * (size_t)n_experts * (size_t)2 * (size_t)intermediate_dim * (size_t)hidden_dim;
-  copy_and_convert(cpu_w->w_mlp1, &gpu_w->w_mlp1, mlp1_w_count);
+  copy_and_quantize_mxfp4(cpu_w->w_mlp1, &gpu_w->w_mlp1_data, &gpu_w->w_mlp1_scales, mlp1_w_count);
 
   size_t mlp1_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)2 * (size_t)intermediate_dim;
   copy_and_convert(cpu_w->b_mlp1, &gpu_w->b_mlp1, mlp1_b_count);
 
   size_t mlp2_w_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim * (size_t)intermediate_dim;
-  copy_and_convert(cpu_w->w_mlp2, &gpu_w->w_mlp2, mlp2_w_count);
+  copy_and_quantize_mxfp4(cpu_w->w_mlp2, &gpu_w->w_mlp2_data, &gpu_w->w_mlp2_scales, mlp2_w_count);
 
   size_t mlp2_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim;
   copy_and_convert(cpu_w->b_mlp2, &gpu_w->b_mlp2, mlp2_b_count);
@@ -1890,8 +2064,10 @@ void gpu_free_weights(GPUTransformerWeights *gpu_w) {
   HIP_CHECK(hipFree(gpu_w->attn_sinks));
   HIP_CHECK(hipFree(gpu_w->w_router));
   HIP_CHECK(hipFree(gpu_w->b_router));
-  HIP_CHECK(hipFree(gpu_w->w_mlp1));
+  HIP_CHECK(hipFree(gpu_w->w_mlp1_data));
+  HIP_CHECK(hipFree(gpu_w->w_mlp1_scales));
   HIP_CHECK(hipFree(gpu_w->b_mlp1));
-  HIP_CHECK(hipFree(gpu_w->w_mlp2));
+  HIP_CHECK(hipFree(gpu_w->w_mlp2_data));
+  HIP_CHECK(hipFree(gpu_w->w_mlp2_scales));
   HIP_CHECK(hipFree(gpu_w->b_mlp2));
 }
