@@ -122,6 +122,10 @@ typedef struct {
   float *router_score_full;
   // MFMA packed buffers
   float *xpack_f32;       // Packed input buffer for MFMA [K_max x Bpad]
+  // Grouped MoE metadata per launch
+  int   *sel_block_cols;   // block -> base selection index (size >= selections)
+  int   *sel_block_sizes;  // block -> number of valid columns in block (<=16)
+  int   *sel_block_eids;   // block -> expert id
 } GPURunState;
 
 struct ParallelLayout {
@@ -424,8 +428,11 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     const uint8_t* __restrict__ w_scales,    // e8m0 per-32-block (row-major)
     const hip_bfloat16* __restrict__ b_mlp1, // [n_layers*n_experts][out_dim]
     const int* __restrict__ sel_sids,        // [M]
-    const int* __restrict__ sel_eids,        // [M]
+    const int* __restrict__ sel_block_cols,  // [num_blocks]
+    const int* __restrict__ sel_block_sizes, // [num_blocks]
+    const int* __restrict__ sel_block_eids,  // [num_blocks]
     int selections_M,
+    int total_blocks,
     int hidden_dim, int out_dim,
     int layer, int n_experts)
 {
@@ -433,36 +440,46 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   const int ty = threadIdx.y;  // 0..3  (row groups)
   const int lane = ty * 16 + tx; // 0..63
 
-  const int tile_m = blockIdx.x;        // along M (rows)
-  const int msel   = blockIdx.y;        // selection index
-  if (msel >= selections_M) return;
+  const int tile_m  = blockIdx.x;  // along output rows (hidden_dim)
+  const int block_id = blockIdx.y; // block covering up to 16 selections for one expert
+  if (block_id >= total_blocks) return;
+
+  const int col0 = sel_block_cols[block_id];
+  const int valid_cols = sel_block_sizes[block_id];
+  const int eid = sel_block_eids[block_id];
+  if (valid_cols <= 0) return;
 
   const int base_row = tile_m * 16;
 
-  const int sid = sel_sids[msel];
-  const int eid = sel_eids[msel];
-
   const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
   const size_t row_stride = (size_t)hidden_dim;
-  const size_t base = mat_index * (size_t)out_dim * row_stride; // for scales (row-major)
-  const hip_bfloat16* __restrict__ B = b_mlp1 + mat_index * (size_t)out_dim;
+  const size_t base_scale = mat_index * (size_t)out_dim * row_stride; // for scales (row-major)
+  const hip_bfloat16* __restrict__ B = b_mlp1 ? (b_mlp1 + mat_index * (size_t)out_dim) : nullptr;
 
   __shared__ __align__(16) float sWf[16 * 16];
   __shared__ __align__(16) float sX[16 * 16];
+  __shared__ __align__(16) float sBias[16];
+
+  if (lane < 16) {
+    const int row = base_row + lane;
+    sBias[lane] = (B && row < out_dim) ? bfloat16_to_float(B[row]) : 0.f;
+  }
+  __syncthreads();
 
   using float4v = __attribute__((ext_vector_type(4))) float;
-  float4v dmn = {0.f, 0.f, 0.f, 0.f};
+  float4v acc = {0.f, 0.f, 0.f, 0.f};
 
   const int K = hidden_dim;
-  const int Ktiles = (K + 15) / 16;
-
-  // Compute packed matrix base (tile-major nibble layout)
   const int tiles_m = (out_dim + 15) / 16;
-  const int tiles_k = (hidden_dim + 15) / 16;
+  const int tiles_k = (K + 15) / 16;
   const size_t packed_mat_bytes = (size_t)tiles_m * (size_t)tiles_k * (size_t)128; // 128 bytes per 16x16 tile (256 nibbles)
   const uint8_t* __restrict__ Wpack = w_data + mat_index * packed_mat_bytes;
+  const size_t tiles_per_row = (size_t)tiles_k;
 
-  for (int kk = 0; kk < Ktiles; ++kk) {
+  for (int kk = 0; kk < tiles_k; ++kk) {
+    const size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
+    const size_t tile_base_byte = tile_linear * (size_t)128;
+
     // Fill W tile [16x16] by dequantizing from MXFP4
     int idx4 = lane * 4;
     if (idx4 < 256) {
@@ -475,13 +492,9 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
         int col = kk * 16 + ik;
         float wv = 0.f;
         if (row < out_dim && col < K) {
-          size_t elem_index = base + (size_t)row * row_stride + (size_t)col; // for scale indexing
+          size_t elem_index = base_scale + (size_t)row * row_stride + (size_t)col;
           uint8_t scale_code = w_scales[elem_index / MXFP4_BLOCK_SIZE];
           float scale = decode_e8m0(scale_code);
-          // tile-packed lookup
-          size_t tiles_per_row = (size_t)tiles_k;
-          size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
-          size_t tile_base_byte = tile_linear * (size_t)128;
           size_t byte_off = tile_base_byte + ((size_t)te >> 1);
           uint8_t packed = Wpack[byte_off];
           uint8_t nibble = (te & 1) ? (uint8_t)(packed >> 4) : (uint8_t)(packed & 0xF);
@@ -491,18 +504,26 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
       }
     }
 
-    // Build X tile [16x16] by replicating vector entries across 16 columns
+    // Build X tile [16x16] by gathering up to 16 distinct selections
     if (lane < 64) {
       const int r   = lane % 16;        // K row within tile
       const int c4  = (lane / 16) * 4;  // column block index {0,4,8,12}
       const int k_row = kk * 16 + r;
-      float v = 0.f;
-      if (k_row < K) {
-        const float* __restrict__ x_b = t + (size_t)sid * (size_t)hidden_dim;
-        v = x_b[k_row];
-      }
       float* dst = sX + r * 16 + c4;
-      dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = v;
+      #pragma unroll
+      for (int jj = 0; jj < 4; ++jj) {
+        int col = c4 + jj;
+        float v = 0.f;
+        if (col < valid_cols && k_row < K) {
+          int msel = col0 + col;
+          if (msel < selections_M) {
+            int sid = sel_sids[msel];
+            const float* __restrict__ x = t + (size_t)sid * (size_t)hidden_dim;
+            v = x[k_row];
+          }
+        }
+        dst[jj] = v;
+      }
     }
 
     __syncthreads();
@@ -512,20 +533,21 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
       const int k4 = ty + 4 * t4; // 0..15
       float amk = sWf[tx * 16 + k4];   // A: row=tx, col=k4
       float bkn = sX[k4 * 16 + tx];    // B: row=k4, col=tx
-      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, acc, 0, 0, 0);
     }
 
     __syncthreads();
   }
 
-  if (tx == 0) {
+  const int msel = col0 + tx;
+  if (tx < valid_cols && msel < selections_M) {
     float* out_vec = mlp1_out_all + (size_t)msel * (size_t)out_dim;
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      const int row = base_row + (ty * 4 + i);
+      const int rloc = ty * 4 + i;
+      const int row = base_row + rloc;
       if (row < out_dim) {
-        const float biasv = B ? bfloat16_to_float(B[row]) : 0.f;
-        out_vec[row] = dmn[i] + biasv;
+        out_vec[row] = acc[i] + sBias[rloc];
       }
     }
   }
@@ -664,9 +686,12 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
     const uint8_t* __restrict__ w_scales,     // row-major e8m0 per-32 block
     const hip_bfloat16* __restrict__ b_mlp2,  // [n_layers*n_experts][hidden_dim]
     const int* __restrict__ sel_sids,         // [M]
-    const int* __restrict__ sel_eids,         // [M]
     const float* __restrict__ sel_w,          // [M]
+    const int* __restrict__ sel_block_cols,   // [num_blocks]
+    const int* __restrict__ sel_block_sizes,  // [num_blocks]
+    const int* __restrict__ sel_block_eids,   // [num_blocks]
     int selections_M,
+    int total_blocks,
     int hidden_dim, int intermediate_dim,
     int layer, int n_experts,
     int eagg_stride) {
@@ -675,34 +700,47 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
   const int ty = threadIdx.y;  // 0..3
   const int lane = ty * 16 + tx; // 0..63
 
-  const int tile_m = blockIdx.x;        // along output rows (hidden_dim)
-  const int msel   = blockIdx.y;        // selection index
-  if (msel >= selections_M) return;
+  const int tile_m  = blockIdx.x;  // along output rows (hidden_dim)
+  const int block_id = blockIdx.y; // block covering up to 16 selections for one expert
+  if (block_id >= total_blocks) return;
+
+  const int col0 = sel_block_cols[block_id];
+  const int valid_cols = sel_block_sizes[block_id];
+  const int eid = sel_block_eids[block_id];
+  if (valid_cols <= 0) return;
 
   const int base_row = tile_m * 16;
-  const int sid = sel_sids[msel];
-  const int eid = sel_eids[msel];
-  const float ew = sel_w[msel];
 
   const int Mout = hidden_dim;
   const int Kdim = intermediate_dim;
-  const int tiles_k = (Kdim + 15) / 16;
-
   const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
   const size_t row_stride = (size_t)intermediate_dim;
   const size_t base_scale = mat_index * (size_t)Mout * row_stride; // for scales (row-major indexing)
-  const int tiles_m = (Mout + 15) / 16;
-  const size_t packed_mat_bytes = (size_t)tiles_m * (size_t)tiles_k * (size_t)128;
-  const uint8_t* __restrict__ Wpack = w_data + mat_index * packed_mat_bytes;
-  const hip_bfloat16* __restrict__ B = b_mlp2 + mat_index * (size_t)hidden_dim;
+  const hip_bfloat16* __restrict__ B = b_mlp2 ? (b_mlp2 + mat_index * (size_t)hidden_dim) : nullptr;
 
   __shared__ __align__(16) float sWf[16 * 16];
   __shared__ __align__(16) float sX[16 * 16];
+  __shared__ __align__(16) float sBias[16];
+
+  if (lane < 16) {
+    const int row = base_row + lane;
+    sBias[lane] = (B && row < Mout) ? bfloat16_to_float(B[row]) : 0.f;
+  }
+  __syncthreads();
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   float4v acc = {0.f, 0.f, 0.f, 0.f};
 
+  const int tiles_m = (Mout + 15) / 16;
+  const int tiles_k = (Kdim + 15) / 16;
+  const size_t packed_mat_bytes = (size_t)tiles_m * (size_t)tiles_k * (size_t)128;
+  const uint8_t* __restrict__ Wpack = w_data + mat_index * packed_mat_bytes;
+  const size_t tiles_per_row = (size_t)tiles_k;
+
   for (int kk = 0; kk < tiles_k; ++kk) {
+    const size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
+    const size_t tile_base_byte = tile_linear * (size_t)128;
+
     int idx4 = lane * 4;
     if (idx4 < 256) {
       #pragma unroll
@@ -714,12 +752,9 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
         int col = kk * 16 + ik;
         float wv = 0.f;
         if (row < Mout && col < Kdim) {
-          size_t elem_index = base_scale + (size_t)row * row_stride + (size_t)col; // for scale indexing
+          size_t elem_index = base_scale + (size_t)row * row_stride + (size_t)col;
           uint8_t scale_code = w_scales[elem_index / MXFP4_BLOCK_SIZE];
           float scale = decode_e8m0(scale_code);
-          size_t tiles_per_row = (size_t)tiles_k;
-          size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
-          size_t tile_base_byte = tile_linear * (size_t)128;
           size_t byte_off = tile_base_byte + ((size_t)te >> 1);
           uint8_t packed = Wpack[byte_off];
           uint8_t nibble = (te & 1) ? (uint8_t)(packed >> 4) : (uint8_t)(packed & 0xF);
@@ -729,18 +764,23 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
       }
     }
 
-    // Build X tile [16x16] by replicating vector entries across 16 columns from gate_up_all[msel]
     if (lane < 64) {
       const int r   = lane % 16;        // K row within tile
       const int c4  = (lane / 16) * 4;  // column block index {0,4,8,12}
       const int k_row = kk * 16 + r;
-      float v = 0.f;
-      if (k_row < Kdim) {
-        const float* __restrict__ g = gate_up_all + (size_t)msel * (size_t)intermediate_dim;
-        v = g[k_row];
-      }
       float* dst = sX + r * 16 + c4;
-      dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = v;
+      #pragma unroll
+      for (int jj = 0; jj < 4; ++jj) {
+        int col = c4 + jj;
+        float v = 0.f;
+        if (col < valid_cols && k_row < Kdim) {
+          int msel = col0 + col;
+          if (msel < selections_M) {
+            v = gate_up_all[(size_t)msel * (size_t)intermediate_dim + (size_t)k_row];
+          }
+        }
+        dst[jj] = v;
+      }
     }
 
     __syncthreads();
@@ -756,27 +796,19 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
     __syncthreads();
   }
 
-  if (tx == 0) {
-    const int row0 = base_row + ty * 4 + 0;
-    const int row1 = base_row + ty * 4 + 1;
-    const int row2 = base_row + ty * 4 + 2;
-    const int row3 = base_row + ty * 4 + 3;
+  const int msel = col0 + tx;
+  if (tx < valid_cols && msel < selections_M) {
+    const int sid = sel_sids[msel];
+    const float ew = sel_w[msel];
     float* out_slot = e_agg + (size_t)sid * (size_t)eagg_stride;
-    if (row0 < Mout) {
-      float y = acc[0] + (B ? bfloat16_to_float(B[row0]) : 0.f);
-      atomicAdd(&out_slot[row0], ew * y);
-    }
-    if (row1 < Mout) {
-      float y = acc[1] + (B ? bfloat16_to_float(B[row1]) : 0.f);
-      atomicAdd(&out_slot[row1], ew * y);
-    }
-    if (row2 < Mout) {
-      float y = acc[2] + (B ? bfloat16_to_float(B[row2]) : 0.f);
-      atomicAdd(&out_slot[row2], ew * y);
-    }
-    if (row3 < Mout) {
-      float y = acc[3] + (B ? bfloat16_to_float(B[row3]) : 0.f);
-      atomicAdd(&out_slot[row3], ew * y);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int rloc = ty * 4 + i;
+      const int row = base_row + rloc;
+      if (row < Mout) {
+        float y = acc[i] + sBias[rloc];
+        atomicAdd(&out_slot[row], ew * y);
+      }
     }
   }
 }
@@ -2900,6 +2932,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     HIP_CHECK(hipMemcpy(host_sel_w.data(), leader->state.sel_w, M * sizeof(float), hipMemcpyDeviceToHost));
 
     std::vector<int> local_M(ctxs.size(), 0);
+    std::vector<int> local_block_counts(ctxs.size(), 0);
     for (size_t idx = 0; idx < ctxs.size(); ++idx) {
       GPUContext *ctx = ctxs[idx];
       std::vector<int> sel_sids_local;
@@ -2916,12 +2949,74 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           sel_w_local.push_back(host_sel_w[m]);
         }
       }
-      local_M[idx] = (int)sel_sids_local.size();
+      int sel_count = (int)sel_sids_local.size();
+      local_M[idx] = sel_count;
       HIP_CHECK(hipSetDevice(ctx->device_id));
-      if (!sel_sids_local.empty()) {
-        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_sids, sel_sids_local.data(), sel_sids_local.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
-        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_eids, sel_eids_local.data(), sel_eids_local.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
-        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_w, sel_w_local.data(), sel_w_local.size() * sizeof(float), hipMemcpyHostToDevice, ctx->batch_stream));
+      if (sel_count == 0) {
+        HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
+        continue;
+      }
+
+      int local_experts = ctx->local_experts;
+      std::vector<int> counts(local_experts, 0);
+      for (int eid_local : sel_eids_local) {
+        counts[eid_local]++;
+      }
+
+      std::vector<int> prefix(local_experts + 1, 0);
+      for (int e = 0; e < local_experts; ++e) {
+        prefix[e + 1] = prefix[e] + counts[e];
+      }
+
+      std::vector<int> write_pos = prefix;
+      std::vector<int> order(sel_count);
+      for (int i = 0; i < sel_count; ++i) {
+        int e = sel_eids_local[i];
+        int pos = write_pos[e]++;
+        order[pos] = i;
+      }
+
+      std::vector<int> grouped_sids(sel_count);
+      std::vector<int> grouped_eids(sel_count);
+      std::vector<float> grouped_w(sel_count);
+      for (int dst = 0; dst < sel_count; ++dst) {
+        int src = order[dst];
+        grouped_sids[dst] = sel_sids_local[src];
+        grouped_eids[dst] = sel_eids_local[src];
+        grouped_w[dst] = sel_w_local[src];
+      }
+
+      std::vector<int> block_cols;
+      std::vector<int> block_sizes;
+      std::vector<int> block_eids;
+      block_cols.reserve((sel_count + 15) / 16);
+      block_sizes.reserve((sel_count + 15) / 16);
+      block_eids.reserve((sel_count + 15) / 16);
+
+      for (int e = 0; e < local_experts; ++e) {
+        int start = prefix[e];
+        int end = prefix[e + 1];
+        int remaining = end - start;
+        int col = start;
+        while (remaining > 0) {
+          int chunk = remaining >= 16 ? 16 : remaining;
+          block_cols.push_back(col);
+          block_sizes.push_back(chunk);
+          block_eids.push_back(e);
+          col += chunk;
+          remaining -= chunk;
+        }
+      }
+
+      local_block_counts[idx] = (int)block_cols.size();
+
+      HIP_CHECK(hipMemcpyAsync(ctx->state.sel_sids, grouped_sids.data(), sel_count * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+      HIP_CHECK(hipMemcpyAsync(ctx->state.sel_eids, grouped_eids.data(), sel_count * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+      HIP_CHECK(hipMemcpyAsync(ctx->state.sel_w, grouped_w.data(), sel_count * sizeof(float), hipMemcpyHostToDevice, ctx->batch_stream));
+      if (!block_cols.empty()) {
+        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_cols, block_cols.data(), block_cols.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_sizes, block_sizes.data(), block_sizes.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_eids, block_eids.data(), block_eids.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
       }
       HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
@@ -2930,18 +3025,23 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     for (size_t idx = 0; idx < ctxs.size(); ++idx) {
       GPUContext *ctx = ctxs[idx];
       int M_local = local_M[idx];
-      if (M_local == 0) continue;
+      int block_count = local_block_counts[idx];
+      if (M_local == 0 || block_count == 0) continue;
       HIP_CHECK(hipSetDevice(ctx->device_id));
       // Launch MFMA matvec over 16-row tiles in output dimension
       const int out_dim = 2 * p->intermediate_dim;
       dim3 block1(16,4,1); // 64 threads per block for 16x16x4 MFMA
-      dim3 grid1((out_dim + 15) / 16, M_local, 1);
+      dim3 grid1((out_dim + 15) / 16, block_count, 1);
       mlp1_grouped_mfma_matvec_mxfp4_kernel<<<grid1, block1, 0, ctx->batch_stream>>>(
         ctx->state.mlp1_out_all, ctx->state.t,
         ctx->weights.w_mlp1_data, ctx->weights.w_mlp1_scales,
         ctx->weights.b_mlp1,
-        ctx->state.sel_sids, ctx->state.sel_eids,
-        M_local, hidden_dim, out_dim,
+        ctx->state.sel_sids,
+        ctx->state.sel_block_cols,
+        ctx->state.sel_block_sizes,
+        ctx->state.sel_block_eids,
+        M_local, block_count,
+        hidden_dim, out_dim,
         l, ctx->local_experts);
 
       dim3 block2(256), grid2((p->intermediate_dim + block2.x - 1) / block2.x, M_local);
@@ -2951,13 +3051,17 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
       // Launch MFMA MLP2 accumulation over 16-row tiles in hidden_dim
       dim3 block3(16,4,1);
-      dim3 grid3((hidden_dim + 15) / 16, M_local, 1);
+      dim3 grid3((hidden_dim + 15) / 16, block_count, 1);
       mlp2_accum_grouped_mfma_matvec_mxfp4_kernel<<<grid3, block3, 0, ctx->batch_stream>>>(
         ctx->state.e_agg, ctx->state.gate_up_all,
         ctx->weights.w_mlp2_data, ctx->weights.w_mlp2_scales,
         ctx->weights.b_mlp2,
-        ctx->state.sel_sids, ctx->state.sel_eids, ctx->state.sel_w,
-        M_local, hidden_dim, p->intermediate_dim,
+        ctx->state.sel_sids, ctx->state.sel_w,
+        ctx->state.sel_block_cols,
+        ctx->state.sel_block_sizes,
+        ctx->state.sel_block_eids,
+        M_local, block_count,
+        hidden_dim, p->intermediate_dim,
         l, ctx->local_experts, hidden_dim);
       HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
@@ -3407,6 +3511,9 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->sel_sids,     Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sel_eids,     Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sel_w,        Mmax * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->sel_block_cols,  Mmax * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sel_block_sizes, Mmax * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sel_block_eids,  Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
 
@@ -3461,6 +3568,9 @@ void gpu_free_run_state(GPUContext *ctx) {
   HIP_CHECK(hipFree(s->sel_sids));
   HIP_CHECK(hipFree(s->sel_eids));
   HIP_CHECK(hipFree(s->sel_w));
+  HIP_CHECK(hipFree(s->sel_block_cols));
+  HIP_CHECK(hipFree(s->sel_block_sizes));
+  HIP_CHECK(hipFree(s->sel_block_eids));
   HIP_CHECK(hipFree(s->mlp1_out_all));
   HIP_CHECK(hipFree(s->gate_up_all));
   if (s->tb2_peer) HIP_CHECK(hipFree(s->tb2_peer));
