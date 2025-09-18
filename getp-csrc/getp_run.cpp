@@ -258,6 +258,245 @@ __global__ void convert_bf16_to_fp32_kernel(const hip_bfloat16 *bf16_data, float
   if (tid < size) fp32_data[tid] = bfloat16_to_float(bf16_data[tid]);
 }
 
+// Pack and convert FP32 row-major [M x K] to BF16 16x16 tiles with padding
+__global__ void pack_convert_fp32_to_bf16_tiles16_kernel(
+    const float *src_fp32, int row_offset, int rows,
+    int M, int K,
+    hip_bfloat16 *dst_packed, int Mpad, int Kpad) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = (size_t)rows * (size_t)K;
+  if (idx >= total) return;
+  int r = (int)(idx / K);
+  int c = (int)(idx % K);
+  int m = row_offset + r;
+  int tile_m = m / 16;
+  int tile_k = c / 16;
+  int im = m % 16;
+  int ik = c % 16;
+  size_t tiles_per_row = (size_t)(Kpad + 15) / 16;
+  size_t dst_index = ((size_t)tile_m * tiles_per_row + (size_t)tile_k) * (size_t)256 + (size_t)im * 16 + (size_t)ik;
+  dst_packed[dst_index] = float_to_bfloat16(src_fp32[(size_t)r * (size_t)K + (size_t)c]);
+}
+
+// Grouped MLP1 matvec using MFMA and packed BF16 weights.
+// For each selection m (sid,eid), compute y = W[layer,eid] @ x[sid] + b[layer,eid]
+// W is packed as 16x16 BF16 tiles (Mpad x Kpad). Accumulate in FP32.
+// Implementation uses an MFMA 16x16x4f32 micro-kernel, replicating the input vector across 16 columns.
+// Only column tx==0 produces stores; other columns are computed but discarded.
+__global__ __launch_bounds__(64)
+void mlp1_grouped_mfma_matvec_kernel(
+    float* __restrict__ mlp1_out_all,        // [M selections][out_dim]
+    const float* __restrict__ t,             // [B slots][hidden_dim]
+    const hip_bfloat16* __restrict__ w_packed, // [n_layers*n_experts][Mpad*Kpad]
+    const hip_bfloat16* __restrict__ b_mlp1, // [n_layers*n_experts][out_dim]
+    const int* __restrict__ sel_sids,        // [M]
+    const int* __restrict__ sel_eids,        // [M]
+    int selections_M,
+    int hidden_dim, int out_dim,
+    int layer, int n_experts,
+    int Mpad, int Kpad)
+{
+  const int tx = threadIdx.x;  // 0..15 (columns)
+  const int ty = threadIdx.y;  // 0..3  (row groups)
+  const int lane = ty * 16 + tx; // 0..63
+
+  const int tile_m = blockIdx.x;        // along M (rows)
+  const int msel   = blockIdx.y;        // selection index
+  if (msel >= selections_M) return;
+
+  const int base_row = tile_m * 16;
+
+  const int sid = sel_sids[msel];
+  const int eid = sel_eids[msel];
+
+  const size_t per_mat_elems = (size_t)Mpad * (size_t)Kpad;
+  const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
+  const hip_bfloat16* __restrict__ W = w_packed + mat_index * per_mat_elems;
+  const hip_bfloat16* __restrict__ B = b_mlp1 + mat_index * (size_t)out_dim;
+
+  __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
+  __shared__ __align__(16) float        sWf[16 * 16];
+  __shared__ __align__(16) float        sX[16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  using u32x4 = __attribute__((ext_vector_type(4))) unsigned int;
+  float4v dmn = {0.f, 0.f, 0.f, 0.f};
+
+  const int K = hidden_dim;
+  const int Ktiles = (Kpad + 15) / 16;
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    if (lane < 32) {
+      const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      const hip_bfloat16* w_src = W + w_tile_base;
+      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+    }
+
+    if (lane < 64) {
+      const int r   = lane % 16;        // K row within tile
+      const int c4  = (lane / 16) * 4;  // column block index {0,4,8,12}
+      const int k_row = kk * 16 + r;
+      float v = 0.f;
+      if (k_row < K) {
+        const float* __restrict__ x_b = t + (size_t)sid * (size_t)hidden_dim;
+        v = x_b[k_row];
+      }
+      float* dst = sX + r * 16 + c4;
+      dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = v;
+    }
+
+    __syncthreads();
+
+    int idx4 = lane * 4;
+    if (idx4 < 256) {
+      sWf[idx4 + 0] = bfloat16_to_float(sWb[idx4 + 0]);
+      sWf[idx4 + 1] = bfloat16_to_float(sWb[idx4 + 1]);
+      sWf[idx4 + 2] = bfloat16_to_float(sWb[idx4 + 2]);
+      sWf[idx4 + 3] = bfloat16_to_float(sWb[idx4 + 3]);
+    }
+
+    #pragma unroll
+    for (int t4 = 0; t4 < 4; ++t4) {
+      const int k4 = ty + 4 * t4; // 0..15
+      float amk = sWf[tx * 16 + k4];   // A: row=tx, col=k4
+      float bkn = sX[k4 * 16 + tx];    // B: row=k4, col=tx
+      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    }
+
+    __syncthreads();
+  }
+
+  if (tx == 0) {
+    float* out_vec = mlp1_out_all + (size_t)msel * (size_t)out_dim;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = base_row + (ty * 4 + i);
+      if (row < out_dim) {
+        const float biasv = B ? bfloat16_to_float(B[row]) : 0.f;
+        out_vec[row] = dmn[i] + biasv;
+      }
+    }
+  }
+}
+
+// MFMA MLP1 directly from MXFP4-packed weights (no BF16 storage).
+// Dequantizes per element on-the-fly using e8m0 scales and 4-bit levels.
+__global__ __launch_bounds__(64)
+void mlp1_grouped_mfma_matvec_mxfp4_kernel(
+    float* __restrict__ mlp1_out_all,        // [M selections][out_dim]
+    const float* __restrict__ t,             // [B slots][hidden_dim]
+    const uint8_t* __restrict__ w_data,      // MXFP4 nibbles (row-major)
+    const uint8_t* __restrict__ w_scales,    // e8m0 per-32-block (row-major)
+    const hip_bfloat16* __restrict__ b_mlp1, // [n_layers*n_experts][out_dim]
+    const int* __restrict__ sel_sids,        // [M]
+    const int* __restrict__ sel_eids,        // [M]
+    int selections_M,
+    int hidden_dim, int out_dim,
+    int layer, int n_experts)
+{
+  const int tx = threadIdx.x;  // 0..15 (columns)
+  const int ty = threadIdx.y;  // 0..3  (row groups)
+  const int lane = ty * 16 + tx; // 0..63
+
+  const int tile_m = blockIdx.x;        // along M (rows)
+  const int msel   = blockIdx.y;        // selection index
+  if (msel >= selections_M) return;
+
+  const int base_row = tile_m * 16;
+
+  const int sid = sel_sids[msel];
+  const int eid = sel_eids[msel];
+
+  const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
+  const size_t row_stride = (size_t)hidden_dim;
+  const size_t base = mat_index * (size_t)out_dim * row_stride; // for scales (row-major)
+  const hip_bfloat16* __restrict__ B = b_mlp1 + mat_index * (size_t)out_dim;
+
+  __shared__ __align__(16) float sWf[16 * 16];
+  __shared__ __align__(16) float sX[16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v dmn = {0.f, 0.f, 0.f, 0.f};
+
+  const int K = hidden_dim;
+  const int Ktiles = (K + 15) / 16;
+
+  // Compute packed matrix base (tile-major nibble layout)
+  const int tiles_m = (out_dim + 15) / 16;
+  const int tiles_k = (hidden_dim + 15) / 16;
+  const size_t packed_mat_bytes = (size_t)tiles_m * (size_t)tiles_k * (size_t)128; // 128 bytes per 16x16 tile (256 nibbles)
+  const uint8_t* __restrict__ Wpack = w_data + mat_index * packed_mat_bytes;
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    // Fill W tile [16x16] by dequantizing from MXFP4
+    int idx4 = lane * 4;
+    if (idx4 < 256) {
+      #pragma unroll
+      for (int t4 = 0; t4 < 4; ++t4) {
+        int te = idx4 + t4;           // 0..255 within tile
+        int im = te / 16;             // row in tile
+        int ik = te - im * 16;        // col in tile
+        int row = base_row + im;
+        int col = kk * 16 + ik;
+        float wv = 0.f;
+        if (row < out_dim && col < K) {
+          size_t elem_index = base + (size_t)row * row_stride + (size_t)col; // for scale indexing
+          uint8_t scale_code = w_scales[elem_index / MXFP4_BLOCK_SIZE];
+          float scale = decode_e8m0(scale_code);
+          // tile-packed lookup
+          size_t tiles_per_row = (size_t)tiles_k;
+          size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
+          size_t tile_base_byte = tile_linear * (size_t)128;
+          size_t byte_off = tile_base_byte + ((size_t)te >> 1);
+          uint8_t packed = Wpack[byte_off];
+          uint8_t nibble = (te & 1) ? (uint8_t)(packed >> 4) : (uint8_t)(packed & 0xF);
+          wv = decode_mxfp4(nibble) * scale;
+        }
+        sWf[im * 16 + ik] = wv;
+      }
+    }
+
+    // Build X tile [16x16] by replicating vector entries across 16 columns
+    if (lane < 64) {
+      const int r   = lane % 16;        // K row within tile
+      const int c4  = (lane / 16) * 4;  // column block index {0,4,8,12}
+      const int k_row = kk * 16 + r;
+      float v = 0.f;
+      if (k_row < K) {
+        const float* __restrict__ x_b = t + (size_t)sid * (size_t)hidden_dim;
+        v = x_b[k_row];
+      }
+      float* dst = sX + r * 16 + c4;
+      dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = v;
+    }
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int t4 = 0; t4 < 4; ++t4) {
+      const int k4 = ty + 4 * t4; // 0..15
+      float amk = sWf[tx * 16 + k4];   // A: row=tx, col=k4
+      float bkn = sX[k4 * 16 + tx];    // B: row=k4, col=tx
+      dmn = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, dmn, 0, 0, 0);
+    }
+
+    __syncthreads();
+  }
+
+  if (tx == 0) {
+    float* out_vec = mlp1_out_all + (size_t)msel * (size_t)out_dim;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = base_row + (ty * 4 + i);
+      if (row < out_dim) {
+        const float biasv = B ? bfloat16_to_float(B[row]) : 0.f;
+        out_vec[row] = dmn[i] + biasv;
+      }
+    }
+  }
+}
+
 __global__ void quantize_mxfp4_kernel(const float *tile, size_t tile_elems, size_t global_elem_offset,
                                       uint8_t *dst_data, uint8_t *dst_scales) {
   size_t block = blockIdx.x;
@@ -298,6 +537,56 @@ __global__ void quantize_mxfp4_kernel(const float *tile, size_t tile_elems, size
   }
 }
 
+// Helpers for MXFP4 tile packing
+__device__ inline uint8_t mxfp4_decode_src_at(const uint8_t* __restrict__ src_data, size_t elem_index) {
+  uint8_t packed = src_data[elem_index >> 1];
+  return (elem_index & 1ULL) ? (uint8_t)(packed >> 4) : (uint8_t)(packed & 0xF);
+}
+
+__device__ inline void mxfp4_tile_map_rowcol(size_t elem_linear, size_t cols, size_t& row, size_t& col) {
+  size_t tiles_per_row = (cols + 15) / 16;
+  size_t tile_idx = elem_linear / 256;             // which 16x16 tile
+  size_t in_tile = elem_linear - tile_idx * 256;   // 0..255
+  size_t im = in_tile / 16;                        // 0..15
+  size_t ik = in_tile - im * 16;                   // 0..15
+  size_t tile_m = tile_idx / tiles_per_row;
+  size_t tile_k = tile_idx - tile_m * tiles_per_row;
+  row = tile_m * 16 + im;
+  col = tile_k * 16 + ik;
+}
+
+// Repack MXFP4 row-major [rows x cols] into 16x16 tile-major order.
+// Only the data (nibbles) are reordered; scales remain in original row-major block order.
+__global__ void pack_mxfp4_row_to_tile16_kernel(
+    const uint8_t* __restrict__ src_data,
+    uint8_t* __restrict__ dst_data,
+    size_t rows, size_t cols) {
+  size_t byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total_elems = rows * cols;
+  size_t total_bytes = (total_elems + 1) >> 1;
+  if (byte_idx >= total_bytes) return;
+
+  size_t elem0 = byte_idx * 2;
+  size_t row0, col0; mxfp4_tile_map_rowcol(elem0, cols, row0, col0);
+  uint8_t code0 = 0u;
+  if (row0 < rows && col0 < cols) {
+    size_t src_elem0 = row0 * cols + col0;
+    code0 = mxfp4_decode_src_at(src_data, src_elem0);
+  }
+
+  size_t elem1 = elem0 + 1;
+  uint8_t code1 = 0u;
+  if (elem1 < total_elems) {
+    size_t row1, col1; mxfp4_tile_map_rowcol(elem1, cols, row1, col1);
+    if (row1 < rows && col1 < cols) {
+      size_t src_elem1 = row1 * cols + col1;
+      code1 = mxfp4_decode_src_at(src_data, src_elem1);
+    }
+  }
+
+  dst_data[byte_idx] = (uint8_t)((code0 & 0x0F) | ((code1 & 0x0F) << 4));
+}
+
 __global__ void rmsnorm_kernel_bf16(hip_bfloat16 *o, const hip_bfloat16 *x, const hip_bfloat16 *weight, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   __shared__ float shared_ss;
@@ -330,6 +619,134 @@ __global__ void matmul_kernel_bf16(hip_bfloat16 *xout, const hip_bfloat16 *x, co
     xout[i] = float_to_bfloat16(val);
   }
 }
+
+// Grouped MLP2 matvec using MFMA and tile-packed MXFP4 weights.
+// For each selection m: y = W[layer,eid] @ g[m] + b[layer,eid]; then atomicAdd into e_agg[sid] with weight sel_w[m].
+__global__ __launch_bounds__(64)
+void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
+    float* __restrict__ e_agg,                // [slots, hidden_dim]
+    const float* __restrict__ gate_up_all,    // [M, intermediate_dim]
+    const uint8_t* __restrict__ w_data,       // tile-packed MXFP4 nibbles (16x16)
+    const uint8_t* __restrict__ w_scales,     // row-major e8m0 per-32 block
+    const hip_bfloat16* __restrict__ b_mlp2,  // [n_layers*n_experts][hidden_dim]
+    const int* __restrict__ sel_sids,         // [M]
+    const int* __restrict__ sel_eids,         // [M]
+    const float* __restrict__ sel_w,          // [M]
+    int selections_M,
+    int hidden_dim, int intermediate_dim,
+    int layer, int n_experts,
+    int eagg_stride) {
+
+  const int tx = threadIdx.x;  // 0..15
+  const int ty = threadIdx.y;  // 0..3
+  const int lane = ty * 16 + tx; // 0..63
+
+  const int tile_m = blockIdx.x;        // along output rows (hidden_dim)
+  const int msel   = blockIdx.y;        // selection index
+  if (msel >= selections_M) return;
+
+  const int base_row = tile_m * 16;
+  const int sid = sel_sids[msel];
+  const int eid = sel_eids[msel];
+  const float ew = sel_w[msel];
+
+  const int Mout = hidden_dim;
+  const int Kdim = intermediate_dim;
+  const int tiles_k = (Kdim + 15) / 16;
+
+  const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
+  const size_t row_stride = (size_t)intermediate_dim;
+  const size_t base_scale = mat_index * (size_t)Mout * row_stride; // for scales (row-major indexing)
+  const int tiles_m = (Mout + 15) / 16;
+  const size_t packed_mat_bytes = (size_t)tiles_m * (size_t)tiles_k * (size_t)128;
+  const uint8_t* __restrict__ Wpack = w_data + mat_index * packed_mat_bytes;
+  const hip_bfloat16* __restrict__ B = b_mlp2 + mat_index * (size_t)hidden_dim;
+
+  __shared__ __align__(16) float sWf[16 * 16];
+  __shared__ __align__(16) float sX[16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v acc = {0.f, 0.f, 0.f, 0.f};
+
+  for (int kk = 0; kk < tiles_k; ++kk) {
+    int idx4 = lane * 4;
+    if (idx4 < 256) {
+      #pragma unroll
+      for (int t4 = 0; t4 < 4; ++t4) {
+        int te = idx4 + t4;           // 0..255 within tile
+        int im = te / 16;             // row in tile
+        int ik = te - im * 16;        // col in tile
+        int row = base_row + im;
+        int col = kk * 16 + ik;
+        float wv = 0.f;
+        if (row < Mout && col < Kdim) {
+          size_t elem_index = base_scale + (size_t)row * row_stride + (size_t)col; // for scale indexing
+          uint8_t scale_code = w_scales[elem_index / MXFP4_BLOCK_SIZE];
+          float scale = decode_e8m0(scale_code);
+          size_t tiles_per_row = (size_t)tiles_k;
+          size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
+          size_t tile_base_byte = tile_linear * (size_t)128;
+          size_t byte_off = tile_base_byte + ((size_t)te >> 1);
+          uint8_t packed = Wpack[byte_off];
+          uint8_t nibble = (te & 1) ? (uint8_t)(packed >> 4) : (uint8_t)(packed & 0xF);
+          wv = decode_mxfp4(nibble) * scale;
+        }
+        sWf[im * 16 + ik] = wv;
+      }
+    }
+
+    // Build X tile [16x16] by replicating vector entries across 16 columns from gate_up_all[msel]
+    if (lane < 64) {
+      const int r   = lane % 16;        // K row within tile
+      const int c4  = (lane / 16) * 4;  // column block index {0,4,8,12}
+      const int k_row = kk * 16 + r;
+      float v = 0.f;
+      if (k_row < Kdim) {
+        const float* __restrict__ g = gate_up_all + (size_t)msel * (size_t)intermediate_dim;
+        v = g[k_row];
+      }
+      float* dst = sX + r * 16 + c4;
+      dst[0] = v; dst[1] = v; dst[2] = v; dst[3] = v;
+    }
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int t4 = 0; t4 < 4; ++t4) {
+      const int k4 = ty + 4 * t4; // 0..15
+      float a0 = sWf[tx * 16 + k4];
+      float b0 = sX[k4 * 16 + tx];
+      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0, b0, acc, 0, 0, 0);
+    }
+
+    __syncthreads();
+  }
+
+  if (tx == 0) {
+    const int row0 = base_row + ty * 4 + 0;
+    const int row1 = base_row + ty * 4 + 1;
+    const int row2 = base_row + ty * 4 + 2;
+    const int row3 = base_row + ty * 4 + 3;
+    float* out_slot = e_agg + (size_t)sid * (size_t)eagg_stride;
+    if (row0 < Mout) {
+      float y = acc[0] + (B ? bfloat16_to_float(B[row0]) : 0.f);
+      atomicAdd(&out_slot[row0], ew * y);
+    }
+    if (row1 < Mout) {
+      float y = acc[1] + (B ? bfloat16_to_float(B[row1]) : 0.f);
+      atomicAdd(&out_slot[row1], ew * y);
+    }
+    if (row2 < Mout) {
+      float y = acc[2] + (B ? bfloat16_to_float(B[row2]) : 0.f);
+      atomicAdd(&out_slot[row2], ew * y);
+    }
+    if (row3 < Mout) {
+      float y = acc[3] + (B ? bfloat16_to_float(B[row3]) : 0.f);
+      atomicAdd(&out_slot[row3], ew * y);
+    }
+  }
+}
+
 
 __global__ void add_bias_kernel_bf16(hip_bfloat16 *output, const hip_bfloat16 *bias, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1495,6 +1912,45 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   }
   add_log("w_mlp1_shard", mlp1_data_bytes + mlp1_blocks * sizeof(uint8_t));
 
+  // Build a tile-packed copy of MXFP4 nibbles for MLP1 to enable coalesced MFMA tiles.
+  // Layout per (layer,eid): rows = out_dim (2*I), cols = hidden_dim.
+  size_t out_dim = (size_t)2 * (size_t)intermediate_dim;
+  size_t Mpad = ((out_dim + 15) / 16) * 16;
+  size_t Kpad = ((size_t)hidden_dim + 15) / 16 * 16;
+  size_t packed_tiles_bytes_per_mat = ((Mpad * Kpad) + 1) / 2; // nibble-packed
+  size_t total_mats = (size_t)n_layers * (size_t)ctx->local_experts;
+  size_t total_packed_bytes = total_mats * packed_tiles_bytes_per_mat;
+  uint8_t *w_mlp1_data_packed = nullptr;
+  HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&w_mlp1_data_packed), total_packed_bytes));
+  HIP_CHECK(hipMemsetAsync(w_mlp1_data_packed, 0, total_packed_bytes, ws.quant_stream));
+
+  // Pack each (layer,eid) matrix independently
+  {
+    dim3 block(256);
+    for (int l = 0; l < n_layers; ++l) {
+      for (int e = 0; e < ctx->local_experts; ++e) {
+        size_t mat_idx = (size_t)l * (size_t)ctx->local_experts + (size_t)e;
+        size_t rows = out_dim;
+        size_t cols = (size_t)hidden_dim;
+        size_t elems = rows * cols;
+        size_t bytes = (elems + 1) / 2;
+        size_t src_offset_bytes = ((size_t)l * (size_t)ctx->local_experts + (size_t)e) * bytes;
+        size_t dst_offset_bytes = mat_idx * packed_tiles_bytes_per_mat;
+        dim3 grid((bytes + block.x - 1) / block.x);
+        pack_mxfp4_row_to_tile16_kernel<<<grid, block, 0, ws.quant_stream>>>(
+          gpu_w->w_mlp1_data + src_offset_bytes,
+          w_mlp1_data_packed + dst_offset_bytes,
+          rows, cols);
+        HIP_CHECK(hipGetLastError());
+      }
+    }
+    HIP_CHECK(hipStreamSynchronize(ws.quant_stream));
+  }
+  // Reuse w_mlp1_data pointer to refer to tile-packed layout to keep memory flat.
+  HIP_CHECK(hipFree(gpu_w->w_mlp1_data));
+  gpu_w->w_mlp1_data = w_mlp1_data_packed;
+  // Note: scales remain in row-major block order; we index with original linear element indices.
+
   size_t mlp1_bias_elems = (size_t)n_layers * (size_t)ctx->local_experts * 2 * (size_t)intermediate_dim;
   HIP_CHECK(hipMalloc(&gpu_w->b_mlp1, mlp1_bias_elems * sizeof(hip_bfloat16)));
   size_t mlp1_bias_offset = 0;
@@ -1525,6 +1981,42 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
     mlp2_offset += count;
   }
   add_log("w_mlp2_shard", mlp2_data_bytes + mlp2_blocks * sizeof(uint8_t));
+
+  // Build a tile-packed copy of MXFP4 nibbles for MLP2 to enable coalesced MFMA tiles.
+  // Layout per (layer,eid): rows = hidden_dim, cols = intermediate_dim.
+  {
+    size_t rows = (size_t)hidden_dim;
+    size_t cols = (size_t)intermediate_dim;
+    size_t Mpad2 = ((rows + 15) / 16) * 16;
+    size_t Kpad2 = ((cols + 15) / 16) * 16;
+    size_t packed_tiles_bytes_per_mat = ((Mpad2 * Kpad2) + 1) / 2; // nibble-packed
+    size_t total_mats = (size_t)n_layers * (size_t)ctx->local_experts;
+    size_t total_packed_bytes = total_mats * packed_tiles_bytes_per_mat;
+    uint8_t *w_mlp2_data_packed = nullptr;
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&w_mlp2_data_packed), total_packed_bytes));
+    HIP_CHECK(hipMemsetAsync(w_mlp2_data_packed, 0, total_packed_bytes, ws.quant_stream));
+
+    dim3 block(256);
+    for (int l = 0; l < n_layers; ++l) {
+      for (int e = 0; e < ctx->local_experts; ++e) {
+        size_t mat_idx = (size_t)l * (size_t)ctx->local_experts + (size_t)e;
+        size_t elems = rows * cols;
+        size_t bytes = (elems + 1) / 2;
+        size_t src_offset_bytes = ((size_t)l * (size_t)ctx->local_experts + (size_t)e) * bytes;
+        size_t dst_offset_bytes = mat_idx * packed_tiles_bytes_per_mat;
+        dim3 grid((unsigned int)((bytes + block.x - 1) / block.x));
+        pack_mxfp4_row_to_tile16_kernel<<<grid, block, 0, ws.quant_stream>>>(
+          gpu_w->w_mlp2_data + src_offset_bytes,
+          w_mlp2_data_packed + dst_offset_bytes,
+          rows, cols);
+        HIP_CHECK(hipGetLastError());
+      }
+    }
+    HIP_CHECK(hipStreamSynchronize(ws.quant_stream));
+    HIP_CHECK(hipFree(gpu_w->w_mlp2_data));
+    gpu_w->w_mlp2_data = w_mlp2_data_packed;
+    // Note: scales stay row-major; kernel uses logical indices for scale lookup.
+  }
 
   size_t mlp2_bias_elems = (size_t)n_layers * (size_t)ctx->local_experts * (size_t)hidden_dim;
   HIP_CHECK(hipMalloc(&gpu_w->b_mlp2, mlp2_bias_elems * sizeof(hip_bfloat16)));
@@ -1948,13 +2440,16 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int M_local = local_M[idx];
       if (M_local == 0) continue;
       HIP_CHECK(hipSetDevice(ctx->device_id));
-      dim3 block1(256), grid1((2 * p->intermediate_dim + block1.x - 1) / block1.x, M_local);
-      mlp1_grouped_kernel_float<<<grid1, block1, (size_t)hidden_dim * sizeof(float), ctx->batch_stream>>>(
+      // Launch MFMA matvec over 16-row tiles in output dimension
+      const int out_dim = 2 * p->intermediate_dim;
+      dim3 block1(16,4,1); // 64 threads per block for 16x16x4 MFMA
+      dim3 grid1((out_dim + 15) / 16, M_local, 1);
+      mlp1_grouped_mfma_matvec_mxfp4_kernel<<<grid1, block1, 0, ctx->batch_stream>>>(
         ctx->state.mlp1_out_all, ctx->state.t,
         ctx->weights.w_mlp1_data, ctx->weights.w_mlp1_scales,
         ctx->weights.b_mlp1,
         ctx->state.sel_sids, ctx->state.sel_eids,
-        M_local, hidden_dim, p->intermediate_dim,
+        M_local, hidden_dim, out_dim,
         l, ctx->local_experts);
 
       dim3 block2(256), grid2((p->intermediate_dim + block2.x - 1) / block2.x, M_local);
@@ -1962,8 +2457,10 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         ctx->state.gate_up_all, ctx->state.mlp1_out_all,
         M_local, p->intermediate_dim, p->swiglu_limit);
 
-      dim3 block3(256), grid3((hidden_dim + block3.x - 1) / block3.x, M_local);
-      mlp2_accum_grouped_kernel_float<<<grid3, block3, 0, ctx->batch_stream>>>(
+      // Launch MFMA MLP2 accumulation over 16-row tiles in hidden_dim
+      dim3 block3(16,4,1);
+      dim3 grid3((hidden_dim + 15) / 16, M_local, 1);
+      mlp2_accum_grouped_mfma_matvec_mxfp4_kernel<<<grid3, block3, 0, ctx->batch_stream>>>(
         ctx->state.e_agg, ctx->state.gate_up_all,
         ctx->weights.w_mlp2_data, ctx->weights.w_mlp2_scales,
         ctx->weights.b_mlp2,
