@@ -2488,9 +2488,9 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   }
 
   if (!ws.logs.empty()) {
-    printf("[Weights][GPU%d] copy summary:\\n", ctx->device_id);
+    printf("[Weights][GPU%d] copy summary:\n", ctx->device_id);
     for (const auto &entry : ws.logs) {
-      printf("  %-22s %.3f GB\\n", entry.first.c_str(), to_gb(entry.second));
+      printf("  %-22s %.3f GB\n", entry.first.c_str(), to_gb(entry.second));
     }
     fflush(stdout);
   }
