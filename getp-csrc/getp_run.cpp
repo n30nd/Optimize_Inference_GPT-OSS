@@ -961,23 +961,47 @@ __global__ void matvec_wbf16_xfp32_outfp32(float *out, const float *x,
 // ========================= FLOAT KERNELS =========================
 // New kernels for float RunState buffers
 
-__global__ void rmsnorm_kernel_float(float *o, const float *x, const hip_bfloat16 *weight, int size) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  __shared__ float shared_ss;
-  if (threadIdx.x == 0) {
-    float ss = 0.0f;
-    for (int j = 0; j < size; j++) {
-      float xv = x[j];
-      ss += xv * xv;
-    }
-    ss = ss / size + 1e-5f;
-    shared_ss = 1.0f / sqrtf(ss);
+// Batched RMSNorm (FP32): normalizes each slot in the batch using shared reductions.
+__global__ __launch_bounds__(256) void rmsnorm_kernel_float_batched(
+    float *__restrict__ out,
+    const float *__restrict__ x,
+    const hip_bfloat16 *__restrict__ weight,
+    int hidden_dim,
+    int batch,
+    int stride,
+    const int *slot_ids) {
+  int b = blockIdx.y;
+  if (b >= batch) {
+    return;
   }
+
+  int sid = slot_ids[b];
+  const float *x_slot = x + (size_t)sid * (size_t)stride;
+  float *out_slot = out + (size_t)sid * (size_t)stride;
+
+  extern __shared__ float s_reduce[];
+
+  float ss = 0.0f;
+  for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
+    float v = x_slot[j];
+    ss += v * v;
+  }
+  s_reduce[threadIdx.x] = ss;
   __syncthreads();
-  if (tid < size) {
-    float xv = x[tid];
-    float wv = bfloat16_to_float(weight[tid]);
-    o[tid] = wv * (shared_ss * xv);
+
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (threadIdx.x < offset) {
+      s_reduce[threadIdx.x] += s_reduce[threadIdx.x + offset];
+    }
+    __syncthreads();
+  }
+
+  float inv_rms = rsqrtf(s_reduce[0] / hidden_dim + 1e-5f);
+  __syncthreads();
+
+  for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
+    float w = bfloat16_to_float(weight[j]);
+    out_slot[j] = x_slot[j] * inv_rms * w;
   }
 }
 
@@ -2634,16 +2658,20 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     // RMSNorm (attention)
     for (GPUContext *ctx : ctxs) {
       HIP_CHECK(hipSetDevice(ctx->device_id));
-      const hip_bfloat16 *rms_attn_w = ctx->weights.rms_attn_w + (size_t)l * (size_t)hidden_dim;
-      for (int bi = 0; bi < batch; ++bi) {
-        int sid = h_slot_ids[bi];
-        dim3 block(256);
-        dim3 grid((hidden_dim + block.x - 1) / block.x);
-        rmsnorm_kernel_float<<<grid, block, 0, ctx->batch_stream>>>(
-          ctx->state.t + (size_t)sid * (size_t)hidden_dim,
-          ctx->state.x + (size_t)sid * (size_t)hidden_dim,
-          rms_attn_w, hidden_dim);
+      if (batch <= 0) {
+        continue;
       }
+      const hip_bfloat16 *rms_attn_w = ctx->weights.rms_attn_w + (size_t)l * (size_t)hidden_dim;
+      dim3 block_norm(256), grid_norm(1, batch);
+      size_t shared_mem_norm = block_norm.x * sizeof(float);
+      rmsnorm_kernel_float_batched<<<grid_norm, block_norm, shared_mem_norm, ctx->batch_stream>>>(
+        ctx->state.t,
+        ctx->state.x,
+        rms_attn_w,
+        hidden_dim,
+        batch,
+        hidden_dim,
+        ctx->d_slot_ids);
       HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
 
@@ -2796,15 +2824,20 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     // MoE RMSNorm per slot
     for (GPUContext *ctx : ctxs) {
       HIP_CHECK(hipSetDevice(ctx->device_id));
-      const hip_bfloat16 *rms_ffn_w = ctx->weights.rms_ffn_w + (size_t)l * (size_t)hidden_dim;
-      for (int bi = 0; bi < batch; ++bi) {
-        int sid = h_slot_ids[bi];
-        dim3 block(256), grid((hidden_dim + block.x - 1) / block.x);
-        rmsnorm_kernel_float<<<grid, block, 0, ctx->batch_stream>>>(
-          ctx->state.t + (size_t)sid * (size_t)hidden_dim,
-          ctx->state.x + (size_t)sid * (size_t)hidden_dim,
-          rms_ffn_w, hidden_dim);
+      if (batch <= 0) {
+        continue;
       }
+      const hip_bfloat16 *rms_ffn_w = ctx->weights.rms_ffn_w + (size_t)l * (size_t)hidden_dim;
+      dim3 block_norm(256), grid_norm(1, batch);
+      size_t shared_mem_norm = block_norm.x * sizeof(float);
+      rmsnorm_kernel_float_batched<<<grid_norm, block_norm, shared_mem_norm, ctx->batch_stream>>>(
+        ctx->state.t,
+        ctx->state.x,
+        rms_ffn_w,
+        hidden_dim,
+        batch,
+        hidden_dim,
+        ctx->d_slot_ids);
       HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
 
