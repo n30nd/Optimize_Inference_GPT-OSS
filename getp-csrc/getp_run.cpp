@@ -1351,7 +1351,7 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
 }
 
 // Launcher tối ưu: gom batch theo nhóm 16 cột/khối.
-// Nếu batch nhỏ (<16), fallback kernel cũ để tránh overhead không cần thiết.
+// Wrapper function cho MFMA-based batched matmul
 void launch_gemm16x16_mfma_f32_batched(
     const hip_bfloat16* W_packed,
     const float* X_packed,
@@ -1365,17 +1365,6 @@ void launch_gemm16x16_mfma_f32_batched(
   const int Mpad = ((M + 15) / 16) * 16;
   const int Kpad = ((K + 15) / 16) * 16;
 
-  // Fallback cho batch rất nhỏ để tái dùng kernel cũ (1 cột/b)
-  if (batch < 16) {
-    printf("BATCH < 16, dùng kernel cũ\n");
-    dim3 block(16, 4, 1); // 64 threads
-    dim3 grid((Mpad + 15) / 16, batch, 1);
-    gemm16x16_mfma_f32_packedW_batched_scatter_bias_kernel<<<grid, block, 0, stream>>>(
-        W_packed, X_packed, output, bias,
-        M, K, batch, Bpad, out_stride, slot_ids, Mpad, Kpad);
-    return;
-  }
-
   // Dùng kernel tối ưu: 1 block xử lý 16 cột batch
   const int group_y = (batch + 15) / 16;
   dim3 block(16, 4, 1);                   // 64 threads / MFMA 16x16x4f32
@@ -1386,27 +1375,6 @@ void launch_gemm16x16_mfma_f32_batched(
       M, K, batch, Bpad, out_stride, slot_ids, Mpad, Kpad);
 }
 
-// Wrapper function cho MFMA-based batched matmul
-void launch_gemm16x16_mfma_f32_batched_old(
-    const hip_bfloat16* W_packed,
-    const float* X_packed, 
-    float* output,
-    const hip_bfloat16* bias,
-    int M, int K, int batch, int Bpad,
-    int out_stride,
-    const int* slot_ids,
-    hipStream_t stream) {
-    
-  int Mpad = ((M + 15) / 16) * 16;
-  int Kpad = ((K + 15) / 16) * 16;
-  
-  dim3 block(16, 4, 1); // 64 threads: 16x4 layout cho MFMA
-  dim3 grid((Mpad + 15) / 16, batch, 1);
-  
-  gemm16x16_mfma_f32_packedW_batched_scatter_bias_kernel<<<grid, block, 0, stream>>>(
-    W_packed, X_packed, output, bias,
-    M, K, batch, Bpad, out_stride, slot_ids, Mpad, Kpad);
-}
 
 __global__ void add_bias_kernel_float(float *output, const hip_bfloat16 *bias, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
