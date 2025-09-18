@@ -1264,20 +1264,13 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
   // Hàng cơ sở của tile M
   const int base_row = tile_m * 16;
 
-  // Chuẩn bị slot_id cho từng cột batch trong nhóm
-  // (đọc trực tiếp từ global trong phase write để tiết kiệm LDS)
-  auto slot_of = [&](int local_col) -> int {
-    // local_col: 0..15
-    int b = b_base + local_col;
-    return (b < B) ? slot_ids[b] : -1;
-  };
-
   // Shared ping-pong
   __shared__ __align__(16) float sW[2][16 * 16];
   __shared__ __align__(16) float sX[2][16 * 16];
+  __shared__ int s_slot[16];
+  __shared__ float s_bias[16];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
-  using u32x4   = __attribute__((ext_vector_type(4))) unsigned int;
 
   // Helper: nạp 4 BF16 -> 4 FP32 (giống hàm bạn đang có, để inline tại đây cho tốc độ)
   auto bf16x4_to_f4 = [&](const hip_bfloat16* src) {
@@ -1299,6 +1292,28 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
     return v;
   };
 
+  const bool has_bias = (bias != nullptr);
+  const bool full_tile = (cols_this == 16);
+
+  // Chuẩn bị slot_id và bias tile cho block
+  if (ty == 0) {
+    const int col = tx;
+    const int global_col = b_base + col;
+    int slot_val = -1;
+    if (col < cols_this && global_col < B) {
+      slot_val = slot_ids[global_col];
+    }
+    s_slot[col] = slot_val;
+
+    const int row = base_row + col;
+    float bias_val = 0.0f;
+    if (has_bias && row < M) {
+      bias_val = bfloat16_to_float(bias[row]);
+    }
+    s_bias[col] = bias_val;
+  }
+  __syncthreads();
+
   float4v acc = {0.f, 0.f, 0.f, 0.f};
 
   const int Ktiles        = (Kpad + 15) / 16;
@@ -1306,6 +1321,9 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
   const size_t tile_elems    = 256;                     // 16*16 BF16/FP32
   const hip_bfloat16* w_tile_row_base =
       W_packed + ((size_t)tile_m * tiles_per_row) * tile_elems;
+
+  const size_t x_stride = static_cast<size_t>(Bpad);
+  const size_t b_base_sz = static_cast<size_t>(b_base);
 
   // Preload Ô-0 (ping=0)
   {
@@ -1320,19 +1338,18 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
     const int k_row0 = 0 * 16 + row_in_tile;
     float4v xv = {0.f, 0.f, 0.f, 0.f};
     if (k_row0 < K) {
-      // mỗi lane ghi 4 cột (col_group xác định cụm {0,4,8,12})
-      // để 64 lanes phủ 16*16 phần tử: lane i ghi 4 phần tử kế tiếp theo cột
-      const int c0 = col_group * 4 + 0;
-      const int c1 = col_group * 4 + 1;
-      const int c2 = col_group * 4 + 2;
-      const int c3 = col_group * 4 + 3;
-      const int xs = Bpad;
-
-      // đọc an toàn trong nhóm cuối
-      xv[0] = (c0 < cols_this) ? Xpack[(size_t)k_row0 * xs + (size_t)(b_base + c0)] : 0.f;
-      xv[1] = (c1 < cols_this) ? Xpack[(size_t)k_row0 * xs + (size_t)(b_base + c1)] : 0.f;
-      xv[2] = (c2 < cols_this) ? Xpack[(size_t)k_row0 * xs + (size_t)(b_base + c2)] : 0.f;
-      xv[3] = (c3 < cols_this) ? Xpack[(size_t)k_row0 * xs + (size_t)(b_base + c3)] : 0.f;
+      const int col_base = col_group * 4;
+      const size_t row_offset = static_cast<size_t>(k_row0) * x_stride + b_base_sz + static_cast<size_t>(col_base);
+      if (full_tile) {
+        // Fast path: vector load when all 16 batch columns are valid
+        xv = reinterpret_cast<const float4v*>(Xpack + row_offset)[0];
+      } else {
+        // Tail group: guard each column individually
+        if (col_base + 0 < cols_this) xv[0] = Xpack[row_offset + 0];
+        if (col_base + 1 < cols_this) xv[1] = Xpack[row_offset + 1];
+        if (col_base + 2 < cols_this) xv[2] = Xpack[row_offset + 2];
+        if (col_base + 3 < cols_this) xv[3] = Xpack[row_offset + 3];
+      }
     }
     reinterpret_cast<float4v*>(&sX[0][row_in_tile * 16])[col_group] = xv;
   }
@@ -1358,16 +1375,18 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
       const int k_row = (kt + 1) * 16 + row_in_tile;
       float4v xv = {0.f, 0.f, 0.f, 0.f};
       if (k_row < K) {
-        const int c0 = col_group * 4 + 0;
-        const int c1 = col_group * 4 + 1;
-        const int c2 = col_group * 4 + 2;
-        const int c3 = col_group * 4 + 3;
-        const int xs = Bpad;
-
-        xv[0] = (c0 < cols_this) ? Xpack[(size_t)k_row * xs + (size_t)(b_base + c0)] : 0.f;
-        xv[1] = (c1 < cols_this) ? Xpack[(size_t)k_row * xs + (size_t)(b_base + c1)] : 0.f;
-        xv[2] = (c2 < cols_this) ? Xpack[(size_t)k_row * xs + (size_t)(b_base + c2)] : 0.f;
-        xv[3] = (c3 < cols_this) ? Xpack[(size_t)k_row * xs + (size_t)(b_base + c3)] : 0.f;
+        const int col_base = col_group * 4;
+        const size_t row_offset = static_cast<size_t>(k_row) * x_stride + b_base_sz + static_cast<size_t>(col_base);
+        if (full_tile) {
+          // Fast path: vector load when all 16 batch columns are valid
+          xv = reinterpret_cast<const float4v*>(Xpack + row_offset)[0];
+        } else {
+          // Tail group: guard each column individually
+          if (col_base + 0 < cols_this) xv[0] = Xpack[row_offset + 0];
+          if (col_base + 1 < cols_this) xv[1] = Xpack[row_offset + 1];
+          if (col_base + 2 < cols_this) xv[2] = Xpack[row_offset + 2];
+          if (col_base + 3 < cols_this) xv[3] = Xpack[row_offset + 3];
+        }
       }
       reinterpret_cast<float4v*>(&sX[pong][row_in_tile * 16])[col_group] = xv;
     }
@@ -1397,14 +1416,14 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
 
   // Nếu cột batch này hợp lệ thì scatter vào slot tương ứng
   if (tx < cols_this) {
-    const int sid     = slot_of(tx);
+    const int sid = s_slot[tx];
     if (sid >= 0) {
       float* __restrict__ out = dst + (size_t)sid * (size_t)out_stride;
-
-      if (r0 < M) { float v = acc[0]; if (bias) v += bfloat16_to_float(bias[r0]); out[r0] = v; }
-      if (r1 < M) { float v = acc[1]; if (bias) v += bfloat16_to_float(bias[r1]); out[r1] = v; }
-      if (r2 < M) { float v = acc[2]; if (bias) v += bfloat16_to_float(bias[r2]); out[r2] = v; }
-      if (r3 < M) { float v = acc[3]; if (bias) v += bfloat16_to_float(bias[r3]); out[r3] = v; }
+      const int bias_base = ty * 4;
+      if (r0 < M) out[r0] = acc[0] + s_bias[bias_base + 0];
+      if (r1 < M) out[r1] = acc[1] + s_bias[bias_base + 1];
+      if (r2 < M) out[r2] = acc[2] + s_bias[bias_base + 2];
+      if (r3 < M) out[r3] = acc[3] + s_bias[bias_base + 3];
     }
   }
 }
