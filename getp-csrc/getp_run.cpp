@@ -3159,6 +3159,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 // ------------------------- Warm-up & Finish -------------------------
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
+  transformer->config.seq_len = 1024; // override max seq len to 1024
   int device_count = 0;
   HIP_CHECK(hipGetDeviceCount(&device_count));
   if (device_count <= 0) {
