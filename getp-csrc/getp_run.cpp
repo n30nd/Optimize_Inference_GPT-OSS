@@ -57,6 +57,7 @@
 typedef struct {
   hip_bfloat16 *token_embedding_table;
   hip_bfloat16 *out;
+  hip_bfloat16 *out_packed16;
   hip_bfloat16 *rms_attn_w;
   hip_bfloat16 *rms_ffn_w;
   hip_bfloat16 *rms_out_w;
@@ -176,6 +177,7 @@ typedef struct {
   int *d_pos_list;
   int *d_token_ids;
   int *d_next_tokens;  // Persistent buffer for sampled next tokens
+  int *d_batch_iota;   // Identity mapping for batch-ordered GEMM outputs
   WeightCopyWorkspace copy_ws;
 } GPUContext;
 
@@ -2105,54 +2107,6 @@ __global__ void rmsnorm_final_batched_kernel(float *x, const hip_bfloat16 *weigh
     }
 }
 
-__global__ void logits_final_batched_kernel(const float *x,
-                                          const hip_bfloat16 *weights_out,
-                                          float *logits,
-                                          int hidden_dim,
-                                          int vocab_size,
-                                          int batch,
-                                          const int *slot_ids) {
-    int v = blockIdx.x;  // vocab index
-    int b = blockIdx.y;  // batch index
-    
-    if (v >= vocab_size || b >= batch) return;
-    
-    int sid = slot_ids[b];
-    const float *x_slot = x + (size_t)sid * (size_t)hidden_dim;
-    float *logits_slot = logits + (size_t)b * (size_t)vocab_size;
-    
-    // Use shared memory efficiently
-    extern __shared__ float s_partial[];
-    
-    // Initialize partial sum
-    float sum = 0.0f;
-    
-    // Each thread processes strided elements
-    for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
-        float x_val = x_slot[i];
-        float w_val = bfloat16_to_float(weights_out[v * hidden_dim + i]);
-        sum += x_val * w_val;
-    }
-    
-    // Store in shared memory
-    s_partial[threadIdx.x] = sum;
-    __syncthreads();
-    
-    // Block reduction
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-            s_partial[threadIdx.x] += s_partial[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    
-    // First thread writes result for this vocab entry
-    if (threadIdx.x == 0) {
-        logits_slot[v] = s_partial[0];
-    }
-}
-
-
 // ------------------------- CPU top-k -------------------------
 
 void topk_cpu(float *topk_values, int *topk_indices, const float *router_score, int num_experts, int experts_per_token) {
@@ -2511,6 +2465,9 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   
   // Pack W_o weights  
   pack_weights_for_mfma(gpu_w->w_o, &gpu_w->w_o_packed16, n_layers, hidden_dim, ctx->local_q_dim, "w_o");
+
+  // Pack final output projection (replicated)
+  pack_weights_for_mfma(gpu_w->out, &gpu_w->out_packed16, 1, vocab_size, hidden_dim, "out_final");
   
   // Pack router weights (only on leader)
   if (ctx->is_leader) {
@@ -3109,13 +3066,19 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       leader->state.x, leader->weights.rms_out_w,
       hidden_dim, batch, leader->d_slot_ids);
 
-    dim3 block_logits(128);
-    dim3 grid_logits(p->vocab_size, batch);
-    size_t shared_logits = block_logits.x * sizeof(float);
-    logits_final_batched_kernel<<<grid_logits, block_logits, shared_logits, leader->batch_stream>>>(
-      leader->state.x, leader->weights.out,
-      leader->state.logits_fp32, hidden_dim,
-      p->vocab_size, batch, leader->d_slot_ids);
+    int vocab = p->vocab_size;
+    int Bpad_logits = ((batch + 15) / 16) * 16;
+    dim3 block_pack_logits(256);
+    dim3 grid_pack_logits((hidden_dim + block_pack_logits.x - 1) / block_pack_logits.x, batch);
+    gather_pack_x_fp32_to_fp32_mfma_kernel<<<grid_pack_logits, block_pack_logits, 0, leader->batch_stream>>>(
+      leader->state.x, leader->state.xpack_f32,
+      hidden_dim, batch, Bpad_logits, hidden_dim, leader->d_slot_ids);
+
+    const hip_bfloat16 *w_out_packed = leader->weights.out_packed16;
+    launch_gemm16x16_mfma_f32_batched(
+      w_out_packed, leader->state.xpack_f32, leader->state.logits_fp32, nullptr,
+      vocab, hidden_dim, batch, Bpad_logits, vocab,
+      leader->d_batch_iota, leader->batch_stream);
 
     dim3 block_argmax(64);
     dim3 grid_argmax((batch + block_argmax.x - 1) / block_argmax.x);
@@ -3261,6 +3224,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     HIP_CHECK(hipMalloc(&ctx.d_pos_list,  ctx.max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&ctx.d_token_ids, ctx.max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&ctx.d_next_tokens, ctx.max_batch * sizeof(int)));
+    HIP_CHECK(hipMalloc(&ctx.d_batch_iota, ctx.max_batch * sizeof(int)));
+    std::vector<int> host_batch_iota(ctx.max_batch);
+    for (int i = 0; i < ctx.max_batch; ++i) host_batch_iota[i] = i;
+    HIP_CHECK(hipMemcpy(ctx.d_batch_iota, host_batch_iota.data(),
+                       ctx.max_batch * sizeof(int), hipMemcpyHostToDevice));
 
     ctx.num_expert_streams = MAX_EXPERT_STREAMS;
     for (int s = 0; s < ctx.num_expert_streams; ++s) {
@@ -3305,6 +3273,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     if (gpu_ctx.d_pos_list)    HIP_CHECK(hipFree(gpu_ctx.d_pos_list));
     if (gpu_ctx.d_token_ids)   HIP_CHECK(hipFree(gpu_ctx.d_token_ids));
     if (gpu_ctx.d_next_tokens) HIP_CHECK(hipFree(gpu_ctx.d_next_tokens));
+    if (gpu_ctx.d_batch_iota)  HIP_CHECK(hipFree(gpu_ctx.d_batch_iota));
     WeightCopyWorkspace &ws = gpu_ctx.copy_ws;
     for (int i = 0; i < 2; ++i) {
       if (ws.copy_ready[i]) HIP_CHECK(hipEventDestroy(ws.copy_ready[i]));
@@ -3581,6 +3550,7 @@ void gpu_free_run_state(GPUContext *ctx) {
 void gpu_free_weights(GPUTransformerWeights *gpu_w) {
   HIP_CHECK(hipFree(gpu_w->token_embedding_table));
   HIP_CHECK(hipFree(gpu_w->out));
+  if (gpu_w->out_packed16) HIP_CHECK(hipFree(gpu_w->out_packed16));
   HIP_CHECK(hipFree(gpu_w->rms_attn_w));
   HIP_CHECK(hipFree(gpu_w->rms_ffn_w));
   HIP_CHECK(hipFree(gpu_w->rms_out_w));
