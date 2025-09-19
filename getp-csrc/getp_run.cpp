@@ -3237,6 +3237,21 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
 // ------------------------- Warm-up & Finish -------------------------
 
+void log_gpu_memory_usage(int device_id) {
+  HIP_CHECK(hipSetDevice(device_id));
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
+  
+  size_t used_bytes = total_bytes - free_bytes;
+  double used_gb = used_bytes / GB;
+  double free_gb = free_bytes / GB;
+  double total_gb = total_bytes / GB;
+  
+  printf("[GPU %d] Memory after warm-up: %.2f GB used, %.2f GB free, %.2f GB total (%.1f%% used)\n",
+         device_id, used_gb, free_gb, total_gb, (used_bytes * 100.0) / total_bytes);
+}
+
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   transformer->config.seq_len = 1024; // override max seq len to 1024
   int device_count = 0;
@@ -3393,6 +3408,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   printf("[GPU] Warm-up done on %d device(s). BF16 weights loaded to VRAM with TP=%d, EP=%d.\n",
          used_devices, parallel_layout.tp_size, parallel_layout.ep_size);
   printf("[Attention] Using FlashAttention-like optimized kernel (always on)\n");
+  
+  // Log memory usage for each GPU device after warm-up
+  for (int d = 0; d < used_devices; ++d) {
+    log_gpu_memory_usage(d);
+  }
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -3585,6 +3605,12 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   size_t kv_cache_elems = (size_t)max_batch * (size_t)p->n_layers * (size_t)p->seq_len * (size_t)local_kv_dim;
   HIP_CHECK(hipMalloc(&s->key_cache,   kv_cache_elems * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->value_cache, kv_cache_elems * sizeof(float)));
+
+  // Log total KV cache memory allocation
+  size_t total_kv_cache_bytes = 2 * kv_cache_elems * sizeof(float); // key_cache + value_cache
+  double total_kv_cache_gb = total_kv_cache_bytes / GB;
+  printf("KV Cache allocated: %zu elements per cache, total %.2f GB (%zu bytes)\n", 
+         kv_cache_elems, total_kv_cache_gb, total_kv_cache_bytes);
 
   if (ctx->is_leader) {
     HIP_CHECK(hipMalloc(&s->logits,      B * (size_t)p->vocab_size * sizeof(float)));
