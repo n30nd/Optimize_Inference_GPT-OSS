@@ -1985,7 +1985,38 @@ __global__ void flash_attention_kernel_optimized(
 
 }
 
-// Batched FlashAttention-like kernel (simplified for reliability)
+// Block-wide reductions implemented with dynamic shared memory scratch.
+__device__ inline float block_reduce_max(float val, float *shared) {
+  int tid = threadIdx.x;
+  shared[tid] = val;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      shared[tid] = fmaxf(shared[tid], shared[tid + offset]);
+    }
+    __syncthreads();
+  }
+  float result = shared[0];
+  __syncthreads();
+  return result;
+}
+
+__device__ inline float block_reduce_sum(float val, float *shared) {
+  int tid = threadIdx.x;
+  shared[tid] = val;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      shared[tid] += shared[tid + offset];
+    }
+    __syncthreads();
+  }
+  float result = shared[0];
+  __syncthreads();
+  return result;
+}
+
+// Batched FlashAttention-like kernel optimized for MI250.
 __global__ void flash_attention_kernel_optimized_batched(
     const float *all_q,           // [B, n_heads*head_dim]
     const float *key_cache,       // [B, layers*seq_len*kv_dim]
@@ -2007,7 +2038,11 @@ __global__ void flash_attention_kernel_optimized_batched(
   int b = blockIdx.z;   // batch index
   if (h >= n_heads || b >= batch) return;
 
+  (void)tile_size;
+
   int pos = pos_list[b];
+  if (pos < 0) return;
+
   int sid = slot_ids[b];
   const float *q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
   float *output = all_output + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
@@ -2015,60 +2050,103 @@ __global__ void flash_attention_kernel_optimized_batched(
   const float *key_cache_base   = key_cache   + (size_t)sid * (size_t)kv_block_size;
   const float *value_cache_base = value_cache + (size_t)sid * (size_t)kv_block_size;
 
-  // Simple shared memory for attention scores
-  extern __shared__ float shared_att_batch[];
-  
-  // Phase 1: Compute attention scores
-  for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
-    const float *k = key_cache_base + (size_t)loff + (size_t)t * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
+  extern __shared__ float shared_mem[];
+  float *shared_att_batch = shared_mem;
+  float *shared_q = shared_att_batch + seq_len;
+  float *reduce_buf = shared_q + head_dim;
+
+  const int head_group = h / kv_mul;
+  const size_t kv_head_offset = (size_t)loff + (size_t)head_group * (size_t)head_dim;
+  const float scale = rsqrtf((float)head_dim);
+
+  // Stage Q vector in shared memory so every thread reuses cached values.
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    shared_q[i] = q_head[i];
+  }
+  __syncthreads();
+
+  int value_len = pos + 1;
+  if (value_len <= 0) return;
+  if (value_len > seq_len) value_len = seq_len;
+
+  bool add_sink = can_add_sink && (pos + 1) < seq_len;
+  int logits_len = value_len + (add_sink ? 1 : 0);
+
+  const float *mask_row = nullptr;
+  if (mask != nullptr) {
+    mask_row = mask + (size_t)pos * (size_t)seq_len;
+  }
+
+  // Phase 1: Compute attention logits using vectorized dot products.
+  for (int t = threadIdx.x; t < value_len; t += blockDim.x) {
+    const float *k = key_cache_base + kv_head_offset + (size_t)t * (size_t)kv_dim;
     float score = 0.0f;
-    for (int i = 0; i < head_dim; i++) {
-      score += q_head[i] * k[i];
+
+    int vec4 = head_dim / 4;
+    if (vec4 > 0) {
+      const float4 *q4 = reinterpret_cast<const float4*>(shared_q);
+      const float4 *k4 = reinterpret_cast<const float4*>(k);
+#pragma unroll
+      for (int i = 0; i < vec4; ++i) {
+        float4 qv = q4[i];
+        float4 kvv = k4[i];
+        score = fmaf(qv.x, kvv.x, score);
+        score = fmaf(qv.y, kvv.y, score);
+        score = fmaf(qv.z, kvv.z, score);
+        score = fmaf(qv.w, kvv.w, score);
+      }
     }
-    score /= sqrtf((float)head_dim);
-    if (mask != NULL) {
-      score += mask[(size_t)pos * (size_t)seq_len + (size_t)t];
+    for (int i = vec4 * 4; i < head_dim; ++i) {
+      score = fmaf(shared_q[i], k[i], score);
+    }
+
+    score *= scale;
+    if (mask_row != nullptr) {
+      score += mask_row[t];
     }
     shared_att_batch[t] = score;
   }
   __syncthreads();
 
-  // Phase 2: Add attention sink
-  if (threadIdx.x == 0 && can_add_sink && (pos + 1) < seq_len) {
-    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
-    shared_att_batch[pos + 1] = bfloat16_to_float(attn_sinks[sink_idx]);
-  }
-  __syncthreads();
-
-  // Phase 3: Softmax
-  if (threadIdx.x == 0) {
-    int len = can_add_sink ? (pos + 2) : (pos + 1);
-    if (len > 0) {
-      float max_val = shared_att_batch[0];
-      for (int i = 1; i < len; i++) max_val = fmaxf(max_val, shared_att_batch[i]);
-      float sum_val = 0.0f;
-      for (int i = 0; i < len; i++) { 
-        float v = expf(shared_att_batch[i] - max_val); 
-        shared_att_batch[i] = v; 
-        sum_val += v; 
-      }
-      float inv = 1.0f / (sum_val + 1e-8f); // Add epsilon for stability
-      for (int i = 0; i < len; i++) shared_att_batch[i] *= inv;
+  // Phase 2: Optional attention sink value appended to logits.
+  if (add_sink) {
+    if (threadIdx.x == 0) {
+      size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
+      shared_att_batch[value_len] = bfloat16_to_float(attn_sinks[sink_idx]);
     }
   }
   __syncthreads();
 
-  // Phase 4: Weighted sum with values
+  // Phase 3: Softmax normalization using parallel reductions.
+  float thread_max = -FLT_MAX;
+  for (int t = threadIdx.x; t < logits_len; t += blockDim.x) {
+    thread_max = fmaxf(thread_max, shared_att_batch[t]);
+  }
+  float max_val = block_reduce_max(thread_max, reduce_buf);
+
+  float thread_sum = 0.0f;
+  for (int t = threadIdx.x; t < logits_len; t += blockDim.x) {
+    float v = __expf(shared_att_batch[t] - max_val);
+    shared_att_batch[t] = v;
+    thread_sum += v;
+  }
+  float sum_val = block_reduce_sum(thread_sum, reduce_buf);
+  float inv_sum = 1.0f / (sum_val + 1e-8f);
+
+  for (int t = threadIdx.x; t < logits_len; t += blockDim.x) {
+    shared_att_batch[t] *= inv_sum;
+  }
+  __syncthreads();
+
+  // Phase 4: Weighted sum with values.
   for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    const float *v = value_cache_base + kv_head_offset + (size_t)i;
     float sum = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-      const float *v = value_cache_base + (size_t)loff + (size_t)t * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
-      sum += shared_att_batch[t] * v[i];
+    for (int t = 0; t < value_len; ++t) {
+      sum = fmaf(shared_att_batch[t], v[(size_t)t * (size_t)kv_dim], sum);
     }
     output[i] = sum;
   }
-
-
 }
 // (Fallback multi-head attention and env-based FlashAttention config removed to simplify code.)
 
@@ -2780,8 +2858,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       HIP_CHECK(hipSetDevice(ctx->device_id));
       bool can_add_sink = true;
       const float *layer_mask = (p->sliding_window > 0 && (l % 2 == 0)) ? ctx->state.mask : NULL;
-      size_t shared_mem_bytes = (size_t)p->seq_len * sizeof(float);
-      dim3 block(256);
+      const int block_size = 256;
+      dim3 block(block_size);
+      size_t shared_mem_bytes = (size_t)(p->seq_len + head_dim + block_size) * sizeof(float);
       dim3 grid(1, ctx->local_q_heads, batch);
       flash_attention_kernel_optimized_batched<<<grid, block, shared_mem_bytes, ctx->batch_stream>>>(
         ctx->state.qkv, ctx->state.key_cache, ctx->state.value_cache, ctx->weights.attn_sinks,
