@@ -104,6 +104,7 @@ typedef struct {
   float *mask;
   float *cos_vals;
   float *sin_vals;
+  hip_bfloat16 *t_bf16;
   // FP32 buffers for accumulation and precision-sensitive ops
   float *acc_buffer;         // x in FP32 for output matvec
   float *logits_fp32;        // final logits
@@ -199,12 +200,25 @@ struct Slot {
 // ------------------------- BF16 utils -------------------------
 
 using float4v = __attribute__((ext_vector_type(4))) float;
+using short4v = __attribute__((ext_vector_type(4))) short;
 
 __device__ __forceinline__ hip_bfloat16 float_to_bfloat16(float f) {
   return hip_bfloat16(f);
 }
 __device__ __host__ __forceinline__ float bfloat16_to_float(hip_bfloat16 bf) {
   return float(bf);
+}
+
+__device__ __forceinline__ uint16_t bfloat16_to_bits(hip_bfloat16 bf) {
+  union { hip_bfloat16 bf; uint16_t u; } u{};
+  u.bf = bf;
+  return u.u;
+}
+
+__device__ __forceinline__ uint16_t float_to_bf16_bits(float f) {
+  union { hip_bfloat16 bf; uint16_t u; } u{};
+  u.bf = float_to_bfloat16(f);
+  return u.u;
 }
 
 __device__ __forceinline__ float bf16_bits_to_float(uint16_t bits) {
@@ -336,7 +350,7 @@ __global__ void convert_fp32_to_bf16_kernel(const float *fp32_data, hip_bfloat16
 __global__ __launch_bounds__(64)
 void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     float* __restrict__ mlp1_out_all,        // [M selections][out_dim]
-    const float* __restrict__ t,             // [B slots][hidden_dim]
+    const hip_bfloat16* __restrict__ t_bf16, // [B slots][hidden_dim] BF16
     const uint8_t* __restrict__ w_data,      // MXFP4 nibbles (tile-packed 16x16)
     const uint8_t* __restrict__ w_scales,    // tile-packed (16 rows per tile) e8m0 codes
     const hip_bfloat16* __restrict__ b_mlp1, // [n_layers*n_experts][out_dim]
@@ -367,8 +381,8 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
   const hip_bfloat16* __restrict__ B = b_mlp1 ? (b_mlp1 + mat_index * (size_t)out_dim) : nullptr;
 
-  __shared__ __align__(16) float sWf[16 * 16];
-  __shared__ __align__(16) float sX[16 * 16];
+  __shared__ __align__(16) uint16_t sWbf16[16 * 16];
+  __shared__ __align__(16) uint16_t sXbf16[16 * 16];
   __shared__ __align__(16) float sBias[16];
   __shared__ __align__(16) float sScale[16];
 
@@ -419,12 +433,13 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
       for (int t4 = 0; t4 < 4; ++t4) {
         int ik = ik_base + t4;
         int col = col_base + t4;
-        float wv = 0.f;
+        uint16_t bits = 0;
         if (row < out_dim && col < K) {
           uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-          wv = decode_mxfp4(nibble) * sScale[im];
+          float wv = decode_mxfp4(nibble) * sScale[im];
+          bits = float_to_bf16_bits(wv);
         }
-        sWf[im * 16 + ik] = wv;
+        sWbf16[im * 16 + ik] = bits;
       }
     }
 
@@ -433,32 +448,38 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
       const int r   = lane % 16;        // K row within tile
       const int c4  = (lane / 16) * 4;  // column block index {0,4,8,12}
       const int k_row = kk * 16 + r;
-      float* dst = sX + r * 16 + c4;
+      uint16_t* dst = sXbf16 + r * 16 + c4;
       #pragma unroll
       for (int jj = 0; jj < 4; ++jj) {
         int col = c4 + jj;
-        float v = 0.f;
+        uint16_t bits = 0;
         if (col < valid_cols && k_row < K) {
           int msel = col0 + col;
           if (msel < selections_M) {
             int sid = sel_sids[msel];
-            const float* __restrict__ x = t + (size_t)sid * (size_t)hidden_dim;
-            v = x[k_row];
+            const hip_bfloat16* __restrict__ x = t_bf16 + (size_t)sid * (size_t)hidden_dim;
+            hip_bfloat16 val = x[k_row];
+            bits = bfloat16_to_bits(val);
           }
         }
-        dst[jj] = v;
+        dst[jj] = bits;
       }
     }
 
     __syncthreads();
 
+    const int kbase = ty * 4;
+    short4v Areg;
+    short4v Breg;
     #pragma unroll
-    for (int t4 = 0; t4 < 4; ++t4) {
-      const int k4 = ty + 4 * t4; // 0..15
-      float amk = sWf[tx * 16 + k4];   // A: row=tx, col=k4
-      float bkn = sX[k4 * 16 + tx];    // B: row=k4, col=tx
-      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(amk, bkn, acc, 0, 0, 0);
+    for (int j = 0; j < 4; ++j) {
+      int kidx = kbase + j;
+      uint16_t a_bits = sWbf16[tx * 16 + kidx];
+      uint16_t b_bits = sXbf16[kidx * 16 + tx];
+      Areg[j] = static_cast<short>(a_bits);
+      Breg[j] = static_cast<short>(b_bits);
     }
+    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
 
     __syncthreads();
   }
@@ -823,6 +844,19 @@ __global__ void gather_pack_x_fp32_to_fp32_mfma_kernel(const float *x, float *xp
     int sid = slot_ids[b];
     const float *x_slot = x + (size_t)sid * (size_t)in_stride;
     xpack[(size_t)row * (size_t)Bpad + (size_t)b] = x_slot[row];
+  }
+}
+
+__global__ void gather_fp32_to_bf16_slots_kernel(const float *x, hip_bfloat16 *dst,
+                                                 int K, int B,
+                                                 int in_stride, const int *slot_ids) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = blockIdx.y;
+  if (row < K && b < B) {
+    int sid = slot_ids[b];
+    const float *x_slot = x + (size_t)sid * (size_t)in_stride;
+    hip_bfloat16 *dst_slot = dst + (size_t)sid * (size_t)in_stride;
+    dst_slot[row] = float_to_bfloat16(x_slot[row]);
   }
 }
 
@@ -2350,12 +2384,23 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int block_count = local_block_counts[idx];
       if (M_local == 0 || block_count == 0) continue;
       HIP_CHECK(hipSetDevice(ctx->device_id));
+      if (batch > 0) {
+        dim3 block_fp2bf16(256);
+        dim3 grid_fp2bf16((hidden_dim + block_fp2bf16.x - 1) / block_fp2bf16.x, batch);
+        gather_fp32_to_bf16_slots_kernel<<<grid_fp2bf16, block_fp2bf16, 0, ctx->batch_stream>>>(
+          ctx->state.t,
+          ctx->state.t_bf16,
+          hidden_dim,
+          batch,
+          hidden_dim,
+          ctx->d_slot_ids);
+      }
       // Launch MFMA matvec over 16-row tiles in output dimension
       const int out_dim = 2 * p->intermediate_dim;
       dim3 block1(16,4,1); // 64 threads per block for 16x16x4 MFMA
       dim3 grid1((out_dim + 15) / 16, block_count, 1);
       mlp1_grouped_mfma_matvec_mxfp4_kernel<<<grid1, block1, 0, ctx->batch_stream>>>(
-        ctx->state.mlp1_out_all, ctx->state.t,
+        ctx->state.mlp1_out_all, ctx->state.t_bf16,
         ctx->weights.w_mlp1_data, ctx->weights.w_mlp1_scales,
         ctx->weights.b_mlp1,
         ctx->state.sel_sids,
@@ -2811,6 +2856,7 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
 
   HIP_CHECK(hipMalloc(&s->x,   B * (size_t)hidden_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->t,   B * (size_t)hidden_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(reinterpret_cast<void **>(&s->t_bf16), B * (size_t)hidden_dim * sizeof(hip_bfloat16)));
   HIP_CHECK(hipMalloc(&s->tb,  B * (size_t)local_q_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->tb2, B * (size_t)hidden_dim * sizeof(float)));
 
@@ -2895,6 +2941,7 @@ void gpu_free_run_state(GPUContext *ctx) {
   GPURunState *s = &ctx->state;
   HIP_CHECK(hipFree(s->x));
   HIP_CHECK(hipFree(s->t));
+  HIP_CHECK(hipFree(s->t_bf16));
   HIP_CHECK(hipFree(s->tb));
   HIP_CHECK(hipFree(s->tb2));
   HIP_CHECK(hipFree(s->router_score));
