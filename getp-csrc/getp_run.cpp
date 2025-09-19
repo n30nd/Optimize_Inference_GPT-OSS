@@ -1163,20 +1163,13 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
   // Hàng cơ sở của tile M
   const int base_row = tile_m * 16;
 
-  // Chuẩn bị slot_id cho từng cột batch trong nhóm
-  // (đọc trực tiếp từ global trong phase write để tiết kiệm LDS)
-  auto slot_of = [&](int local_col) -> int {
-    // local_col: 0..15
-    int b = b_base + local_col;
-    return (b < B) ? slot_ids[b] : -1;
-  };
-
   // Shared ping-pong
   __shared__ __align__(16) float sW[2][16 * 16];
   __shared__ __align__(16) float sX[2][16 * 16];
+  __shared__ int s_slot[16];
+  __shared__ float s_bias[16];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
-  using u32x4   = __attribute__((ext_vector_type(4))) unsigned int;
 
   // Helper: nạp 4 BF16 -> 4 FP32 (giống hàm bạn đang có, để inline tại đây cho tốc độ)
   auto bf16x4_to_f4 = [&](const hip_bfloat16* src) {
@@ -1198,6 +1191,28 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
     return v;
   };
 
+  const bool has_bias = (bias != nullptr);
+  const bool full_tile = (cols_this == 16);
+
+  // Chuẩn bị slot_id và bias tile cho block
+  if (ty == 0) {
+    const int col = tx;
+    const int global_col = b_base + col;
+    int slot_val = -1;
+    if (col < cols_this && global_col < B) {
+      slot_val = slot_ids[global_col];
+    }
+    s_slot[col] = slot_val;
+
+    const int row = base_row + col;
+    float bias_val = 0.0f;
+    if (has_bias && row < M) {
+      bias_val = bfloat16_to_float(bias[row]);
+    }
+    s_bias[col] = bias_val;
+  }
+  __syncthreads();
+
   float4v acc = {0.f, 0.f, 0.f, 0.f};
 
   const int Ktiles        = (Kpad + 15) / 16;
@@ -1205,6 +1220,9 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
   const size_t tile_elems    = 256;                     // 16*16 BF16/FP32
   const hip_bfloat16* w_tile_row_base =
       W_packed + ((size_t)tile_m * tiles_per_row) * tile_elems;
+
+  const size_t x_stride = static_cast<size_t>(Bpad);
+  const size_t b_base_sz = static_cast<size_t>(b_base);
 
   // Preload Ô-0 (ping=0)
   {
@@ -1219,19 +1237,18 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
     const int k_row0 = 0 * 16 + row_in_tile;
     float4v xv = {0.f, 0.f, 0.f, 0.f};
     if (k_row0 < K) {
-      // mỗi lane ghi 4 cột (col_group xác định cụm {0,4,8,12})
-      // để 64 lanes phủ 16*16 phần tử: lane i ghi 4 phần tử kế tiếp theo cột
-      const int c0 = col_group * 4 + 0;
-      const int c1 = col_group * 4 + 1;
-      const int c2 = col_group * 4 + 2;
-      const int c3 = col_group * 4 + 3;
-      const int xs = Bpad;
-
-      // đọc an toàn trong nhóm cuối
-      xv[0] = (c0 < cols_this) ? Xpack[(size_t)k_row0 * xs + (size_t)(b_base + c0)] : 0.f;
-      xv[1] = (c1 < cols_this) ? Xpack[(size_t)k_row0 * xs + (size_t)(b_base + c1)] : 0.f;
-      xv[2] = (c2 < cols_this) ? Xpack[(size_t)k_row0 * xs + (size_t)(b_base + c2)] : 0.f;
-      xv[3] = (c3 < cols_this) ? Xpack[(size_t)k_row0 * xs + (size_t)(b_base + c3)] : 0.f;
+      const int col_base = col_group * 4;
+      const size_t row_offset = static_cast<size_t>(k_row0) * x_stride + b_base_sz + static_cast<size_t>(col_base);
+      if (full_tile) {
+        // Fast path: vector load when all 16 batch columns are valid
+        xv = reinterpret_cast<const float4v*>(Xpack + row_offset)[0];
+      } else {
+        // Tail group: guard each column individually
+        if (col_base + 0 < cols_this) xv[0] = Xpack[row_offset + 0];
+        if (col_base + 1 < cols_this) xv[1] = Xpack[row_offset + 1];
+        if (col_base + 2 < cols_this) xv[2] = Xpack[row_offset + 2];
+        if (col_base + 3 < cols_this) xv[3] = Xpack[row_offset + 3];
+      }
     }
     reinterpret_cast<float4v*>(&sX[0][row_in_tile * 16])[col_group] = xv;
   }
@@ -1257,16 +1274,18 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
       const int k_row = (kt + 1) * 16 + row_in_tile;
       float4v xv = {0.f, 0.f, 0.f, 0.f};
       if (k_row < K) {
-        const int c0 = col_group * 4 + 0;
-        const int c1 = col_group * 4 + 1;
-        const int c2 = col_group * 4 + 2;
-        const int c3 = col_group * 4 + 3;
-        const int xs = Bpad;
-
-        xv[0] = (c0 < cols_this) ? Xpack[(size_t)k_row * xs + (size_t)(b_base + c0)] : 0.f;
-        xv[1] = (c1 < cols_this) ? Xpack[(size_t)k_row * xs + (size_t)(b_base + c1)] : 0.f;
-        xv[2] = (c2 < cols_this) ? Xpack[(size_t)k_row * xs + (size_t)(b_base + c2)] : 0.f;
-        xv[3] = (c3 < cols_this) ? Xpack[(size_t)k_row * xs + (size_t)(b_base + c3)] : 0.f;
+        const int col_base = col_group * 4;
+        const size_t row_offset = static_cast<size_t>(k_row) * x_stride + b_base_sz + static_cast<size_t>(col_base);
+        if (full_tile) {
+          // Fast path: vector load when all 16 batch columns are valid
+          xv = reinterpret_cast<const float4v*>(Xpack + row_offset)[0];
+        } else {
+          // Tail group: guard each column individually
+          if (col_base + 0 < cols_this) xv[0] = Xpack[row_offset + 0];
+          if (col_base + 1 < cols_this) xv[1] = Xpack[row_offset + 1];
+          if (col_base + 2 < cols_this) xv[2] = Xpack[row_offset + 2];
+          if (col_base + 3 < cols_this) xv[3] = Xpack[row_offset + 3];
+        }
       }
       reinterpret_cast<float4v*>(&sX[pong][row_in_tile * 16])[col_group] = xv;
     }
@@ -1296,14 +1315,14 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
 
   // Nếu cột batch này hợp lệ thì scatter vào slot tương ứng
   if (tx < cols_this) {
-    const int sid     = slot_of(tx);
+    const int sid = s_slot[tx];
     if (sid >= 0) {
       float* __restrict__ out = dst + (size_t)sid * (size_t)out_stride;
-
-      if (r0 < M) { float v = acc[0]; if (bias) v += bfloat16_to_float(bias[r0]); out[r0] = v; }
-      if (r1 < M) { float v = acc[1]; if (bias) v += bfloat16_to_float(bias[r1]); out[r1] = v; }
-      if (r2 < M) { float v = acc[2]; if (bias) v += bfloat16_to_float(bias[r2]); out[r2] = v; }
-      if (r3 < M) { float v = acc[3]; if (bias) v += bfloat16_to_float(bias[r3]); out[r3] = v; }
+      const int bias_base = ty * 4;
+      if (r0 < M) out[r0] = acc[0] + s_bias[bias_base + 0];
+      if (r1 < M) out[r1] = acc[1] + s_bias[bias_base + 1];
+      if (r2 < M) out[r2] = acc[2] + s_bias[bias_base + 2];
+      if (r3 < M) out[r3] = acc[3] + s_bias[bias_base + 3];
     }
   }
 }
@@ -1865,7 +1884,38 @@ __global__ void flash_attention_kernel_optimized(
 
 }
 
-// Batched FlashAttention-like kernel (simplified for reliability)
+// Block-wide reductions implemented with dynamic shared memory scratch.
+__device__ inline float block_reduce_max(float val, float *shared) {
+  int tid = threadIdx.x;
+  shared[tid] = val;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      shared[tid] = fmaxf(shared[tid], shared[tid + offset]);
+    }
+    __syncthreads();
+  }
+  float result = shared[0];
+  __syncthreads();
+  return result;
+}
+
+__device__ inline float block_reduce_sum(float val, float *shared) {
+  int tid = threadIdx.x;
+  shared[tid] = val;
+  __syncthreads();
+  for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1) {
+    if (tid < offset) {
+      shared[tid] += shared[tid + offset];
+    }
+    __syncthreads();
+  }
+  float result = shared[0];
+  __syncthreads();
+  return result;
+}
+
+// Batched FlashAttention-like kernel optimized for MI250.
 __global__ void flash_attention_kernel_optimized_batched(
     const float *all_q,           // [B, n_heads*head_dim]
     const float *key_cache,       // [B, layers*seq_len*kv_dim]
@@ -1887,7 +1937,11 @@ __global__ void flash_attention_kernel_optimized_batched(
   int b = blockIdx.z;   // batch index
   if (h >= n_heads || b >= batch) return;
 
+  (void)tile_size;
+
   int pos = pos_list[b];
+  if (pos < 0) return;
+
   int sid = slot_ids[b];
   const float *q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
   float *output = all_output + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
@@ -1895,60 +1949,103 @@ __global__ void flash_attention_kernel_optimized_batched(
   const float *key_cache_base   = key_cache   + (size_t)sid * (size_t)kv_block_size;
   const float *value_cache_base = value_cache + (size_t)sid * (size_t)kv_block_size;
 
-  // Simple shared memory for attention scores
-  extern __shared__ float shared_att_batch[];
-  
-  // Phase 1: Compute attention scores
-  for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
-    const float *k = key_cache_base + (size_t)loff + (size_t)t * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
+  extern __shared__ float shared_mem[];
+  float *shared_att_batch = shared_mem;
+  float *shared_q = shared_att_batch + seq_len;
+  float *reduce_buf = shared_q + head_dim;
+
+  const int head_group = h / kv_mul;
+  const size_t kv_head_offset = (size_t)loff + (size_t)head_group * (size_t)head_dim;
+  const float scale = rsqrtf((float)head_dim);
+
+  // Stage Q vector in shared memory so every thread reuses cached values.
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    shared_q[i] = q_head[i];
+  }
+  __syncthreads();
+
+  int value_len = pos + 1;
+  if (value_len <= 0) return;
+  if (value_len > seq_len) value_len = seq_len;
+
+  bool add_sink = can_add_sink && (pos + 1) < seq_len;
+  int logits_len = value_len + (add_sink ? 1 : 0);
+
+  const float *mask_row = nullptr;
+  if (mask != nullptr) {
+    mask_row = mask + (size_t)pos * (size_t)seq_len;
+  }
+
+  // Phase 1: Compute attention logits using vectorized dot products.
+  for (int t = threadIdx.x; t < value_len; t += blockDim.x) {
+    const float *k = key_cache_base + kv_head_offset + (size_t)t * (size_t)kv_dim;
     float score = 0.0f;
-    for (int i = 0; i < head_dim; i++) {
-      score += q_head[i] * k[i];
+
+    int vec4 = head_dim / 4;
+    if (vec4 > 0) {
+      const float4 *q4 = reinterpret_cast<const float4*>(shared_q);
+      const float4 *k4 = reinterpret_cast<const float4*>(k);
+#pragma unroll
+      for (int i = 0; i < vec4; ++i) {
+        float4 qv = q4[i];
+        float4 kvv = k4[i];
+        score = fmaf(qv.x, kvv.x, score);
+        score = fmaf(qv.y, kvv.y, score);
+        score = fmaf(qv.z, kvv.z, score);
+        score = fmaf(qv.w, kvv.w, score);
+      }
     }
-    score /= sqrtf((float)head_dim);
-    if (mask != NULL) {
-      score += mask[(size_t)pos * (size_t)seq_len + (size_t)t];
+    for (int i = vec4 * 4; i < head_dim; ++i) {
+      score = fmaf(shared_q[i], k[i], score);
+    }
+
+    score *= scale;
+    if (mask_row != nullptr) {
+      score += mask_row[t];
     }
     shared_att_batch[t] = score;
   }
   __syncthreads();
 
-  // Phase 2: Add attention sink
-  if (threadIdx.x == 0 && can_add_sink && (pos + 1) < seq_len) {
-    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
-    shared_att_batch[pos + 1] = bfloat16_to_float(attn_sinks[sink_idx]);
-  }
-  __syncthreads();
-
-  // Phase 3: Softmax
-  if (threadIdx.x == 0) {
-    int len = can_add_sink ? (pos + 2) : (pos + 1);
-    if (len > 0) {
-      float max_val = shared_att_batch[0];
-      for (int i = 1; i < len; i++) max_val = fmaxf(max_val, shared_att_batch[i]);
-      float sum_val = 0.0f;
-      for (int i = 0; i < len; i++) { 
-        float v = expf(shared_att_batch[i] - max_val); 
-        shared_att_batch[i] = v; 
-        sum_val += v; 
-      }
-      float inv = 1.0f / (sum_val + 1e-8f); // Add epsilon for stability
-      for (int i = 0; i < len; i++) shared_att_batch[i] *= inv;
+  // Phase 2: Optional attention sink value appended to logits.
+  if (add_sink) {
+    if (threadIdx.x == 0) {
+      size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
+      shared_att_batch[value_len] = bfloat16_to_float(attn_sinks[sink_idx]);
     }
   }
   __syncthreads();
 
-  // Phase 4: Weighted sum with values
+  // Phase 3: Softmax normalization using parallel reductions.
+  float thread_max = -FLT_MAX;
+  for (int t = threadIdx.x; t < logits_len; t += blockDim.x) {
+    thread_max = fmaxf(thread_max, shared_att_batch[t]);
+  }
+  float max_val = block_reduce_max(thread_max, reduce_buf);
+
+  float thread_sum = 0.0f;
+  for (int t = threadIdx.x; t < logits_len; t += blockDim.x) {
+    float v = __expf(shared_att_batch[t] - max_val);
+    shared_att_batch[t] = v;
+    thread_sum += v;
+  }
+  float sum_val = block_reduce_sum(thread_sum, reduce_buf);
+  float inv_sum = 1.0f / (sum_val + 1e-8f);
+
+  for (int t = threadIdx.x; t < logits_len; t += blockDim.x) {
+    shared_att_batch[t] *= inv_sum;
+  }
+  __syncthreads();
+
+  // Phase 4: Weighted sum with values.
   for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    const float *v = value_cache_base + kv_head_offset + (size_t)i;
     float sum = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-      const float *v = value_cache_base + (size_t)loff + (size_t)t * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
-      sum += shared_att_batch[t] * v[i];
+    for (int t = 0; t < value_len; ++t) {
+      sum = fmaf(shared_att_batch[t], v[(size_t)t * (size_t)kv_dim], sum);
     }
     output[i] = sum;
   }
-
-
 }
 // (Fallback multi-head attention and env-based FlashAttention config removed to simplify code.)
 
@@ -2660,8 +2757,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       HIP_CHECK(hipSetDevice(ctx->device_id));
       bool can_add_sink = true;
       const float *layer_mask = (p->sliding_window > 0 && (l % 2 == 0)) ? ctx->state.mask : NULL;
-      size_t shared_mem_bytes = (size_t)p->seq_len * sizeof(float);
-      dim3 block(256);
+      const int block_size = 256;
+      dim3 block(block_size);
+      size_t shared_mem_bytes = (size_t)(p->seq_len + head_dim + block_size) * sizeof(float);
       dim3 grid(1, ctx->local_q_heads, batch);
       flash_attention_kernel_optimized_batched<<<grid, block, shared_mem_bytes, ctx->batch_stream>>>(
         ctx->state.qkv, ctx->state.key_cache, ctx->state.value_cache, ctx->weights.attn_sinks,
@@ -3038,7 +3136,23 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
 // ------------------------- Warm-up & Finish -------------------------
 
+void log_gpu_memory_usage(int device_id) {
+  HIP_CHECK(hipSetDevice(device_id));
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
+  
+  size_t used_bytes = total_bytes - free_bytes;
+  double used_gb = used_bytes / GB;
+  double free_gb = free_bytes / GB;
+  double total_gb = total_bytes / GB;
+  
+  printf("[GPU %d] Memory after warm-up: %.2f GB used, %.2f GB free, %.2f GB total (%.1f%% used)\n",
+         device_id, used_gb, free_gb, total_gb, (used_bytes * 100.0) / total_bytes);
+}
+
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
+  transformer->config.seq_len = 1024; // override max seq len to 1024
   int device_count = 0;
   HIP_CHECK(hipGetDeviceCount(&device_count));
   if (device_count <= 0) {
@@ -3193,6 +3307,11 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   printf("[GPU] Warm-up done on %d device(s). BF16 weights loaded to VRAM with TP=%d, EP=%d.\n",
          used_devices, parallel_layout.tp_size, parallel_layout.ep_size);
   printf("[Attention] Using FlashAttention-like optimized kernel (always on)\n");
+  
+  // Log memory usage for each GPU device after warm-up
+  for (int d = 0; d < used_devices; ++d) {
+    log_gpu_memory_usage(d);
+  }
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
@@ -3385,6 +3504,12 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   size_t kv_cache_elems = (size_t)max_batch * (size_t)p->n_layers * (size_t)p->seq_len * (size_t)local_kv_dim;
   HIP_CHECK(hipMalloc(&s->key_cache,   kv_cache_elems * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->value_cache, kv_cache_elems * sizeof(float)));
+
+  // Log total KV cache memory allocation
+  size_t total_kv_cache_bytes = 2 * kv_cache_elems * sizeof(float); // key_cache + value_cache
+  double total_kv_cache_gb = total_kv_cache_bytes / GB;
+  printf("KV Cache allocated: %zu elements per cache, total %.2f GB (%zu bytes)\n", 
+         kv_cache_elems, total_kv_cache_gb, total_kv_cache_bytes);
 
   if (ctx->is_leader) {
     HIP_CHECK(hipMalloc(&s->logits,      B * (size_t)p->vocab_size * sizeof(float)));
