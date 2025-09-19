@@ -247,9 +247,48 @@ constexpr float MXFP4_THRESHOLDS[7] = {
   0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f
 };
 
+__device__ __constant__ float MXFP4_DECODE_E8M0_LUT[256] = {
+  5.87747175e-39f, 1.17549435e-38f, 2.35098870e-38f, 4.70197740e-38f, 9.40395481e-38f, 1.88079096e-37f, 3.76158192e-37f, 7.52316385e-37f,
+  1.50463277e-36f, 3.00926554e-36f, 6.01853108e-36f, 1.20370622e-35f, 2.40741243e-35f, 4.81482486e-35f, 9.62964972e-35f, 1.92592994e-34f,
+  3.85185989e-34f, 7.70371978e-34f, 1.54074396e-33f, 3.08148791e-33f, 6.16297582e-33f, 1.23259516e-32f, 2.46519033e-32f, 4.93038066e-32f,
+  9.86076132e-32f, 1.97215226e-31f, 3.94430453e-31f, 7.88860905e-31f, 1.57772181e-30f, 3.15544362e-30f, 6.31088724e-30f, 1.26217745e-29f,
+  2.52435490e-29f, 5.04870979e-29f, 1.00974196e-28f, 2.01948392e-28f, 4.03896783e-28f, 8.07793567e-28f, 1.61558713e-27f, 3.23117427e-27f,
+  6.46234854e-27f, 1.29246971e-26f, 2.58493941e-26f, 5.16987883e-26f, 1.03397577e-25f, 2.06795153e-25f, 4.13590306e-25f, 8.27180613e-25f,
+  1.65436123e-24f, 3.30872245e-24f, 6.61744490e-24f, 1.32348898e-23f, 2.64697796e-23f, 5.29395592e-23f, 1.05879118e-22f, 2.11758237e-22f,
+  4.23516474e-22f, 8.47032947e-22f, 1.69406589e-21f, 3.38813179e-21f, 6.77626358e-21f, 1.35525272e-20f, 2.71050543e-20f, 5.42101086e-20f,
+  1.08420217e-19f, 2.16840434e-19f, 4.33680869e-19f, 8.67361738e-19f, 1.73472348e-18f, 3.46944695e-18f, 6.93889390e-18f, 1.38777878e-17f,
+  2.77555756e-17f, 5.55111512e-17f, 1.11022302e-16f, 2.22044605e-16f, 4.44089210e-16f, 8.88178420e-16f, 1.77635684e-15f, 3.55271368e-15f,
+  7.10542736e-15f, 1.42108547e-14f, 2.84217094e-14f, 5.68434189e-14f, 1.13686838e-13f, 2.27373675e-13f, 4.54747351e-13f, 9.09494702e-13f,
+  1.81898940e-12f, 3.63797881e-12f, 7.27595761e-12f, 1.45519152e-11f, 2.91038305e-11f, 5.82076609e-11f, 1.16415322e-10f, 2.32830644e-10f,
+  4.65661287e-10f, 9.31322575e-10f, 1.86264515e-09f, 3.72529030e-09f, 7.45058060e-09f, 1.49011612e-08f, 2.98023224e-08f, 5.96046448e-08f,
+  1.19209290e-07f, 2.38418579e-07f, 4.76837158e-07f, 9.53674316e-07f, 1.90734863e-06f, 3.81469727e-06f, 7.62939453e-06f, 1.52587891e-05f,
+  3.05175781e-05f, 6.10351562e-05f, 1.22070312e-04f, 2.44140625e-04f, 4.88281250e-04f, 9.76562500e-04f, 1.95312500e-03f, 3.90625000e-03f,
+  7.81250000e-03f, 1.56250000e-02f, 3.12500000e-02f, 6.25000000e-02f, 1.25000000e-01f, 2.50000000e-01f, 5.00000000e-01f, 1.00000000e+00f,
+  2.00000000e+00f, 4.00000000e+00f, 8.00000000e+00f, 1.60000000e+01f, 3.20000000e+01f, 6.40000000e+01f, 1.28000000e+02f, 2.56000000e+02f,
+  5.12000000e+02f, 1.02400000e+03f, 2.04800000e+03f, 4.09600000e+03f, 8.19200000e+03f, 1.63840000e+04f, 3.27680000e+04f, 6.55360000e+04f,
+  1.31072000e+05f, 2.62144000e+05f, 5.24288000e+05f, 1.04857600e+06f, 2.09715200e+06f, 4.19430400e+06f, 8.38860800e+06f, 1.67772160e+07f,
+  3.35544320e+07f, 6.71088640e+07f, 1.34217728e+08f, 2.68435456e+08f, 5.36870912e+08f, 1.07374182e+09f, 2.14748365e+09f, 4.29496730e+09f,
+  8.58993459e+09f, 1.71798692e+10f, 3.43597384e+10f, 6.87194767e+10f, 1.37438953e+11f, 2.74877907e+11f, 5.49755814e+11f, 1.09951163e+12f,
+  2.19902326e+12f, 4.39804651e+12f, 8.79609302e+12f, 1.75921860e+13f, 3.51843721e+13f, 7.03687442e+13f, 1.40737488e+14f, 2.81474977e+14f,
+  5.62949953e+14f, 1.12589991e+15f, 2.25179981e+15f, 4.50359963e+15f, 9.00719925e+15f, 1.80143985e+16f, 3.60287970e+16f, 7.20575940e+16f,
+  1.44115188e+17f, 2.88230376e+17f, 5.76460752e+17f, 1.15292150e+18f, 2.30584301e+18f, 4.61168602e+18f, 9.22337204e+18f, 1.84467441e+19f,
+  3.68934881e+19f, 7.37869763e+19f, 1.47573953e+20f, 2.95147905e+20f, 5.90295810e+20f, 1.18059162e+21f, 2.36118324e+21f, 4.72236648e+21f,
+  9.44473297e+21f, 1.88894659e+22f, 3.77789319e+22f, 7.55578637e+22f, 1.51115727e+23f, 3.02231455e+23f, 6.04462910e+23f, 1.20892582e+24f,
+  2.41785164e+24f, 4.83570328e+24f, 9.67140656e+24f, 1.93428131e+25f, 3.86856262e+25f, 7.73712525e+25f, 1.54742505e+26f, 3.09485010e+26f,
+  6.18970020e+26f, 1.23794004e+27f, 2.47588008e+27f, 4.95176016e+27f, 9.90352031e+27f, 1.98070406e+28f, 3.96140813e+28f, 7.92281625e+28f,
+  1.58456325e+29f, 3.16912650e+29f, 6.33825300e+29f, 1.26765060e+30f, 2.53530120e+30f, 5.07060240e+30f, 1.01412048e+31f, 2.02824096e+31f,
+  4.05648192e+31f, 8.11296384e+31f, 1.62259277e+32f, 3.24518554e+32f, 6.49037107e+32f, 1.29807421e+33f, 2.59614843e+33f, 5.19229686e+33f,
+  1.03845937e+34f, 2.07691874e+34f, 4.15383749e+34f, 8.30767497e+34f, 1.66153499e+35f, 3.32306999e+35f, 6.64613998e+35f, 1.32922800e+36f,
+  2.65845599e+36f, 5.31691198e+36f, 1.06338240e+37f, 2.12676479e+37f, 4.25352959e+37f, 8.50705917e+37f, 1.70141183e+38f, 3.40282347e+38f
+};
+
 __host__ __device__ __forceinline__ float decode_e8m0(uint8_t code) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  return MXFP4_DECODE_E8M0_LUT[code];
+#else
   int exp_unbiased = static_cast<int>(code) - 127;
   return ldexpf(1.0f, exp_unbiased);
+#endif
 }
 
 __host__ __device__ inline uint8_t encode_e8m0(float scale) {
@@ -298,8 +337,8 @@ __global__ __launch_bounds__(64)
 void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     float* __restrict__ mlp1_out_all,        // [M selections][out_dim]
     const float* __restrict__ t,             // [B slots][hidden_dim]
-    const uint8_t* __restrict__ w_data,      // MXFP4 nibbles (row-major)
-    const uint8_t* __restrict__ w_scales,    // e8m0 per-32-block (row-major)
+    const uint8_t* __restrict__ w_data,      // MXFP4 nibbles (tile-packed 16x16)
+    const uint8_t* __restrict__ w_scales,    // tile-packed (16 rows per tile) e8m0 codes
     const hip_bfloat16* __restrict__ b_mlp1, // [n_layers*n_experts][out_dim]
     const int* __restrict__ sel_sids,        // [M]
     const int* __restrict__ sel_block_cols,  // [num_blocks]
@@ -326,13 +365,12 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   const int base_row = tile_m * 16;
 
   const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
-  const size_t row_stride = (size_t)hidden_dim;
-  const size_t base_scale = mat_index * (size_t)out_dim * row_stride; // for scales (row-major)
   const hip_bfloat16* __restrict__ B = b_mlp1 ? (b_mlp1 + mat_index * (size_t)out_dim) : nullptr;
 
   __shared__ __align__(16) float sWf[16 * 16];
   __shared__ __align__(16) float sX[16 * 16];
   __shared__ __align__(16) float sBias[16];
+  __shared__ __align__(16) float sScale[16];
 
   if (lane < 16) {
     const int row = base_row + lane;
@@ -349,30 +387,42 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   const size_t packed_mat_bytes = (size_t)tiles_m * (size_t)tiles_k * (size_t)128; // 128 bytes per 16x16 tile (256 nibbles)
   const uint8_t* __restrict__ Wpack = w_data + mat_index * packed_mat_bytes;
   const size_t tiles_per_row = (size_t)tiles_k;
+  const size_t scales_per_mat = (size_t)tiles_m * (size_t)tiles_k * (size_t)16;
+  const uint8_t* __restrict__ Wscale = w_scales + mat_index * scales_per_mat;
 
   for (int kk = 0; kk < tiles_k; ++kk) {
     const size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
     const size_t tile_base_byte = tile_linear * (size_t)128;
+    const size_t scale_base = tile_linear * (size_t)16;
+
+    if (lane < 16) {
+      int row = base_row + lane;
+      float scale = 0.f;
+      if (row < out_dim) {
+        uint8_t scale_code = Wscale[scale_base + lane];
+        scale = decode_e8m0(scale_code);
+      }
+      sScale[lane] = scale;
+    }
+    __syncthreads();
 
     // Fill W tile [16x16] by dequantizing from MXFP4
     int idx4 = lane * 4;
     if (idx4 < 256) {
+      int im = idx4 >> 4;            // tile row for this lane
+      int ik_base = idx4 & 0xF;      // starting column within row
+      int row = base_row + im;
+      int col_base = kk * 16 + ik_base;
+      int byte_off = tile_base_byte + (idx4 >> 1);
+      uint16_t packed16 = *reinterpret_cast<const uint16_t*>(Wpack + byte_off);
       #pragma unroll
       for (int t4 = 0; t4 < 4; ++t4) {
-        int te = idx4 + t4;           // 0..255 within tile
-        int im = te / 16;             // row in tile
-        int ik = te - im * 16;        // col in tile
-        int row = base_row + im;
-        int col = kk * 16 + ik;
+        int ik = ik_base + t4;
+        int col = col_base + t4;
         float wv = 0.f;
         if (row < out_dim && col < K) {
-          size_t elem_index = base_scale + (size_t)row * row_stride + (size_t)col;
-          uint8_t scale_code = w_scales[elem_index / MXFP4_BLOCK_SIZE];
-          float scale = decode_e8m0(scale_code);
-          size_t byte_off = tile_base_byte + ((size_t)te >> 1);
-          uint8_t packed = Wpack[byte_off];
-          uint8_t nibble = (te & 1) ? (uint8_t)(packed >> 4) : (uint8_t)(packed & 0xF);
-          wv = decode_mxfp4(nibble) * scale;
+          uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
+          wv = decode_mxfp4(nibble) * sScale[im];
         }
         sWf[im * 16 + ik] = wv;
       }
@@ -486,7 +536,6 @@ __device__ inline void mxfp4_tile_map_rowcol(size_t elem_linear, size_t cols, si
 }
 
 // Repack MXFP4 row-major [rows x cols] into 16x16 tile-major order.
-// Only the data (nibbles) are reordered; scales remain in original row-major block order.
 __global__ void pack_mxfp4_row_to_tile16_kernel(
     const uint8_t* __restrict__ src_data,
     uint8_t* __restrict__ dst_data,
@@ -517,6 +566,36 @@ __global__ void pack_mxfp4_row_to_tile16_kernel(
   dst_data[byte_idx] = (uint8_t)((code0 & 0x0F) | ((code1 & 0x0F) << 4));
 }
 
+// Reorder per-32-element scale codes into the same tile-major layout (16 codes per tile).
+__global__ void pack_mxfp4_scales_row_to_tile16_kernel(
+    const uint8_t* __restrict__ src_scales,
+    uint8_t* __restrict__ dst_scales,
+    size_t rows, size_t cols) {
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t tiles_m = (rows + 15) / 16;
+  size_t tiles_k = (cols + 15) / 16;
+  size_t total_tiles = tiles_m * tiles_k;
+  size_t total_entries = total_tiles * 16; // 16 rows per tile
+  if (idx >= total_entries) return;
+
+  size_t tile_idx = idx / 16;
+  size_t row_in_tile = idx % 16;
+
+  size_t tile_m = tile_idx / tiles_k;
+  size_t tile_k = tile_idx - tile_m * tiles_k;
+
+  size_t row = tile_m * 16 + row_in_tile;
+  size_t col = tile_k * 16;
+
+  size_t blocks_per_row = (cols + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
+  uint8_t code = static_cast<uint8_t>(127); // scale=1 default
+  if (row < rows && col < cols) {
+    size_t block_idx = row * blocks_per_row + (col / MXFP4_BLOCK_SIZE);
+    code = src_scales[block_idx];
+  }
+  dst_scales[idx] = code;
+}
+
 // Grouped MLP2 matvec using MFMA and tile-packed MXFP4 weights.
 // For each selection m: y = W[layer,eid] @ g[m] + b[layer,eid]; then atomicAdd into e_agg[sid] with weight sel_w[m].
 __global__ __launch_bounds__(64)
@@ -524,7 +603,7 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
     float* __restrict__ e_agg,                // [slots, hidden_dim]
     const float* __restrict__ gate_up_all,    // [M, intermediate_dim]
     const uint8_t* __restrict__ w_data,       // tile-packed MXFP4 nibbles (16x16)
-    const uint8_t* __restrict__ w_scales,     // row-major e8m0 per-32 block
+    const uint8_t* __restrict__ w_scales,     // tile-packed (16 rows per tile) e8m0 codes
     const hip_bfloat16* __restrict__ b_mlp2,  // [n_layers*n_experts][hidden_dim]
     const int* __restrict__ sel_sids,         // [M]
     const float* __restrict__ sel_w,          // [M]
@@ -555,13 +634,12 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
   const int Mout = hidden_dim;
   const int Kdim = intermediate_dim;
   const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
-  const size_t row_stride = (size_t)intermediate_dim;
-  const size_t base_scale = mat_index * (size_t)Mout * row_stride; // for scales (row-major indexing)
   const hip_bfloat16* __restrict__ B = b_mlp2 ? (b_mlp2 + mat_index * (size_t)hidden_dim) : nullptr;
 
   __shared__ __align__(16) float sWf[16 * 16];
   __shared__ __align__(16) float sX[16 * 16];
   __shared__ __align__(16) float sBias[16];
+  __shared__ __align__(16) float sScale[16];
 
   if (lane < 16) {
     const int row = base_row + lane;
@@ -577,29 +655,40 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
   const size_t packed_mat_bytes = (size_t)tiles_m * (size_t)tiles_k * (size_t)128;
   const uint8_t* __restrict__ Wpack = w_data + mat_index * packed_mat_bytes;
   const size_t tiles_per_row = (size_t)tiles_k;
+  const size_t scales_per_mat = (size_t)tiles_m * (size_t)tiles_k * (size_t)16;
+  const uint8_t* __restrict__ Wscale = w_scales + mat_index * scales_per_mat;
 
   for (int kk = 0; kk < tiles_k; ++kk) {
     const size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
     const size_t tile_base_byte = tile_linear * (size_t)128;
 
+    if (lane < 16) {
+      int row = base_row + lane;
+      float scale = 0.f;
+      if (row < Mout) {
+        uint8_t scale_code = Wscale[tile_linear * (size_t)16 + lane];
+        scale = decode_e8m0(scale_code);
+      }
+      sScale[lane] = scale;
+    }
+    __syncthreads();
+
     int idx4 = lane * 4;
     if (idx4 < 256) {
+      int im = idx4 >> 4;
+      int ik_base = idx4 & 0xF;
+      int row = base_row + im;
+      int col_base = kk * 16 + ik_base;
+      int byte_off = tile_base_byte + (idx4 >> 1);
+      uint16_t packed16 = *reinterpret_cast<const uint16_t*>(Wpack + byte_off);
       #pragma unroll
       for (int t4 = 0; t4 < 4; ++t4) {
-        int te = idx4 + t4;           // 0..255 within tile
-        int im = te / 16;             // row in tile
-        int ik = te - im * 16;        // col in tile
-        int row = base_row + im;
-        int col = kk * 16 + ik;
+        int ik = ik_base + t4;
+        int col = col_base + t4;
         float wv = 0.f;
         if (row < Mout && col < Kdim) {
-          size_t elem_index = base_scale + (size_t)row * row_stride + (size_t)col;
-          uint8_t scale_code = w_scales[elem_index / MXFP4_BLOCK_SIZE];
-          float scale = decode_e8m0(scale_code);
-          size_t byte_off = tile_base_byte + ((size_t)te >> 1);
-          uint8_t packed = Wpack[byte_off];
-          uint8_t nibble = (te & 1) ? (uint8_t)(packed >> 4) : (uint8_t)(packed & 0xF);
-          wv = decode_mxfp4(nibble) * scale;
+          uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
+          wv = decode_mxfp4(nibble) * sScale[im];
         }
         sWf[im * 16 + ik] = wv;
       }
@@ -1561,12 +1650,20 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   size_t out_dim = (size_t)2 * (size_t)intermediate_dim;
   size_t Mpad = ((out_dim + 15) / 16) * 16;
   size_t Kpad = ((size_t)hidden_dim + 15) / 16 * 16;
+  size_t tiles_m = (out_dim + 15) / 16;
+  size_t tiles_k = ((size_t)hidden_dim + 15) / 16;
   size_t packed_tiles_bytes_per_mat = ((Mpad * Kpad) + 1) / 2; // nibble-packed
+  size_t scales_entries_per_mat = tiles_m * tiles_k * 16;       // 16 rows per tile
+  size_t scale_blocks_per_mat = ((out_dim * (size_t)hidden_dim) + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
   size_t total_mats = (size_t)n_layers * (size_t)ctx->local_experts;
   size_t total_packed_bytes = total_mats * packed_tiles_bytes_per_mat;
+  size_t total_scale_entries = total_mats * scales_entries_per_mat;
   uint8_t *w_mlp1_data_packed = nullptr;
+  uint8_t *w_mlp1_scales_packed = nullptr;
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&w_mlp1_data_packed), total_packed_bytes));
+  HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&w_mlp1_scales_packed), total_scale_entries));
   HIP_CHECK(hipMemsetAsync(w_mlp1_data_packed, 0, total_packed_bytes, ws.quant_stream));
+  HIP_CHECK(hipMemsetAsync(w_mlp1_scales_packed, 0x7F, total_scale_entries, ws.quant_stream));
 
   // Pack each (layer,eid) matrix independently
   {
@@ -1580,10 +1677,20 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
         size_t bytes = (elems + 1) / 2;
         size_t src_offset_bytes = ((size_t)l * (size_t)ctx->local_experts + (size_t)e) * bytes;
         size_t dst_offset_bytes = mat_idx * packed_tiles_bytes_per_mat;
+        size_t src_scale_offset = mat_idx * scale_blocks_per_mat;
+        size_t dst_scale_offset = mat_idx * scales_entries_per_mat;
         dim3 grid((bytes + block.x - 1) / block.x);
         pack_mxfp4_row_to_tile16_kernel<<<grid, block, 0, ws.quant_stream>>>(
           gpu_w->w_mlp1_data + src_offset_bytes,
           w_mlp1_data_packed + dst_offset_bytes,
+          rows, cols);
+        HIP_CHECK(hipGetLastError());
+
+        size_t scale_total_entries = tiles_m * tiles_k * 16;
+        dim3 grid_scale((scale_total_entries + block.x - 1) / block.x);
+        pack_mxfp4_scales_row_to_tile16_kernel<<<grid_scale, block, 0, ws.quant_stream>>>(
+          gpu_w->w_mlp1_scales + src_scale_offset,
+          w_mlp1_scales_packed + dst_scale_offset,
           rows, cols);
         HIP_CHECK(hipGetLastError());
       }
@@ -1593,7 +1700,9 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   // Reuse w_mlp1_data pointer to refer to tile-packed layout to keep memory flat.
   HIP_CHECK(hipFree(gpu_w->w_mlp1_data));
   gpu_w->w_mlp1_data = w_mlp1_data_packed;
-  // Note: scales remain in row-major block order; we index with original linear element indices.
+  HIP_CHECK(hipFree(gpu_w->w_mlp1_scales));
+  gpu_w->w_mlp1_scales = w_mlp1_scales_packed;
+  // Associated scale codes now mirror the tile layout: 16 entries per tile (one per row).
 
   size_t mlp1_bias_elems = (size_t)n_layers * (size_t)ctx->local_experts * 2 * (size_t)intermediate_dim;
   HIP_CHECK(hipMalloc(&gpu_w->b_mlp1, mlp1_bias_elems * sizeof(hip_bfloat16)));
@@ -1633,12 +1742,20 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
     size_t cols = (size_t)intermediate_dim;
     size_t Mpad2 = ((rows + 15) / 16) * 16;
     size_t Kpad2 = ((cols + 15) / 16) * 16;
+    size_t tiles_m2 = (rows + 15) / 16;
+    size_t tiles_k2 = (cols + 15) / 16;
     size_t packed_tiles_bytes_per_mat = ((Mpad2 * Kpad2) + 1) / 2; // nibble-packed
+    size_t scales_entries_per_mat = tiles_m2 * tiles_k2 * 16;
+    size_t scale_blocks_per_mat = ((rows * cols) + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
     size_t total_mats = (size_t)n_layers * (size_t)ctx->local_experts;
     size_t total_packed_bytes = total_mats * packed_tiles_bytes_per_mat;
+    size_t total_scale_entries = total_mats * scales_entries_per_mat;
     uint8_t *w_mlp2_data_packed = nullptr;
+    uint8_t *w_mlp2_scales_packed = nullptr;
     HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&w_mlp2_data_packed), total_packed_bytes));
+    HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&w_mlp2_scales_packed), total_scale_entries));
     HIP_CHECK(hipMemsetAsync(w_mlp2_data_packed, 0, total_packed_bytes, ws.quant_stream));
+    HIP_CHECK(hipMemsetAsync(w_mlp2_scales_packed, 0x7F, total_scale_entries, ws.quant_stream));
 
     dim3 block(256);
     for (int l = 0; l < n_layers; ++l) {
@@ -1648,10 +1765,20 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
         size_t bytes = (elems + 1) / 2;
         size_t src_offset_bytes = ((size_t)l * (size_t)ctx->local_experts + (size_t)e) * bytes;
         size_t dst_offset_bytes = mat_idx * packed_tiles_bytes_per_mat;
+        size_t src_scale_offset = mat_idx * scale_blocks_per_mat;
+        size_t dst_scale_offset = mat_idx * scales_entries_per_mat;
         dim3 grid((unsigned int)((bytes + block.x - 1) / block.x));
         pack_mxfp4_row_to_tile16_kernel<<<grid, block, 0, ws.quant_stream>>>(
           gpu_w->w_mlp2_data + src_offset_bytes,
           w_mlp2_data_packed + dst_offset_bytes,
+          rows, cols);
+        HIP_CHECK(hipGetLastError());
+
+        size_t scale_total_entries = tiles_m2 * tiles_k2 * 16;
+        dim3 grid_scale((unsigned int)((scale_total_entries + block.x - 1) / block.x));
+        pack_mxfp4_scales_row_to_tile16_kernel<<<grid_scale, block, 0, ws.quant_stream>>>(
+          gpu_w->w_mlp2_scales + src_scale_offset,
+          w_mlp2_scales_packed + dst_scale_offset,
           rows, cols);
         HIP_CHECK(hipGetLastError());
       }
@@ -1659,7 +1786,9 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
     HIP_CHECK(hipStreamSynchronize(ws.quant_stream));
     HIP_CHECK(hipFree(gpu_w->w_mlp2_data));
     gpu_w->w_mlp2_data = w_mlp2_data_packed;
-    // Note: scales stay row-major; kernel uses logical indices for scale lookup.
+    HIP_CHECK(hipFree(gpu_w->w_mlp2_scales));
+    gpu_w->w_mlp2_scales = w_mlp2_scales_packed;
+    // Scales are tile-packed alongside MXFP4 data (16 codes per tile/row slice).
   }
 
   size_t mlp2_bias_elems = (size_t)n_layers * (size_t)ctx->local_experts * (size_t)hidden_dim;
