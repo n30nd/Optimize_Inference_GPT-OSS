@@ -484,7 +484,7 @@ typedef struct {
   int   *sel_eids;        // [max_batch * experts_per_token]
   float *sel_w;           // [max_batch * experts_per_token]
   float *mlp1_out_all;    // [max_batch * experts_per_token][2 * intermediate_dim]
-  float *gate_up_all;     // [max_batch * experts_per_token][intermediate_dim]
+  hip_bfloat16 *gate_up_all;     // [max_batch * experts_per_token][intermediate_dim]
   float *tb2_peer;        // cross-GPU accumulation buffers (leader)
   float *e_agg_peer;
   float *router_score_full;
@@ -1008,7 +1008,7 @@ __global__ void pack_mxfp4_scales_row_to_tile16_kernel(
 __global__ __launch_bounds__(64)
 void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
     float* __restrict__ e_agg,                // [slots, hidden_dim]
-    const float* __restrict__ gate_up_all,    // [M, intermediate_dim]
+    const hip_bfloat16* __restrict__ gate_up_all, // [M, intermediate_dim] BF16
     const uint8_t* __restrict__ w_data,       // tile-packed MXFP4 nibbles (16x16)
     const uint8_t* __restrict__ w_scales,     // tile-packed (16 rows per tile) e8m0 codes
     const hip_bfloat16* __restrict__ b_mlp2,  // [n_layers*n_experts][hidden_dim]
@@ -1043,14 +1043,18 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
   const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
   const hip_bfloat16* __restrict__ B = b_mlp2 ? (b_mlp2 + mat_index * (size_t)hidden_dim) : nullptr;
 
-  __shared__ __align__(16) float sWf[16 * 16];
-  __shared__ __align__(16) float sX[16 * 16];
+  __shared__ __align__(16) uint16_t sWbf16[16 * 16];
+  __shared__ __align__(16) uint16_t sXbf16[16 * 16];
   __shared__ __align__(16) float sBias[16];
-  __shared__ __align__(16) float sScale[16];
+  __shared__ __align__(16) const hip_bfloat16* sXPtrs[16];
 
   if (lane < 16) {
     const int row = base_row + lane;
     sBias[lane] = (B && row < Mout) ? bfloat16_to_float(B[row]) : 0.f;
+    const int col = lane;
+    const int msel = col0 + col;
+    const bool active = (col < valid_cols) && (msel < selections_M);
+    sXPtrs[col] = active ? (gate_up_all + (size_t)msel * (size_t)intermediate_dim) : nullptr;
   }
   __syncthreads();
 
@@ -1068,36 +1072,33 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
   for (int kk = 0; kk < tiles_k; ++kk) {
     const size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
     const size_t tile_base_byte = tile_linear * (size_t)128;
-
-    if (lane < 16) {
-      int row = base_row + lane;
-      float scale = 0.f;
-      if (row < Mout) {
-        uint8_t scale_code = Wscale[tile_linear * (size_t)16 + lane];
-        scale = decode_e8m0(scale_code);
-      }
-      sScale[lane] = scale;
-    }
-    __syncthreads();
+    const size_t scale_base = tile_linear * (size_t)16;
 
     int idx4 = lane * 4;
     if (idx4 < 256) {
-      int im = idx4 >> 4;
-      int ik_base = idx4 & 0xF;
-      int row = base_row + im;
-      int col_base = kk * 16 + ik_base;
-      int byte_off = tile_base_byte + (idx4 >> 1);
-      uint16_t packed16 = *reinterpret_cast<const uint16_t*>(Wpack + byte_off);
+      const int im = idx4 >> 4;
+      const int ik_base = idx4 & 0xF;
+      const int row = base_row + im;
+      const int col_base = kk * 16 + ik_base;
+      const int byte_off = tile_base_byte + (idx4 >> 1);
+      const uint16_t packed16 = *reinterpret_cast<const uint16_t*>(Wpack + byte_off);
+      int scale_code_int = 0x7F;
+      const int lane_group = lane & ~3;
+      if ((lane & 3) == 0 && row < Mout) {
+        scale_code_int = static_cast<int>(Wscale[scale_base + im]);
+      }
+      scale_code_int = __shfl(scale_code_int, lane_group, 4);
+      const int scale_exp = scale_code_int - 127;
       #pragma unroll
       for (int t4 = 0; t4 < 4; ++t4) {
-        int ik = ik_base + t4;
-        int col = col_base + t4;
-        float wv = 0.f;
+        const int ik = ik_base + t4;
+        const int col = col_base + t4;
+        uint16_t bits = 0;
         if (row < Mout && col < Kdim) {
-          uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-          wv = decode_mxfp4(nibble) * sScale[im];
+          const uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
+          bits = mxfp4_dequant_to_bf16(nibble, scale_exp);
         }
-        sWf[im * 16 + ik] = wv;
+        sWbf16[im * 16 + ik] = bits;
       }
     }
 
@@ -1105,30 +1106,33 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
       const int r   = lane % 16;        // K row within tile
       const int c4  = (lane / 16) * 4;  // column block index {0,4,8,12}
       const int k_row = kk * 16 + r;
-      float* dst = sX + r * 16 + c4;
+      uint16_t* dst = sXbf16 + r * 16 + c4;
       #pragma unroll
       for (int jj = 0; jj < 4; ++jj) {
-        int col = c4 + jj;
-        float v = 0.f;
-        if (col < valid_cols && k_row < Kdim) {
-          int msel = col0 + col;
-          if (msel < selections_M) {
-            v = gate_up_all[(size_t)msel * (size_t)intermediate_dim + (size_t)k_row];
-          }
+        const int col = c4 + jj;
+        uint16_t bits = 0;
+        const hip_bfloat16* x_ptr = (col < 16) ? sXPtrs[col] : nullptr;
+        if (x_ptr && col < valid_cols && k_row < Kdim) {
+          bits = bfloat16_to_bits(x_ptr[k_row]);
         }
-        dst[jj] = v;
+        dst[jj] = bits;
       }
     }
 
     __syncthreads();
 
+    short4v Areg;
+    short4v Breg;
+    const int kbase = ty * 4;
     #pragma unroll
-    for (int t4 = 0; t4 < 4; ++t4) {
-      const int k4 = ty + 4 * t4; // 0..15
-      float a0 = sWf[tx * 16 + k4];
-      float b0 = sX[k4 * 16 + tx];
-      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0, b0, acc, 0, 0, 0);
+    for (int j = 0; j < 4; ++j) {
+      const int kidx = kbase + j;
+      const uint16_t a_bits = sWbf16[tx * 16 + kidx];
+      const uint16_t b_bits = sXbf16[kidx * 16 + tx];
+      Areg[j] = static_cast<short>(a_bits);
+      Breg[j] = static_cast<short>(b_bits);
     }
+    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
 
     __syncthreads();
   }
@@ -1587,8 +1591,8 @@ __global__ void gather_topk_pairs_kernel(const float *topv, const int *topi,
 }
 
 // Split + SwiGLU batched for all selections
-__global__ void swiglu_grouped_kernel_float(float *gate_up_all, const float *mlp1_out_all,
-                                            int M, int intermediate_dim, float swiglu_limit) {
+__global__ void swiglu_grouped_kernel_bf16(hip_bfloat16 *gate_up_all, const float *mlp1_out_all,
+                                           int M, int intermediate_dim, float swiglu_limit) {
   int i = blockIdx.x * blockDim.x + threadIdx.x; // [0, intermediate_dim)
   int m = blockIdx.y;
   if (m < M && i < intermediate_dim) {
@@ -1602,7 +1606,7 @@ __global__ void swiglu_grouped_kernel_float(float *gate_up_all, const float *mlp
     const float alpha = 1.702f;
     gate *= (1.0f / (1.0f + expf(-alpha * gate)));
     float v = gate * (up + 1.0f);
-    gate_up_all[(size_t)m * (size_t)intermediate_dim + (size_t)i] = v;
+    gate_up_all[(size_t)m * (size_t)intermediate_dim + (size_t)i] = float_to_bfloat16(v);
   }
 }
 
@@ -3062,7 +3066,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         l, ctx->local_experts);
 
       dim3 block2(256), grid2((p->intermediate_dim + block2.x - 1) / block2.x, M_local);
-      swiglu_grouped_kernel_float<<<grid2, block2, 0, ctx->batch_stream>>>(
+      swiglu_grouped_kernel_bf16<<<grid2, block2, 0, ctx->batch_stream>>>(
         ctx->state.gate_up_all, ctx->state.mlp1_out_all,
         M_local, p->intermediate_dim, p->swiglu_limit);
 
@@ -3605,7 +3609,7 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->sel_block_sizes, Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sel_block_eids,  Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(hip_bfloat16)));
 
   s->tb2_peer = nullptr;
   s->e_agg_peer = nullptr;
