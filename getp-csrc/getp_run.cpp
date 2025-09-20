@@ -1046,17 +1046,11 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
   __shared__ __align__(16) uint16_t sWbf16[16 * 16];
   __shared__ __align__(16) uint16_t sXbf16[16 * 16];
   __shared__ __align__(16) float sBias[16];
-  __shared__ __align__(16) const hip_bfloat16* sXPtrs[16];
 
   if (lane < 16) {
     const int row = base_row + lane;
     sBias[lane] = (B && row < Mout) ? bfloat16_to_float(B[row]) : 0.f;
-    const int col = lane;
-    const int msel = col0 + col;
-    const bool active = (col < valid_cols) && (msel < selections_M);
-    sXPtrs[col] = active ? (gate_up_all + (size_t)msel * (size_t)intermediate_dim) : nullptr;
   }
-  __syncthreads();
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   float4v acc = {0.f, 0.f, 0.f, 0.f};
@@ -1111,8 +1105,9 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
       for (int jj = 0; jj < 4; ++jj) {
         const int col = c4 + jj;
         uint16_t bits = 0;
-        const hip_bfloat16* x_ptr = (col < 16) ? sXPtrs[col] : nullptr;
-        if (x_ptr && col < valid_cols && k_row < Kdim) {
+        const int msel = col0 + col;
+        if (col < valid_cols && msel < selections_M && k_row < Kdim) {
+          const hip_bfloat16* x_ptr = gate_up_all + (size_t)msel * (size_t)intermediate_dim;
           bits = bfloat16_to_bits(x_ptr[k_row]);
         }
         dst[jj] = bits;
