@@ -570,7 +570,7 @@ struct Slot {
 using float4v = __attribute__((ext_vector_type(4))) float;
 using short4v = __attribute__((ext_vector_type(4))) short;
 
-__device__ __forceinline__ hip_bfloat16 float_to_bfloat16(float f) {
+__host__ __device__ __forceinline__ hip_bfloat16 float_to_bfloat16(float f) {
   return hip_bfloat16(f);
 }
 __device__ __host__ __forceinline__ float bfloat16_to_float(hip_bfloat16 bf) {
@@ -583,7 +583,7 @@ __device__ __forceinline__ uint16_t bfloat16_to_bits(hip_bfloat16 bf) {
   return u.u;
 }
 
-__device__ __forceinline__ uint16_t float_to_bf16_bits(float f) {
+__host__ __device__ __forceinline__ uint16_t float_to_bf16_bits(float f) {
   union { hip_bfloat16 bf; uint16_t u; } u{};
   u.bf = float_to_bfloat16(f);
   return u.u;
@@ -634,6 +634,8 @@ constexpr uint16_t MXFP4_BASE_BF16[16] = {
   0x8000u, 0xBF00u, 0xBF80u, 0xBFC0u,
   0xC000u, 0xC040u, 0xC080u, 0xC0C0u
 };
+
+__device__ __constant__ uint16_t MXFP4_DEQUANT_LUT_BF16[256][16];
 
 __device__ __constant__ float MXFP4_DECODE_E8M0_LUT[256] = {
   5.87747175e-39f, 1.17549435e-38f, 2.35098870e-38f, 4.70197740e-38f, 9.40395481e-38f, 1.88079096e-37f, 3.76158192e-37f, 7.52316385e-37f,
@@ -711,7 +713,7 @@ __host__ __device__ inline uint8_t encode_mxfp4(float v) {
   }
 }
 
-__device__ __forceinline__ uint16_t mxfp4_dequant_to_bf16(uint8_t nibble, int scale_exp) {
+__host__ __device__ __forceinline__ uint16_t mxfp4_dequant_to_bf16(uint8_t nibble, int scale_exp) {
   uint16_t base = MXFP4_BASE_BF16[nibble & 0x0F];
   if ((base & 0x7F80u) == 0u || scale_exp == 0) {
     return base;
@@ -723,6 +725,33 @@ __device__ __forceinline__ uint16_t mxfp4_dequant_to_bf16(uint8_t nibble, int sc
   }
   float scaled = ldexpf(MXFP4_LEVELS[nibble & 0x0F], scale_exp);
   return float_to_bf16_bits(scaled);
+}
+
+static void ensure_mxfp4_dequant_lut_initialized() {
+  static std::once_flag build_once;
+  static uint16_t host_lut[256][16];
+  std::call_once(build_once, []() {
+    for (int scale_code = 0; scale_code < 256; ++scale_code) {
+      int scale_exp = scale_code - 127;
+      for (int nib = 0; nib < 16; ++nib) {
+        host_lut[scale_code][nib] = mxfp4_dequant_to_bf16(static_cast<uint8_t>(nib), scale_exp);
+      }
+    }
+  });
+
+  static std::mutex lut_mutex;
+  static std::vector<char> initialized;
+  int device_id = 0;
+  HIP_CHECK(hipGetDevice(&device_id));
+  std::lock_guard<std::mutex> guard(lut_mutex);
+  if (device_id >= static_cast<int>(initialized.size())) {
+    initialized.resize(device_id + 1, 0);
+  }
+  if (initialized[device_id]) {
+    return;
+  }
+  HIP_CHECK(hipMemcpyToSymbol(HIP_SYMBOL(MXFP4_DEQUANT_LUT_BF16), host_lut, sizeof(host_lut)));
+  initialized[device_id] = 1;
 }
 
 // ------------------------- Kernels -------------------------
@@ -820,7 +849,8 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
         scale_code_int = static_cast<int>(Wscale[scale_base + im]);
       }
       scale_code_int = __shfl(scale_code_int, lane_group, 4);
-      int scale_exp = scale_code_int - 127;
+      uint8_t scale_code = static_cast<uint8_t>(scale_code_int & 0xFF);
+      const uint16_t* __restrict__ lut_row = MXFP4_DEQUANT_LUT_BF16[scale_code];
       #pragma unroll
       for (int t4 = 0; t4 < 4; ++t4) {
         int ik = ik_base + t4;
@@ -828,7 +858,7 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
         uint16_t bits = 0;
         if (row < out_dim && col < K) {
           uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-          bits = mxfp4_dequant_to_bf16(nibble, scale_exp);
+          bits = lut_row[nibble];
         }
         sWbf16[im * 16 + ik] = bits;
       }
@@ -1082,7 +1112,8 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
         scale_code_int = static_cast<int>(Wscale[scale_base + im]);
       }
       scale_code_int = __shfl(scale_code_int, lane_group, 4);
-      const int scale_exp = scale_code_int - 127;
+      const uint8_t scale_code = static_cast<uint8_t>(scale_code_int & 0xFF);
+      const uint16_t* __restrict__ lut_row = MXFP4_DEQUANT_LUT_BF16[scale_code];
       #pragma unroll
       for (int t4 = 0; t4 < 4; ++t4) {
         const int ik = ik_base + t4;
@@ -1090,7 +1121,7 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
         uint16_t bits = 0;
         if (row < Mout && col < Kdim) {
           const uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-          bits = mxfp4_dequant_to_bf16(nibble, scale_exp);
+          bits = lut_row[nibble];
         }
         sWbf16[im * 16 + ik] = bits;
       }
@@ -3273,6 +3304,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     ctx.local_kv_dim = ctx.local_kv_heads * head_dim;
     ctx.local_qkv_dim = ctx.local_q_dim + 2 * ctx.local_kv_dim;
     ctx.is_leader = (tp_rank == 0);
+
+    ensure_mxfp4_dequant_lut_initialized();
 
     const char *env_mb = getenv("GETP_MAX_BATCH");
     int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 8;
