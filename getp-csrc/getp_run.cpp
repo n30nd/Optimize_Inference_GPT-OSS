@@ -492,7 +492,7 @@ typedef struct {
   float *xpack_f32;       // Packed input buffer for MFMA [K_max x Bpad]
   // Grouped MoE metadata per launch
   int   *sel_block_cols;   // block -> base selection index (size >= selections)
-  int   *sel_block_sizes;  // block -> logical column width (fixed 16)
+  int   *sel_block_sizes;  // block -> number of valid columns in block (<=16)
   int   *sel_block_eids;   // block -> expert id
 } GPURunState;
 
@@ -712,7 +712,7 @@ __global__ void convert_fp32_to_bf16_kernel(const float *fp32_data, hip_bfloat16
 
 // MFMA MLP1 directly from MXFP4-packed weights (no BF16 storage).
 // Dequantizes per element on-the-fly using e8m0 scales and 4-bit levels.
-__global__ __launch_bounds__(64, 2)
+__global__ __launch_bounds__(64)
 void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     float* __restrict__ mlp1_out_all,        // [M selections][out_dim]
     const hip_bfloat16* __restrict__ t_bf16, // [B slots][hidden_dim] BF16
@@ -737,7 +737,9 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   if (block_id >= total_blocks) return;
 
   const int col0 = sel_block_cols[block_id];
+  const int valid_cols = sel_block_sizes[block_id];
   const int eid = sel_block_eids[block_id];
+  if (valid_cols <= 0) return;
 
   const int base_row = tile_m * 16;
 
@@ -748,10 +750,19 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   __shared__ __align__(16) uint16_t sXbf16[16 * 16];
   __shared__ __align__(16) float sBias[16];
   __shared__ __align__(16) float sScale[16];
+  __shared__ __align__(16) const hip_bfloat16* sXPtrs[16];
+  __shared__ __align__(16) float* sOutPtrs[16];
 
   if (lane < 16) {
+    // Cache bias and per-selection base pointers once per block to reuse across all K tiles.
     const int row = base_row + lane;
     sBias[lane] = (B && row < out_dim) ? bfloat16_to_float(B[row]) : 0.f;
+    const int col = lane;
+    const int msel = col0 + col;
+    const bool active = (col < valid_cols) && (msel < selections_M);
+    const hip_bfloat16* x_ptr = active ? (t_bf16 + (size_t)sel_sids[msel] * (size_t)hidden_dim) : nullptr;
+    sXPtrs[col] = x_ptr;
+    sOutPtrs[col] = active ? (mlp1_out_all + (size_t)msel * (size_t)out_dim) : nullptr;
   }
   __syncthreads();
 
@@ -815,11 +826,9 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
       #pragma unroll
       for (int jj = 0; jj < 4; ++jj) {
         int col = c4 + jj;
-        int msel = col0 + col;
         uint16_t bits = 0;
-        int sid = sel_sids[msel];
-        if (sid >= 0 && k_row < K) {
-          const hip_bfloat16* __restrict__ x = t_bf16 + (size_t)sid * (size_t)hidden_dim;
+        const hip_bfloat16* x = sXPtrs[col];
+        if (x && col < valid_cols && k_row < K) {
           hip_bfloat16 val = x[k_row];
           bits = bfloat16_to_bits(val);
         }
@@ -845,10 +854,8 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     __syncthreads();
   }
 
-  const int msel = col0 + tx;
-  const int sid = sel_sids[msel];
-  if (sid >= 0) {
-    float* out_vec = mlp1_out_all + (size_t)msel * (size_t)out_dim;
+  float* out_vec = sOutPtrs[tx];
+  if (out_vec) {
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int rloc = ty * 4 + i;
@@ -1008,7 +1015,9 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
   if (block_id >= total_blocks) return;
 
   const int col0 = sel_block_cols[block_id];
+  const int valid_cols = sel_block_sizes[block_id];
   const int eid = sel_block_eids[block_id];
+  if (valid_cols <= 0) return;
 
   const int base_row = tile_m * 16;
 
@@ -1084,10 +1093,11 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
       for (int jj = 0; jj < 4; ++jj) {
         int col = c4 + jj;
         float v = 0.f;
-        int msel = col0 + col;
-        int sid = sel_sids[msel];
-        if (sid >= 0 && k_row < Kdim) {
-          v = gate_up_all[(size_t)msel * (size_t)intermediate_dim + (size_t)k_row];
+        if (col < valid_cols && k_row < Kdim) {
+          int msel = col0 + col;
+          if (msel < selections_M) {
+            v = gate_up_all[(size_t)msel * (size_t)intermediate_dim + (size_t)k_row];
+          }
         }
         dst[jj] = v;
       }
@@ -1107,8 +1117,8 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
   }
 
   const int msel = col0 + tx;
-  const int sid = sel_sids[msel];
-  if (sid >= 0) {
+  if (tx < valid_cols && msel < selections_M) {
+    const int sid = sel_sids[msel];
     const float ew = sel_w[msel];
     float* out_slot = e_agg + (size_t)sid * (size_t)eagg_stride;
     #pragma unroll
@@ -1561,32 +1571,22 @@ __global__ void gather_topk_pairs_kernel(const float *topv, const int *topi,
 
 // Split + SwiGLU batched for all selections
 __global__ void swiglu_grouped_kernel_float(float *gate_up_all, const float *mlp1_out_all,
-                                            const int* __restrict__ sel_sids,
                                             int M, int intermediate_dim, float swiglu_limit) {
   int i = blockIdx.x * blockDim.x + threadIdx.x; // [0, intermediate_dim)
   int m = blockIdx.y;
-  if (m >= M || i >= intermediate_dim) {
-    return;
+  if (m < M && i < intermediate_dim) {
+    int out_dim = 2 * intermediate_dim;
+    const float *row = mlp1_out_all + (size_t)m * (size_t)out_dim;
+    float gate = row[2 * i + 0];
+    float up   = row[2 * i + 1];
+    if (gate >  swiglu_limit) gate =  swiglu_limit;
+    if (up   >  swiglu_limit) up   =  swiglu_limit;
+    if (up   < -swiglu_limit) up   = -swiglu_limit;
+    const float alpha = 1.702f;
+    gate *= (1.0f / (1.0f + expf(-alpha * gate)));
+    float v = gate * (up + 1.0f);
+    gate_up_all[(size_t)m * (size_t)intermediate_dim + (size_t)i] = v;
   }
-
-  size_t out_idx = (size_t)m * (size_t)intermediate_dim + (size_t)i;
-  int sid = sel_sids[m];
-  if (sid < 0) {
-    gate_up_all[out_idx] = 0.0f;
-    return;
-  }
-
-  int out_dim = 2 * intermediate_dim;
-  const float *row = mlp1_out_all + (size_t)m * (size_t)out_dim;
-  float gate = row[2 * i + 0];
-  float up   = row[2 * i + 1];
-  if (gate >  swiglu_limit) gate =  swiglu_limit;
-  if (up   >  swiglu_limit) up   =  swiglu_limit;
-  if (up   < -swiglu_limit) up   = -swiglu_limit;
-  const float alpha = 1.702f;
-  gate *= (1.0f / (1.0f + expf(-alpha * gate)));
-  float v = gate * (up + 1.0f);
-  gate_up_all[out_idx] = v;
 }
 
 // Block-wide reductions implemented with dynamic shared memory scratch.
@@ -2777,7 +2777,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     HIP_CHECK(hipMemcpy(host_sel_w.data(), leader->state.sel_w, M * sizeof(float), hipMemcpyDeviceToHost));
 
     std::vector<int> local_M(ctxs.size(), 0);
-    std::vector<int> local_M_padded(ctxs.size(), 0);
     std::vector<int> local_block_counts(ctxs.size(), 0);
     for (size_t idx = 0; idx < ctxs.size(); ++idx) {
       GPUContext *ctx = ctxs[idx];
@@ -2832,63 +2831,33 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         grouped_w[dst] = sel_w_local[src];
       }
 
-      constexpr int kBlockCols = 16;
       std::vector<int> block_cols;
       std::vector<int> block_sizes;
       std::vector<int> block_eids;
-      block_cols.reserve((sel_count + kBlockCols - 1) / kBlockCols);
-      block_sizes.reserve((sel_count + kBlockCols - 1) / kBlockCols);
-      block_eids.reserve((sel_count + kBlockCols - 1) / kBlockCols);
-
-      std::vector<int> padded_sids;
-      std::vector<int> padded_eids;
-      std::vector<float> padded_w;
-      padded_sids.reserve(block_cols.capacity() * kBlockCols);
-      padded_eids.reserve(block_cols.capacity() * kBlockCols);
-      padded_w.reserve(block_cols.capacity() * kBlockCols);
+      block_cols.reserve((sel_count + 15) / 16);
+      block_sizes.reserve((sel_count + 15) / 16);
+      block_eids.reserve((sel_count + 15) / 16);
 
       for (int e = 0; e < local_experts; ++e) {
         int start = prefix[e];
         int end = prefix[e + 1];
-        for (int offset = start; offset < end; ) {
-          int chunk = std::min(kBlockCols, end - offset);
-          int block_col = (int)padded_sids.size();
-          block_cols.push_back(block_col);
-          block_sizes.push_back(kBlockCols);
+        int remaining = end - start;
+        int col = start;
+        while (remaining > 0) {
+          int chunk = remaining >= 16 ? 16 : remaining;
+          block_cols.push_back(col);
+          block_sizes.push_back(chunk);
           block_eids.push_back(e);
-
-          for (int i = 0; i < chunk; ++i) {
-            int src = offset + i;
-            padded_sids.push_back(grouped_sids[src]);
-            padded_eids.push_back(grouped_eids[src]);
-            padded_w.push_back(grouped_w[src]);
-          }
-          for (int i = chunk; i < kBlockCols; ++i) {
-            padded_sids.push_back(-1);
-            padded_eids.push_back(e);
-            padded_w.push_back(0.0f);
-          }
-
-          offset += chunk;
+          col += chunk;
+          remaining -= chunk;
         }
       }
 
       local_block_counts[idx] = (int)block_cols.size();
-      local_M_padded[idx] = (int)padded_sids.size();
 
-      size_t max_padded = (size_t)ctx->max_batch * (size_t)p->experts_per_token
-                         + (size_t)ctx->local_experts * (size_t)(kBlockCols - 1);
-      if (padded_sids.size() > max_padded) {
-        fprintf(stderr, "Padded selection count %zu exceeds capacity %zu\n",
-                padded_sids.size(), max_padded);
-        exit(EXIT_FAILURE);
-      }
-
-      if (!padded_sids.empty()) {
-        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_sids, padded_sids.data(), padded_sids.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
-        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_eids, padded_eids.data(), padded_eids.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
-        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_w, padded_w.data(), padded_w.size() * sizeof(float), hipMemcpyHostToDevice, ctx->batch_stream));
-      }
+      HIP_CHECK(hipMemcpyAsync(ctx->state.sel_sids, grouped_sids.data(), sel_count * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+      HIP_CHECK(hipMemcpyAsync(ctx->state.sel_eids, grouped_eids.data(), sel_count * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+      HIP_CHECK(hipMemcpyAsync(ctx->state.sel_w, grouped_w.data(), sel_count * sizeof(float), hipMemcpyHostToDevice, ctx->batch_stream));
       if (!block_cols.empty()) {
         HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_cols, block_cols.data(), block_cols.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
         HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_sizes, block_sizes.data(), block_sizes.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
@@ -2901,9 +2870,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     for (size_t idx = 0; idx < ctxs.size(); ++idx) {
       GPUContext *ctx = ctxs[idx];
       int M_local = local_M[idx];
-      int M_local_padded = local_M_padded[idx];
       int block_count = local_block_counts[idx];
-      if (M_local == 0 || M_local_padded == 0 || block_count == 0) continue;
+      if (M_local == 0 || block_count == 0) continue;
       HIP_CHECK(hipSetDevice(ctx->device_id));
       if (batch > 0) {
         dim3 block_fp2bf16(256);
@@ -2928,15 +2896,14 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         ctx->state.sel_block_cols,
         ctx->state.sel_block_sizes,
         ctx->state.sel_block_eids,
-        M_local_padded, block_count,
+        M_local, block_count,
         hidden_dim, out_dim,
         l, ctx->local_experts);
 
-      dim3 block2(256), grid2((p->intermediate_dim + block2.x - 1) / block2.x, M_local_padded);
+      dim3 block2(256), grid2((p->intermediate_dim + block2.x - 1) / block2.x, M_local);
       swiglu_grouped_kernel_float<<<grid2, block2, 0, ctx->batch_stream>>>(
         ctx->state.gate_up_all, ctx->state.mlp1_out_all,
-        ctx->state.sel_sids,
-        M_local_padded, p->intermediate_dim, p->swiglu_limit);
+        M_local, p->intermediate_dim, p->swiglu_limit);
 
       // Launch MFMA MLP2 accumulation over 16-row tiles in hidden_dim
       dim3 block3(16,4,1);
@@ -2949,7 +2916,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         ctx->state.sel_block_cols,
         ctx->state.sel_block_sizes,
         ctx->state.sel_block_eids,
-        M_local_padded, block_count,
+        M_local, block_count,
         hidden_dim, p->intermediate_dim,
         l, ctx->local_experts, hidden_dim);
       HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
@@ -3415,17 +3382,15 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->gate_up_s,  MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->tb2_s,      MAX_EXPERT_STREAMS * (size_t)hidden_dim * sizeof(float)));
 
-  const size_t Mmax = (size_t)max_batch * (size_t)p->experts_per_token;
-  const size_t sentinel_pad = (size_t)ctx->local_experts * (size_t)(16 - 1);
-  const size_t Mmax_pad = Mmax + sentinel_pad;
-  HIP_CHECK(hipMalloc(&s->sel_sids,     Mmax_pad * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->sel_eids,     Mmax_pad * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->sel_w,        Mmax_pad * sizeof(float)));
+  size_t Mmax = (size_t)max_batch * (size_t)p->experts_per_token;
+  HIP_CHECK(hipMalloc(&s->sel_sids,     Mmax * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sel_eids,     Mmax * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->sel_w,        Mmax * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->sel_block_cols,  Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sel_block_sizes, Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sel_block_eids,  Mmax * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax_pad * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax_pad * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
 
   s->tb2_peer = nullptr;
   s->e_agg_peer = nullptr;
