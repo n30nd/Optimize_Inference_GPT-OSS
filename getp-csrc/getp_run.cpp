@@ -3199,19 +3199,19 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   Config *cfg = &transformer->config;
 
-  int desired_tp = device_count;
+  int desired_tp = (device_count >= 2) ? 2 : 1;
   const char *env_tp = getenv("GETP_TP_SIZE");
   if (env_tp && atoi(env_tp) > 0) desired_tp = atoi(env_tp);
   if (desired_tp < 1) desired_tp = 1;
   if (desired_tp > device_count) desired_tp = device_count;
 
-  int desired_ep = desired_tp;
+  int desired_ep = (device_count >= 2) ? 2 : 1;
   const char *env_ep = getenv("GETP_EP_SIZE");
   if (env_ep && atoi(env_ep) > 0) desired_ep = atoi(env_ep);
   if (desired_ep < 1) desired_ep = 1;
   if (desired_ep > device_count) desired_ep = device_count;
 
-  int desired_dp = device_count / desired_tp;
+  int desired_dp = std::max(1, device_count / 2);
   const char *env_dp = getenv("GETP_DP_SIZE");
   if (env_dp && atoi(env_dp) > 0) desired_dp = atoi(env_dp);
   if (desired_dp < 1) desired_dp = 1;
