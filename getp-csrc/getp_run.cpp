@@ -2200,7 +2200,11 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
         HIP_CHECK(hipGetLastError());
       }
     }
-    HIP_CHECK(hipStreamSynchronize(ws.quant_stream));
+    hipEvent_t mlp1_pack_done;
+    HIP_CHECK(hipEventCreateWithFlags(&mlp1_pack_done, hipEventDisableTiming));
+    HIP_CHECK(hipEventRecord(mlp1_pack_done, ws.quant_stream));
+    HIP_CHECK(hipEventSynchronize(mlp1_pack_done));
+    HIP_CHECK(hipEventDestroy(mlp1_pack_done));
   }
   // Reuse w_mlp1_data pointer to refer to tile-packed layout to keep memory flat.
   HIP_CHECK(hipFree(gpu_w->w_mlp1_data));
@@ -2288,7 +2292,11 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
         HIP_CHECK(hipGetLastError());
       }
     }
-    HIP_CHECK(hipStreamSynchronize(ws.quant_stream));
+    hipEvent_t mlp2_pack_done;
+    HIP_CHECK(hipEventCreateWithFlags(&mlp2_pack_done, hipEventDisableTiming));
+    HIP_CHECK(hipEventRecord(mlp2_pack_done, ws.quant_stream));
+    HIP_CHECK(hipEventSynchronize(mlp2_pack_done));
+    HIP_CHECK(hipEventDestroy(mlp2_pack_done));
     HIP_CHECK(hipFree(gpu_w->w_mlp2_data));
     gpu_w->w_mlp2_data = w_mlp2_data_packed;
     HIP_CHECK(hipFree(gpu_w->w_mlp2_scales));
@@ -2307,9 +2315,21 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   }
   add_log("b_mlp2_shard", mlp2_bias_elems * sizeof(hip_bfloat16));
 
-  HIP_CHECK(hipStreamSynchronize(ws.copy_stream));
-  HIP_CHECK(hipStreamSynchronize(ws.convert_stream));
-  HIP_CHECK(hipStreamSynchronize(ws.quant_stream));
+  hipEvent_t copy_done;
+  hipEvent_t convert_done;
+  hipEvent_t weights_ready;
+  HIP_CHECK(hipEventCreateWithFlags(&copy_done, hipEventDisableTiming));
+  HIP_CHECK(hipEventCreateWithFlags(&convert_done, hipEventDisableTiming));
+  HIP_CHECK(hipEventCreateWithFlags(&weights_ready, hipEventDisableTiming));
+  HIP_CHECK(hipEventRecord(copy_done, ws.copy_stream));
+  HIP_CHECK(hipEventRecord(convert_done, ws.convert_stream));
+  HIP_CHECK(hipStreamWaitEvent(ws.quant_stream, copy_done, 0));
+  HIP_CHECK(hipStreamWaitEvent(ws.quant_stream, convert_done, 0));
+  HIP_CHECK(hipEventRecord(weights_ready, ws.quant_stream));
+  HIP_CHECK(hipEventSynchronize(weights_ready));
+  HIP_CHECK(hipEventDestroy(weights_ready));
+  HIP_CHECK(hipEventDestroy(convert_done));
+  HIP_CHECK(hipEventDestroy(copy_done));
 
   // Create packed BF16 weights for MFMA kernels
   auto pack_weights_for_mfma = [&](const hip_bfloat16 *src, hip_bfloat16 **dst, int layers, int M, int K, const std::string &name) {
@@ -2329,7 +2349,11 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
         layer_src, 0, M, M, K, layer_dst, Mpad, Kpad);
       HIP_CHECK(hipGetLastError());
     }
-    HIP_CHECK(hipStreamSynchronize(ws.convert_stream));
+    hipEvent_t pack_done;
+    HIP_CHECK(hipEventCreateWithFlags(&pack_done, hipEventDisableTiming));
+    HIP_CHECK(hipEventRecord(pack_done, ws.convert_stream));
+    HIP_CHECK(hipEventSynchronize(pack_done));
+    HIP_CHECK(hipEventDestroy(pack_done));
     add_log(name + "_packed16", total_elems * sizeof(hip_bfloat16));
   };
 
@@ -2383,13 +2407,25 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
   GPUContext *leader = ctxs[0];
   (void)gpu_ctx; // leader orchestrates shards; incoming pointer kept for compatibility
 
+  std::vector<hipEvent_t> batch_events(ctxs.size(), nullptr);
+  for (size_t idx = 0; idx < ctxs.size(); ++idx) {
+    HIP_CHECK(hipSetDevice(ctxs[idx]->device_id));
+    HIP_CHECK(hipEventCreateWithFlags(&batch_events[idx], hipEventDisableTiming));
+  }
+  auto record_batch_event = [&](size_t idx) {
+    HIP_CHECK(hipSetDevice(ctxs[idx]->device_id));
+    HIP_CHECK(hipEventRecord(batch_events[idx], ctxs[idx]->batch_stream));
+  };
+  auto wait_batch_event = [&](size_t idx) {
+    HIP_CHECK(hipEventSynchronize(batch_events[idx]));
+  };
+
   // Stage indices to every GPU
   for (GPUContext *ctx : ctxs) {
     HIP_CHECK(hipSetDevice(ctx->device_id));
     HIP_CHECK(hipMemcpyAsync(ctx->d_slot_ids,  h_slot_ids,  batch * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
     HIP_CHECK(hipMemcpyAsync(ctx->d_pos_list,  h_pos_list,  batch * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
     HIP_CHECK(hipMemcpyAsync(ctx->d_token_ids, h_tokens,    batch * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
-    HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
   }
 
   // Embedding gather on each GPU
@@ -2418,7 +2454,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
   for (GPUContext *ctx : ctxs) {
     HIP_CHECK(hipSetDevice(ctx->device_id));
     launch_embed(ctx);
-    HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
   }
 
   // RoPE precompute per slot per GPU
@@ -2472,7 +2507,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
   for (GPUContext *ctx : ctxs) {
     HIP_CHECK(hipSetDevice(ctx->device_id));
     launch_rope(ctx);
-    HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
   }
 
   struct PagedKVWriterV {
@@ -2533,7 +2567,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         batch,
         hidden_dim,
         ctx->d_slot_ids);
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
 
     // QKV projection + bias per shard using MFMA
@@ -2558,8 +2591,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         w_qkv_packed, ctx->state.xpack_f32, ctx->state.qkv, b_qkv,
         ctx->local_qkv_dim, hidden_dim, batch, Bpad, ctx->local_qkv_dim,
         ctx->d_slot_ids, ctx->batch_stream);
-      
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
 
     // Cache write + RoPE per shard
@@ -2594,8 +2625,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         ctx->state.kv_cache_manager->get_device_data(), l,
         batch, q_stride, q_size, k_size,
         ctx->d_pos_list, ctx->d_slot_ids);
-
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
 
     // Flash attention per shard
@@ -2624,11 +2653,11 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         batch,
         ctx->local_qkv_dim,
         ctx->d_slot_ids);
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
 
     // Output projection without bias using MFMA
-    for (GPUContext *ctx : ctxs) {
+    for (size_t idx = 0; idx < ctxs.size(); ++idx) {
+      GPUContext *ctx = ctxs[idx];
       HIP_CHECK(hipSetDevice(ctx->device_id));
       
       // Pack input (tb from attention)
@@ -2647,27 +2676,25 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         w_o_packed, ctx->state.xpack_f32, ctx->state.tb2, nullptr,  // no bias
         hidden_dim, ctx->local_q_dim, batch, Bpad, hidden_dim,
         ctx->d_slot_ids, ctx->batch_stream);
-      
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
+      record_batch_event(idx);
     }
 
     // Sum partial tb2 on leader and broadcast
     if (ctxs.size() > 1) {
+      wait_batch_event(0);
       HIP_CHECK(hipSetDevice(leader->device_id));
-      HIP_CHECK(hipStreamSynchronize(leader->batch_stream));
       size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
-        HIP_CHECK(hipSetDevice(peer->device_id));
-        HIP_CHECK(hipStreamSynchronize(peer->batch_stream));
+        wait_batch_event(idx);
         HIP_CHECK(hipMemcpyPeer(leader->state.tb2_peer, leader->device_id,
                                 peer->state.tb2, peer->device_id, bytes));
         HIP_CHECK(hipSetDevice(leader->device_id));
         dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
         add_selected_kernel_float<<<grid, block, 0, leader->batch_stream>>>(
           leader->state.tb2, leader->state.tb2_peer, hidden_dim, batch, leader->d_slot_ids);
-        HIP_CHECK(hipStreamSynchronize(leader->batch_stream));
       }
+      record_batch_event(0);
     }
 
     // Add bias once on leader and broadcast
@@ -2677,10 +2704,12 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
       add_bias_kernel_float_batched<<<grid, block, 0, leader->batch_stream>>>(
         leader->state.tb2, b_o, hidden_dim, batch, hidden_dim, leader->d_slot_ids);
-      HIP_CHECK(hipStreamSynchronize(leader->batch_stream));
+      record_batch_event(0);
+      wait_batch_event(0);
     }
 
     if (ctxs.size() > 1) {
+      wait_batch_event(0);
       size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
@@ -2695,7 +2724,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
       residual_connection_kernel_float_batched<<<grid, block, 0, ctx->batch_stream>>>(
         ctx->state.x, ctx->state.tb2, hidden_dim, batch, hidden_dim, ctx->d_slot_ids);
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
 
     // MoE RMSNorm per slot
@@ -2715,7 +2743,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         batch,
         hidden_dim,
         ctx->d_slot_ids);
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
 
     // Router computation on leader using MFMA
@@ -2745,7 +2772,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         leader->state.topk_v, leader->state.topk_i,
         p->n_experts, p->experts_per_token,
         leader->d_slot_ids, batch);
-      HIP_CHECK(hipStreamSynchronize(leader->batch_stream));
     }
 
     // Zero MoE accumulation buffers on every shard
@@ -2754,7 +2780,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
       zero_selected_slots_kernel_float<<<grid, block, 0, ctx->batch_stream>>>(
         ctx->state.e_agg, hidden_dim, ctx->d_slot_ids, batch);
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
 
     // Gather global top-k pairs on leader
@@ -2766,7 +2791,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         leader->state.topk_v, leader->state.topk_i,
         leader->d_slot_ids, batch, p->experts_per_token,
         leader->state.sel_w, leader->state.sel_eids, leader->state.sel_sids);
-      HIP_CHECK(hipStreamSynchronize(leader->batch_stream));
+      record_batch_event(0);
+      wait_batch_event(0);
     }
 
     std::vector<int> host_sel_sids(M);
@@ -2798,7 +2824,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       local_M[idx] = sel_count;
       HIP_CHECK(hipSetDevice(ctx->device_id));
       if (sel_count == 0) {
-        HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
         continue;
       }
 
@@ -2863,7 +2888,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_sizes, block_sizes.data(), block_sizes.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
         HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_eids, block_eids.data(), block_eids.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
       }
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
 
     // Grouped MoE compute per shard
@@ -2919,26 +2943,26 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         M_local, block_count,
         hidden_dim, p->intermediate_dim,
         l, ctx->local_experts, hidden_dim);
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
+      record_batch_event(idx);
     }
 
     // Sum e_agg on leader and broadcast
     if (ctxs.size() > 1) {
+      wait_batch_event(0);
       HIP_CHECK(hipSetDevice(leader->device_id));
-      HIP_CHECK(hipStreamSynchronize(leader->batch_stream));
       size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
-        HIP_CHECK(hipSetDevice(peer->device_id));
-        HIP_CHECK(hipStreamSynchronize(peer->batch_stream));
+        wait_batch_event(idx);
         HIP_CHECK(hipMemcpyPeer(leader->state.e_agg_peer, leader->device_id,
                                 peer->state.e_agg, peer->device_id, bytes));
         HIP_CHECK(hipSetDevice(leader->device_id));
         dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
         add_selected_kernel_float<<<grid, block, 0, leader->batch_stream>>>(
           leader->state.e_agg, leader->state.e_agg_peer, hidden_dim, batch, leader->d_slot_ids);
-        HIP_CHECK(hipStreamSynchronize(leader->batch_stream));
       }
+      record_batch_event(0);
+      wait_batch_event(0);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
         HIP_CHECK(hipMemcpyPeer(peer->state.e_agg, peer->device_id,
@@ -2951,7 +2975,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
       residual_connection_kernel_float_batched<<<grid, block, 0, ctx->batch_stream>>>(
         ctx->state.x, ctx->state.e_agg, hidden_dim, batch, hidden_dim, ctx->d_slot_ids);
-      HIP_CHECK(hipStreamSynchronize(ctx->batch_stream));
     }
   }
 
@@ -2989,7 +3012,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
     HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, leader->d_next_tokens,
                              batch * sizeof(int), hipMemcpyDeviceToHost, leader->batch_stream));
-    HIP_CHECK(hipStreamSynchronize(leader->batch_stream));
+    record_batch_event(0);
+    wait_batch_event(0);
   }
 
   // Keep follower activations aligned (optional)
@@ -2999,6 +3023,13 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       GPUContext *peer = ctxs[idx];
       HIP_CHECK(hipMemcpyPeer(peer->state.x, peer->device_id,
                               leader->state.x, leader->device_id, bytes));
+    }
+  }
+
+  for (size_t idx = 0; idx < batch_events.size(); ++idx) {
+    if (batch_events[idx] != nullptr) {
+      HIP_CHECK(hipSetDevice(ctxs[idx]->device_id));
+      HIP_CHECK(hipEventDestroy(batch_events[idx]));
     }
   }
 }
