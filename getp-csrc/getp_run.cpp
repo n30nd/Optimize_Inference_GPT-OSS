@@ -2665,49 +2665,80 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   gpu_w->w_router = nullptr;
   gpu_w->w_mlp1 = nullptr; // we will use packed storage for mlp1
 
+  // Shared staging resources for weight loads (reused across helpers)
+  constexpr size_t STAGING_BYTES_TARGET = (size_t)512 * 1024 * 1024; // 512 MB
+  size_t staging_elems = std::max((size_t)1, STAGING_BYTES_TARGET / sizeof(float));
+  size_t largest_matrix_k = std::max({(size_t)hidden_dim,
+                                      (size_t)intermediate_dim,
+                                      (size_t)head_dim * (size_t)n_attn_heads,
+                                      (size_t)head_dim * (size_t)std::max(1, n_kv_heads),
+                                      (size_t)n_experts});
+  if (staging_elems < largest_matrix_k) staging_elems = largest_matrix_k;
+  const size_t INT_MAX_ELEMS = (size_t)std::numeric_limits<int>::max() - 1024;
+  if (staging_elems > INT_MAX_ELEMS) staging_elems = INT_MAX_ELEMS;
+
+  hipStream_t load_stream;
+  hipError_t stream_status = hipStreamCreateWithFlags(&load_stream, hipStreamNonBlocking);
+  if (stream_status != hipSuccess) {
+    hipGetLastError();
+    HIP_CHECK(hipStreamCreate(&load_stream));
+  }
+
+  float *d_stage_fp32 = nullptr;
+  HIP_CHECK(hipMalloc(&d_stage_fp32, staging_elems * sizeof(float)));
+
+  auto maybe_pin_host = [&](const void *ptr, size_t elem_count, size_t bytes_per_elem) {
+    size_t bytes = elem_count * bytes_per_elem;
+    if (bytes < ((size_t)4 << 20)) return hipErrorInvalidValue; // signal no pin attempt for small buffers
+    return hipHostRegister(const_cast<void*>(ptr), bytes, 0);
+  };
+
+  auto cpu_convert_fp32_to_bf16 = [](const float *src, hip_bfloat16 *dst, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+      dst[i] = hip_bfloat16(src[i]);
+    }
+  };
+
   // Helper: host FP32 -> device staging FP32 (tile) -> device BF16 dest
   auto copy_and_convert = [&](const float *cpu_data, hip_bfloat16 **gpu_data, size_t count) {
     const size_t bf16_size = count * sizeof(hip_bfloat16);
     HIP_CHECK(hipMalloc(gpu_data, bf16_size));
 
-    hipStream_t stream;
-    HIP_CHECK(hipStreamCreate(&stream));
+    // For small buffers, convert on CPU to avoid GPU kernel/stream overheads
+    const size_t CPU_CONVERT_THRESHOLD = 4096; // elements
+    if (count <= CPU_CONVERT_THRESHOLD) {
+      std::vector<hip_bfloat16> tmp(count);
+      cpu_convert_fp32_to_bf16(cpu_data, tmp.data(), count);
+      HIP_CHECK(hipMemcpy(*gpu_data, tmp.data(), bf16_size, hipMemcpyHostToDevice));
+      return;
+    }
 
-    // Try to pin host memory region for faster HtoD copies
-    hipError_t pin_ret = hipHostRegister((void*)cpu_data, count * sizeof(float), 0);
-
-    const size_t STAGING_BYTES = (size_t)512 * 1024 * 1024; // 512 MB
-    size_t staging_elems = std::max((size_t)1, STAGING_BYTES / sizeof(float));
-
-    const size_t INT_MAX_ELEMS = (size_t)std::numeric_limits<int>::max() - 1024;
-    if (staging_elems > INT_MAX_ELEMS) staging_elems = INT_MAX_ELEMS;
-
-    float *d_stage_fp32 = nullptr;
-    HIP_CHECK(hipMalloc(&d_stage_fp32, staging_elems * sizeof(float)));
+    hipError_t pin_ret = maybe_pin_host(cpu_data, count, sizeof(float));
+    if (pin_ret != hipSuccess && pin_ret != hipErrorInvalidValue) {
+      hipGetLastError(); // clear sticky error state if registration failed
+    }
 
     size_t done = 0;
     const dim3 block(256);
     while (done < count) {
       size_t tile = std::min(staging_elems, count - done);
+      if (tile > INT_MAX_ELEMS) tile = INT_MAX_ELEMS;
       size_t tile_bytes_fp32 = tile * sizeof(float);
 
       HIP_CHECK(hipMemcpyAsync(d_stage_fp32, cpu_data + done, tile_bytes_fp32,
-                               hipMemcpyHostToDevice, stream));
+                               hipMemcpyHostToDevice, load_stream));
 
       int n = static_cast<int>(tile);
       dim3 grid((n + block.x - 1) / block.x);
-      convert_fp32_to_bf16_kernel<<<grid, block, 0, stream>>>(d_stage_fp32, *gpu_data + done, n);
+      convert_fp32_to_bf16_kernel<<<grid, block, 0, load_stream>>>(d_stage_fp32, *gpu_data + done, n);
       HIP_CHECK(hipGetLastError());
 
       done += tile;
     }
 
-    HIP_CHECK(hipStreamSynchronize(stream));
-    HIP_CHECK(hipFree(d_stage_fp32));
-    HIP_CHECK(hipStreamDestroy(stream));
-
+    HIP_CHECK(hipStreamSynchronize(load_stream));
     if (pin_ret == hipSuccess) {
-      HIP_CHECK(hipHostUnregister((void*)cpu_data));
+      HIP_CHECK(hipHostUnregister(const_cast<float*>(cpu_data)));
     }
   };
 
@@ -2722,23 +2753,16 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipMalloc(gpu_packed, (size_t)layers * per_layer_elems * sizeof(hip_bfloat16)));
     HIP_CHECK(hipMemset(*gpu_packed, 0, (size_t)layers * per_layer_elems * sizeof(hip_bfloat16)));
 
-    hipStream_t stream;
-    HIP_CHECK(hipStreamCreate(&stream));
-
-    // Pin entire host buffer for faster streaming
     size_t total_f32 = (size_t)layers * (size_t)M * (size_t)K;
-    hipError_t pin_ret = hipHostRegister((void*)cpu_data, total_f32 * sizeof(float), 0);
-
-    const size_t STAGING_BYTES = (size_t)512 * 1024 * 1024; // 512 MB
-    size_t staging_elems = std::max((size_t)1, STAGING_BYTES / sizeof(float));
-    const size_t INT_MAX_ELEMS = (size_t)std::numeric_limits<int>::max() - 1024;
-    if (staging_elems > INT_MAX_ELEMS) staging_elems = INT_MAX_ELEMS;
+    hipError_t pin_ret = maybe_pin_host(cpu_data, total_f32, sizeof(float));
+    if (pin_ret != hipSuccess && pin_ret != hipErrorInvalidValue) {
+      hipGetLastError();
+    }
 
     size_t max_rows = staging_elems / (size_t)K;
-    if (max_rows < 1) max_rows = 1;
-
-    float *d_stage_fp32 = nullptr;
-    HIP_CHECK(hipMalloc(&d_stage_fp32, (size_t)max_rows * (size_t)K * sizeof(float)));
+    if (max_rows == 0) {
+      max_rows = 1;
+    }
 
     const dim3 block(256);
     for (int l = 0; l < layers; ++l) {
@@ -2746,22 +2770,20 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
       hip_bfloat16 *layer_dst = *gpu_packed + (size_t)l * (size_t)per_layer_elems;
       for (int row_off = 0; row_off < M; row_off += (int)max_rows) {
         int rows = std::min((int)max_rows, M - row_off);
-        size_t tile_bytes = (size_t)rows * (size_t)K * sizeof(float);
-        HIP_CHECK(hipMemcpyAsync(d_stage_fp32, layer_src + (size_t)row_off * (size_t)K,
-                                 tile_bytes, hipMemcpyHostToDevice, stream));
         size_t total = (size_t)rows * (size_t)K;
+        size_t tile_bytes = total * sizeof(float);
+        HIP_CHECK(hipMemcpyAsync(d_stage_fp32, layer_src + (size_t)row_off * (size_t)K,
+                                 tile_bytes, hipMemcpyHostToDevice, load_stream));
         dim3 grid((unsigned int)((total + block.x - 1) / block.x));
-        pack_convert_fp32_to_bf16_tiles16_kernel<<<grid, block, 0, stream>>>(
+        pack_convert_fp32_to_bf16_tiles16_kernel<<<grid, block, 0, load_stream>>>(
             d_stage_fp32, row_off, rows, M, K, layer_dst, Mpad, Kpad);
         HIP_CHECK(hipGetLastError());
       }
     }
-    HIP_CHECK(hipStreamSynchronize(stream));
-    HIP_CHECK(hipFree(d_stage_fp32));
-    HIP_CHECK(hipStreamDestroy(stream));
+    HIP_CHECK(hipStreamSynchronize(load_stream));
 
     if (pin_ret == hipSuccess) {
-      HIP_CHECK(hipHostUnregister((void*)cpu_data));
+      HIP_CHECK(hipHostUnregister(const_cast<float*>(cpu_data)));
     }
   };
 
@@ -2823,27 +2845,20 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   int K_mlp1 = hidden_dim;
   // Treat each (layer,expert) as a separate matrix in a flattened array of length n_layers*n_experts
   {
-    // Pin host W_mlp1 for faster streaming
     size_t total_f32 = (size_t)n_layers * (size_t)n_experts * (size_t)M_mlp1 * (size_t)K_mlp1;
-    hipError_t pin_ret_mlp1 = hipHostRegister((void*)cpu_w->w_mlp1, total_f32 * sizeof(float), 0);
+    hipError_t pin_ret_mlp1 = maybe_pin_host(cpu_w->w_mlp1, total_f32, sizeof(float));
+    if (pin_ret_mlp1 != hipSuccess && pin_ret_mlp1 != hipErrorInvalidValue) {
+      hipGetLastError();
+    }
     int layers_flat = n_layers * n_experts;
     int Mpad = round_up16(M_mlp1);
     int Kpad = round_up16(K_mlp1);
     size_t per_mat_elems = (size_t)Mpad * (size_t)Kpad;
     HIP_CHECK(hipMalloc(&gpu_w->w_mlp1_packed16, (size_t)layers_flat * per_mat_elems * sizeof(hip_bfloat16)));
     HIP_CHECK(hipMemset(gpu_w->w_mlp1_packed16, 0, (size_t)layers_flat * per_mat_elems * sizeof(hip_bfloat16)));
-
-    hipStream_t stream;
-    HIP_CHECK(hipStreamCreate(&stream));
-    const size_t STAGING_BYTES = (size_t)512 * 1024 * 1024;
-    size_t staging_elems = std::max((size_t)1, STAGING_BYTES / sizeof(float));
-    const size_t INT_MAX_ELEMS = (size_t)std::numeric_limits<int>::max() - 1024;
-    if (staging_elems > INT_MAX_ELEMS) staging_elems = INT_MAX_ELEMS;
-    size_t max_rows = staging_elems / (size_t)K_mlp1;
-    if (max_rows < 1) max_rows = 1;
-    float *d_stage_fp32 = nullptr;
-    HIP_CHECK(hipMalloc(&d_stage_fp32, (size_t)max_rows * (size_t)K_mlp1 * sizeof(float)));
     const dim3 block(256);
+    size_t max_rows = staging_elems / (size_t)K_mlp1;
+    if (max_rows == 0) max_rows = 1;
     for (int l = 0; l < n_layers; ++l) {
       // Simple progress indicator per layer
       // fprintf(stdout, "[GPU#%d]  MLP1 layer %d/%d\n", dev, l+1, n_layers);
@@ -2854,22 +2869,20 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
         hip_bfloat16 *dst = gpu_w->w_mlp1_packed16 + (size_t)idx * per_mat_elems;
         for (int row_off = 0; row_off < M_mlp1; row_off += (int)max_rows) {
           int rows = std::min((int)max_rows, M_mlp1 - row_off);
-          size_t tile_bytes = (size_t)rows * (size_t)K_mlp1 * sizeof(float);
-          HIP_CHECK(hipMemcpyAsync(d_stage_fp32, src + (size_t)row_off * (size_t)K_mlp1,
-                                   tile_bytes, hipMemcpyHostToDevice, stream));
           size_t total = (size_t)rows * (size_t)K_mlp1;
+          size_t tile_bytes = total * sizeof(float);
+          HIP_CHECK(hipMemcpyAsync(d_stage_fp32, src + (size_t)row_off * (size_t)K_mlp1,
+                                   tile_bytes, hipMemcpyHostToDevice, load_stream));
           dim3 grid((unsigned int)((total + block.x - 1) / block.x));
-          pack_convert_fp32_to_bf16_tiles16_kernel<<<grid, block, 0, stream>>>(
+          pack_convert_fp32_to_bf16_tiles16_kernel<<<grid, block, 0, load_stream>>>(
               d_stage_fp32, row_off, rows, M_mlp1, K_mlp1, dst, Mpad, Kpad);
           HIP_CHECK(hipGetLastError());
         }
       }
     }
-    HIP_CHECK(hipStreamSynchronize(stream));
-    HIP_CHECK(hipFree(d_stage_fp32));
-    HIP_CHECK(hipStreamDestroy(stream));
+    HIP_CHECK(hipStreamSynchronize(load_stream));
     if (pin_ret_mlp1 == hipSuccess) {
-      HIP_CHECK(hipHostUnregister((void*)cpu_w->w_mlp1));
+      HIP_CHECK(hipHostUnregister(const_cast<float*>(cpu_w->w_mlp1)));
     }
   }
 
@@ -2878,14 +2891,18 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
   // size_t mlp2_w_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim * (size_t)intermediate_dim;
   // copy_and_convert(cpu_w->w_mlp2, &gpu_w->w_mlp2, mlp2_w_count);
-    printf("[GPU#%d] Pack MLP2 (layers=%d, experts=%d)...\n", dev, n_layers, n_experts);
+  printf("[GPU#%d] Pack MLP2 (layers=%d, experts=%d)...\n", dev, n_layers, n_experts);
   {
     int M_mlp2 = hidden_dim;          // H
     int K_mlp2 = intermediate_dim;    // I
 
     // giống nhánh pack MLP1 ngay phía trên, chỉ đổi kích thước M/K và nguồn
-    hipError_t pin_ret_mlp2 = hipHostRegister((void*)cpu_w->w_mlp2,
-        (size_t)n_layers * (size_t)n_experts * (size_t)M_mlp2 * (size_t)K_mlp2 * sizeof(float), 0);
+    size_t total_f32 = (size_t)n_layers * (size_t)n_experts * (size_t)M_mlp2 * (size_t)K_mlp2;
+    hipError_t pin_ret_mlp2 = maybe_pin_host(cpu_w->w_mlp2,
+        total_f32, sizeof(float));
+    if (pin_ret_mlp2 != hipSuccess && pin_ret_mlp2 != hipErrorInvalidValue) {
+      hipGetLastError();
+    }
 
     int Mpad = round_up16(M_mlp2);
     int Kpad = round_up16(K_mlp2);
@@ -2895,15 +2912,8 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     HIP_CHECK(hipMemset(gpu_w->w_mlp2_packed16, 0,
         (size_t)n_layers * (size_t)n_experts * per_mat_elems * sizeof(hip_bfloat16)));
 
-    hipStream_t stream; HIP_CHECK(hipStreamCreate(&stream));
-    const size_t STAGING_BYTES = (size_t)512 * 1024 * 1024;
-    size_t staging_elems = std::max((size_t)1, STAGING_BYTES / sizeof(float));
-    const size_t INT_MAX_ELEMS = (size_t)std::numeric_limits<int>::max() - 1024;
-    if (staging_elems > INT_MAX_ELEMS) staging_elems = INT_MAX_ELEMS;
-    size_t max_rows = staging_elems / (size_t)K_mlp2; if (max_rows < 1) max_rows = 1;
-
-    float *d_stage_fp32 = nullptr;
-    HIP_CHECK(hipMalloc(&d_stage_fp32, (size_t)max_rows * (size_t)K_mlp2 * sizeof(float)));
+    size_t max_rows = staging_elems / (size_t)K_mlp2;
+    if (max_rows == 0) max_rows = 1;
     const dim3 block(256);
 
     for (int l = 0; l < n_layers; ++l) {
@@ -2916,22 +2926,22 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
         for (int row_off = 0; row_off < M_mlp2; row_off += (int)max_rows) {
           int rows = std::min((int)max_rows, M_mlp2 - row_off);
-          size_t tile_bytes = (size_t)rows * (size_t)K_mlp2 * sizeof(float);
-          HIP_CHECK(hipMemcpyAsync(d_stage_fp32, src + (size_t)row_off * (size_t)K_mlp2,
-                                   tile_bytes, hipMemcpyHostToDevice, stream));
           size_t total = (size_t)rows * (size_t)K_mlp2;
+          size_t tile_bytes = total * sizeof(float);
+          HIP_CHECK(hipMemcpyAsync(d_stage_fp32, src + (size_t)row_off * (size_t)K_mlp2,
+                                   tile_bytes, hipMemcpyHostToDevice, load_stream));
           dim3 grid((unsigned)((total + block.x - 1) / block.x));
-          pack_convert_fp32_to_bf16_tiles16_kernel<<<grid, block, 0, stream>>>(
+          pack_convert_fp32_to_bf16_tiles16_kernel<<<grid, block, 0, load_stream>>>(
               d_stage_fp32, row_off, rows, M_mlp2, K_mlp2, dst, Mpad, Kpad);
           HIP_CHECK(hipGetLastError());
         }
       }
     }
 
-    HIP_CHECK(hipStreamSynchronize(stream));
-    HIP_CHECK(hipFree(d_stage_fp32));
-    HIP_CHECK(hipStreamDestroy(stream));
-    if (pin_ret_mlp2 == hipSuccess) HIP_CHECK(hipHostUnregister((void*)cpu_w->w_mlp2));
+    HIP_CHECK(hipStreamSynchronize(load_stream));
+    if (pin_ret_mlp2 == hipSuccess) {
+      HIP_CHECK(hipHostUnregister(const_cast<float*>(cpu_w->w_mlp2)));
+    }
 
     // (tùy chọn) bỏ con trỏ w_mlp2 cũ, vì không còn dùng đường dot-product:
     gpu_w->w_mlp2 = nullptr;
@@ -2939,6 +2949,10 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
   size_t mlp2_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim;
   copy_and_convert(cpu_w->b_mlp2, &gpu_w->b_mlp2, mlp2_b_count);
+
+  HIP_CHECK(hipStreamSynchronize(load_stream));
+  HIP_CHECK(hipFree(d_stage_fp32));
+  HIP_CHECK(hipStreamDestroy(load_stream));
 }
 
 void gpu_free_weights(GPUTransformerWeights *gpu_w) {
