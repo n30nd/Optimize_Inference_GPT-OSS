@@ -625,6 +625,12 @@ constexpr float MXFP4_LEVELS[16] = {
 constexpr float MXFP4_THRESHOLDS[7] = {
   0.25f, 0.75f, 1.25f, 1.75f, 2.5f, 3.5f, 5.0f
 };
+constexpr uint16_t MXFP4_BASE_BF16[16] = {
+  0x0000u, 0x3F00u, 0x3F80u, 0x3FC0u,
+  0x4000u, 0x4040u, 0x4080u, 0x40C0u,
+  0x8000u, 0xBF00u, 0xBF80u, 0xBFC0u,
+  0xC000u, 0xC040u, 0xC080u, 0xC0C0u
+};
 
 __device__ __constant__ float MXFP4_DECODE_E8M0_LUT[256] = {
   5.87747175e-39f, 1.17549435e-38f, 2.35098870e-38f, 4.70197740e-38f, 9.40395481e-38f, 1.88079096e-37f, 3.76158192e-37f, 7.52316385e-37f,
@@ -702,6 +708,20 @@ __host__ __device__ inline uint8_t encode_mxfp4(float v) {
   }
 }
 
+__device__ __forceinline__ uint16_t mxfp4_dequant_to_bf16(uint8_t nibble, int scale_exp) {
+  uint16_t base = MXFP4_BASE_BF16[nibble & 0x0F];
+  if ((base & 0x7F80u) == 0u || scale_exp == 0) {
+    return base;
+  }
+  int exp = (base >> 7) & 0xFF;
+  int new_exp = exp + scale_exp;
+  if (new_exp > 0 && new_exp < 0xFF) {
+    return static_cast<uint16_t>((base & 0x807Fu) | (static_cast<uint16_t>(new_exp) << 7));
+  }
+  float scaled = ldexpf(MXFP4_LEVELS[nibble & 0x0F], scale_exp);
+  return float_to_bf16_bits(scaled);
+}
+
 // ------------------------- Kernels -------------------------
 
 // FP32 -> BF16 (device)
@@ -749,7 +769,6 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   __shared__ __align__(16) uint16_t sWbf16[16 * 16];
   __shared__ __align__(16) uint16_t sXbf16[16 * 16];
   __shared__ __align__(16) float sBias[16];
-  __shared__ __align__(16) float sScale[16];
   __shared__ __align__(16) const hip_bfloat16* sXPtrs[16];
   __shared__ __align__(16) float* sOutPtrs[16];
 
@@ -783,17 +802,6 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     const size_t tile_base_byte = tile_linear * (size_t)128;
     const size_t scale_base = tile_linear * (size_t)16;
 
-    if (lane < 16) {
-      int row = base_row + lane;
-      float scale = 0.f;
-      if (row < out_dim) {
-        uint8_t scale_code = Wscale[scale_base + lane];
-        scale = decode_e8m0(scale_code);
-      }
-      sScale[lane] = scale;
-    }
-    __syncthreads();
-
     // Fill W tile [16x16] by dequantizing from MXFP4
     int idx4 = lane * 4;
     if (idx4 < 256) {
@@ -803,6 +811,13 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
       int col_base = kk * 16 + ik_base;
       int byte_off = tile_base_byte + (idx4 >> 1);
       uint16_t packed16 = *reinterpret_cast<const uint16_t*>(Wpack + byte_off);
+      int lane_group = lane & ~3;
+      int scale_code_int = 0x7F;
+      if ((lane & 3) == 0 && row < out_dim) {
+        scale_code_int = static_cast<int>(Wscale[scale_base + im]);
+      }
+      scale_code_int = __shfl(scale_code_int, lane_group, 4);
+      int scale_exp = scale_code_int - 127;
       #pragma unroll
       for (int t4 = 0; t4 < 4; ++t4) {
         int ik = ik_base + t4;
@@ -810,8 +825,7 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
         uint16_t bits = 0;
         if (row < out_dim && col < K) {
           uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-          float wv = decode_mxfp4(nibble) * sScale[im];
-          bits = float_to_bf16_bits(wv);
+          bits = mxfp4_dequant_to_bf16(nibble, scale_exp);
         }
         sWbf16[im * 16 + ik] = bits;
       }
