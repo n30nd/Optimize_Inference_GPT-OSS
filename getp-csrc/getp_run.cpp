@@ -489,7 +489,7 @@ typedef struct {
   float *e_agg_peer;
   float *router_score_full;
   // MFMA packed buffers
-  float *xpack_f32;       // Packed input buffer for MFMA [K_max x Bpad]
+  hip_bfloat16 *xpack_bf16; // Packed input buffer for MFMA [K_max x Bpad]
   // Grouped MoE metadata per launch
   int   *sel_block_cols;   // block -> base selection index (size >= selections)
   int   *sel_block_sizes;  // block -> number of valid columns in block (<=16)
@@ -1250,8 +1250,8 @@ __global__ void pack_bf16_rowmajor_to_bf16_tiles16_kernel(
   dst_packed[dst_index] = src_bf16[(size_t)r * (size_t)K + (size_t)c];
 }
 
-// Gather và pack input X từ multiple slots thành format cho MFMA
-__global__ void gather_pack_x_fp32_to_fp32_mfma_kernel(const float *x, float *xpack,
+// Gather và pack input X từ multiple slots thành format BF16 cho MFMA
+__global__ void gather_pack_x_fp32_to_bf16_mfma_kernel(const float *x, hip_bfloat16 *xpack,
                                                        int K, int B, int Bpad,
                                                        int in_stride, const int *slot_ids) {
   int row = blockIdx.x * blockDim.x + threadIdx.x; // row in [0, K)
@@ -1259,7 +1259,7 @@ __global__ void gather_pack_x_fp32_to_fp32_mfma_kernel(const float *x, float *xp
   if (row < K && b < B) {
     int sid = slot_ids[b];
     const float *x_slot = x + (size_t)sid * (size_t)in_stride;
-    xpack[(size_t)row * (size_t)Bpad + (size_t)b] = x_slot[row];
+    xpack[(size_t)row * (size_t)Bpad + (size_t)b] = float_to_bfloat16(x_slot[row]);
   }
 }
 
@@ -1281,16 +1281,15 @@ __global__ void gather_fp32_to_bf16_slots_kernel(const float *x, hip_bfloat16 *d
 __global__ __launch_bounds__(64)
 void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
     const hip_bfloat16* __restrict__ W_packed,    // [Mpad x Kpad] tile16 BF16
-    const float* __restrict__ Xpack,              // [K x Bpad] FP32 (cột = batch)
+    const hip_bfloat16* __restrict__ Xpack,       // [K x Bpad] BF16 (cột = batch)
     float* __restrict__ dst,                      // scatter theo slot_ids
     const hip_bfloat16* __restrict__ bias,        // [M] hoặc nullptr
     int M, int K, int B, int Bpad,
-    int out_stride,                               // = M
+    int out_stride,
     const int* __restrict__ slot_ids,
     int Mpad, int Kpad)
 {
-  // mapping 64 lanes: tx=col (0..15), ty=row groups (0..3); mỗi lane có 4 accumulator (4 hàng)
-  const int tx = threadIdx.x;     // cột trong tile (0..15) = cột batch tương ứng
+  const int tx = threadIdx.x;     // cột trong tile (0..15) = cột batch
   const int ty = threadIdx.y;     // nhóm hàng (0..3)
   const int lane = ty * 16 + tx;  // 0..63
 
@@ -1299,44 +1298,20 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
   const int b_base  = b_group * 16;
   if (b_base >= B) return;
 
-  // Số cột thực sự trong nhóm (nhóm cuối có thể < 16)
-  const int cols_this = min(16, B - b_base);
+  const int cols_this = min(16, B - b_base);  // số cột hợp lệ trong nhóm này
+  const int base_row = tile_m * 16;           // hàng cơ sở của tile M
 
-  // Hàng cơ sở của tile M
-  const int base_row = tile_m * 16;
-
-  // Shared ping-pong
-  __shared__ __align__(16) float sW[2][16 * 16];
-  __shared__ __align__(16) float sX[2][16 * 16];
+  __shared__ __align__(16) uint16_t sW[2][16 * 16];
+  __shared__ __align__(16) uint16_t sX[2][16 * 16];
   __shared__ int s_slot[16];
-  __shared__ float s_bias[16];
+  __shared__ float s_bias_rows[16];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
-
-  // Helper: nạp 4 BF16 -> 4 FP32 (giống hàm bạn đang có, để inline tại đây cho tốc độ)
-  auto bf16x4_to_f4 = [&](const hip_bfloat16* src) {
-    // đọc 2x uint32 (mỗi uint32 chứa 2 BF16)
-    const uint32_t *p32 = reinterpret_cast<const uint32_t*>(src);
-    uint32_t p0 = p32[0];
-    uint32_t p1 = p32[1];
-    float4v v;
-    // chuyển từng nửa-word sang float
-    auto bits2f = [] __device__ (uint16_t bits) {
-      union { uint32_t u; float f; } cvt;
-      cvt.u = uint32_t(bits) << 16;
-      return cvt.f;
-    };
-    v[0] = bits2f((uint16_t)(p0 & 0xFFFFu));
-    v[1] = bits2f((uint16_t)(p0 >> 16));
-    v[2] = bits2f((uint16_t)(p1 & 0xFFFFu));
-    v[3] = bits2f((uint16_t)(p1 >> 16));
-    return v;
-  };
+  using short4v = __attribute__((ext_vector_type(4))) short;
 
   const bool has_bias = (bias != nullptr);
   const bool full_tile = (cols_this == 16);
 
-  // Chuẩn bị slot_id và bias tile cho block
   if (ty == 0) {
     const int col = tx;
     const int global_col = b_base + col;
@@ -1351,120 +1326,148 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
     if (has_bias && row < M) {
       bias_val = bfloat16_to_float(bias[row]);
     }
-    s_bias[col] = bias_val;
+    s_bias_rows[col] = bias_val;
   }
   __syncthreads();
 
   float4v acc = {0.f, 0.f, 0.f, 0.f};
 
-  const int Ktiles        = (Kpad + 15) / 16;
-  const size_t tiles_per_row = (size_t)Kpad / 16;       // do Kpad bội 16
-  const size_t tile_elems    = 256;                     // 16*16 BF16/FP32
+  const int Ktiles = (Kpad + 15) / 16;
+  const size_t tiles_per_row = (size_t)((Kpad + 15) / 16);
+  const size_t tile_elems = 256;
   const hip_bfloat16* w_tile_row_base =
       W_packed + ((size_t)tile_m * tiles_per_row) * tile_elems;
 
-  const size_t x_stride = static_cast<size_t>(Bpad);
-  const size_t b_base_sz = static_cast<size_t>(b_base);
+  const size_t x_stride = (size_t)Bpad;
+  const size_t b_base_sz = (size_t)b_base;
 
-  // Preload Ô-0 (ping=0)
   {
-    const int row_in_tile = lane & 15;      // 0..15
-    const int col_group   = lane >> 4;      // 0..3 (4 nhóm cột cho vector write)
+    const int idx4 = lane * 4;
+    if (idx4 < 256) {
+      const hip_bfloat16* w_src = w_tile_row_base + idx4;
+      const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
+      uint32_t v0 = w_u32[0];
+      uint32_t v1 = w_u32[1];
+      uint16_t* dst_tile = &sW[0][0] + idx4;
+      dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
+      dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
+      dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
+      dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
+    }
 
-    // nạp W[16x16] tile k=0
-    const hip_bfloat16* w_src0 = w_tile_row_base + 0 * tile_elems;
-    reinterpret_cast<float4v*>(&sW[0][0])[lane] = bf16x4_to_f4(w_src0 + lane * 4);
-
-    // nạp X[16x16]: lấy 16 hàng liên tiếp (k_row) × 16 cột batch (b_base..b_base+15)
-    const int k_row0 = 0 * 16 + row_in_tile;
-    float4v xv = {0.f, 0.f, 0.f, 0.f};
-    if (k_row0 < K) {
-      const int col_base = col_group * 4;
-      const size_t row_offset = static_cast<size_t>(k_row0) * x_stride + b_base_sz + static_cast<size_t>(col_base);
+    const int row_in_tile = lane & 15;
+    const int col_group   = lane >> 4;
+    const int col_base    = col_group * 4;
+    uint16_t vals[4] = {0, 0, 0, 0};
+    const int k_row = row_in_tile;
+    if (k_row < K) {
+      const size_t row_offset = (size_t)k_row * x_stride + b_base_sz + (size_t)col_base;
+      const hip_bfloat16* x_src = Xpack + row_offset;
       if (full_tile) {
-        // Fast path: vector load when all 16 batch columns are valid
-        xv = reinterpret_cast<const float4v*>(Xpack + row_offset)[0];
+        const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+        uint32_t xv0 = x_u32[0];
+        uint32_t xv1 = x_u32[1];
+        vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+        vals[1] = static_cast<uint16_t>(xv0 >> 16);
+        vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+        vals[3] = static_cast<uint16_t>(xv1 >> 16);
       } else {
-        // Tail group: guard each column individually
-        if (col_base + 0 < cols_this) xv[0] = Xpack[row_offset + 0];
-        if (col_base + 1 < cols_this) xv[1] = Xpack[row_offset + 1];
-        if (col_base + 2 < cols_this) xv[2] = Xpack[row_offset + 2];
-        if (col_base + 3 < cols_this) xv[3] = Xpack[row_offset + 3];
+        const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+        if (col_base + 0 < cols_this) vals[0] = x_u16[0];
+        if (col_base + 1 < cols_this) vals[1] = x_u16[1];
+        if (col_base + 2 < cols_this) vals[2] = x_u16[2];
+        if (col_base + 3 < cols_this) vals[3] = x_u16[3];
       }
     }
-    reinterpret_cast<float4v*>(&sX[0][row_in_tile * 16])[col_group] = xv;
+    uint16_t* dst_tile = &sX[0][row_in_tile * 16 + col_base];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      dst_tile[i] = vals[i];
+    }
   }
   __syncthreads();
 
   int ping = 0;
 
-  // Vòng lặp trên K-tiles với prefetch ô tiếp theo vào pong
-  for (int kt = 0; kt < Ktiles; ++kt)
-  {
+  for (int kt = 0; kt < Ktiles; ++kt) {
     const int pong = ping ^ 1;
 
-    // Prefetch ô kế tiếp nếu có
     if (kt + 1 < Ktiles) {
+      const int idx4 = lane * 4;
+      if (idx4 < 256) {
+        const hip_bfloat16* w_src = w_tile_row_base + (size_t)(kt + 1) * tile_elems + idx4;
+        const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
+        uint32_t v0 = w_u32[0];
+        uint32_t v1 = w_u32[1];
+        uint16_t* dst_tile = &sW[pong][0] + idx4;
+        dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
+        dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
+        dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
+        dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
+      }
+
       const int row_in_tile = lane & 15;
       const int col_group   = lane >> 4;
-
-      // nạp W tile (kt+1) vào ping-pong
-      const hip_bfloat16* w_src_next = w_tile_row_base + (size_t)(kt + 1) * tile_elems;
-      reinterpret_cast<float4v*>(&sW[pong][0])[lane] = bf16x4_to_f4(w_src_next + lane * 4);
-
-      // nạp X tile (kt+1)
+      const int col_base    = col_group * 4;
+      uint16_t vals[4] = {0, 0, 0, 0};
       const int k_row = (kt + 1) * 16 + row_in_tile;
-      float4v xv = {0.f, 0.f, 0.f, 0.f};
       if (k_row < K) {
-        const int col_base = col_group * 4;
-        const size_t row_offset = static_cast<size_t>(k_row) * x_stride + b_base_sz + static_cast<size_t>(col_base);
+        const size_t row_offset = (size_t)k_row * x_stride + b_base_sz + (size_t)col_base;
+        const hip_bfloat16* x_src = Xpack + row_offset;
         if (full_tile) {
-          // Fast path: vector load when all 16 batch columns are valid
-          xv = reinterpret_cast<const float4v*>(Xpack + row_offset)[0];
+          const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+          uint32_t xv0 = x_u32[0];
+          uint32_t xv1 = x_u32[1];
+          vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+          vals[1] = static_cast<uint16_t>(xv0 >> 16);
+          vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+          vals[3] = static_cast<uint16_t>(xv1 >> 16);
         } else {
-          // Tail group: guard each column individually
-          if (col_base + 0 < cols_this) xv[0] = Xpack[row_offset + 0];
-          if (col_base + 1 < cols_this) xv[1] = Xpack[row_offset + 1];
-          if (col_base + 2 < cols_this) xv[2] = Xpack[row_offset + 2];
-          if (col_base + 3 < cols_this) xv[3] = Xpack[row_offset + 3];
+          const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+          if (col_base + 0 < cols_this) vals[0] = x_u16[0];
+          if (col_base + 1 < cols_this) vals[1] = x_u16[1];
+          if (col_base + 2 < cols_this) vals[2] = x_u16[2];
+          if (col_base + 3 < cols_this) vals[3] = x_u16[3];
         }
       }
-      reinterpret_cast<float4v*>(&sX[pong][row_in_tile * 16])[col_group] = xv;
+      uint16_t* dst_tile = &sX[pong][row_in_tile * 16 + col_base];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        dst_tile[i] = vals[i];
+      }
     }
 
-    // Tính trên ô hiện tại (ping)
     __syncthreads();
-    // mỗi lane đọc theo “k4” = ty + 4*t
+
+    short4v Areg;
+    short4v Breg;
+    const int kbase = ty * 4;
     #pragma unroll
-    for (int t4 = 0; t4 < 4; ++t4) {
-      const int k4 = ty + 4 * t4;         // 0..15
-      const float a_val = sW[ping][tx * 16 + k4]; // A(row=tx, col=k4)
-      const float b_val = sX[ping][k4 * 16 + tx]; // B(row=k4,  col=tx)
-      acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a_val, b_val, acc, 0, 0, 0);
+    for (int j = 0; j < 4; ++j) {
+      const int kidx = kbase + j;
+      Areg[j] = static_cast<short>(sW[ping][tx * 16 + kidx]);
+      Breg[j] = static_cast<short>(sX[ping][kidx * 16 + tx]);
     }
+    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
 
     ping = pong;
   }
   __syncthreads();
 
-  // Ghi ra 16 cột batch (không còn tx==0 nữa!)
-  // Với MFMA 16x16x4f32: mỗi lane giữ 4 phần tử theo trục hàng của cột tx.
-  // Các hàng lane này: r = base_row + (ty*4 + i), i=0..3
   const int r0 = base_row + ty * 4 + 0;
   const int r1 = base_row + ty * 4 + 1;
   const int r2 = base_row + ty * 4 + 2;
   const int r3 = base_row + ty * 4 + 3;
 
-  // Nếu cột batch này hợp lệ thì scatter vào slot tương ứng
   if (tx < cols_this) {
     const int sid = s_slot[tx];
     if (sid >= 0) {
       float* __restrict__ out = dst + (size_t)sid * (size_t)out_stride;
       const int bias_base = ty * 4;
-      if (r0 < M) out[r0] = acc[0] + s_bias[bias_base + 0];
-      if (r1 < M) out[r1] = acc[1] + s_bias[bias_base + 1];
-      if (r2 < M) out[r2] = acc[2] + s_bias[bias_base + 2];
-      if (r3 < M) out[r3] = acc[3] + s_bias[bias_base + 3];
+      if (r0 < M) out[r0] = acc[0] + s_bias_rows[bias_base + 0];
+      if (r1 < M) out[r1] = acc[1] + s_bias_rows[bias_base + 1];
+      if (r2 < M) out[r2] = acc[2] + s_bias_rows[bias_base + 2];
+      if (r3 < M) out[r3] = acc[3] + s_bias_rows[bias_base + 3];
     }
   }
 }
@@ -1473,7 +1476,7 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
 // Wrapper function cho MFMA-based batched matmul
 void launch_gemm16x16_mfma_f32_batched(
     const hip_bfloat16* W_packed,
-    const float* X_packed,
+    const hip_bfloat16* X_packed,
     float* output,
     const hip_bfloat16* bias,
     int M, int K, int batch, int Bpad,
@@ -1486,7 +1489,7 @@ void launch_gemm16x16_mfma_f32_batched(
 
   // Dùng kernel tối ưu: 1 block xử lý 16 cột batch
   const int group_y = (batch + 15) / 16;
-  dim3 block(16, 4, 1);                   // 64 threads / MFMA 16x16x4f32
+  dim3 block(16, 4, 1);                   // 64 threads / MFMA 16x16x16bf16
   dim3 grid((Mpad + 15) / 16, group_y, 1);
 
   gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel<<<grid, block, 0, stream>>>(
@@ -2745,8 +2748,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int Bpad = ((batch + 15) / 16) * 16;
       dim3 block_pack(256);
       dim3 grid_pack((hidden_dim + block_pack.x - 1) / block_pack.x, batch);
-      gather_pack_x_fp32_to_fp32_mfma_kernel<<<grid_pack, block_pack, 0, ctx->batch_stream>>>(
-        ctx->state.t, ctx->state.xpack_f32, hidden_dim, batch, Bpad, hidden_dim, ctx->d_slot_ids);
+      gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack, block_pack, 0, ctx->batch_stream>>>(
+        ctx->state.t, ctx->state.xpack_bf16, hidden_dim, batch, Bpad, hidden_dim, ctx->d_slot_ids);
       
       // MFMA QKV 
       const int Mpad_qkv = ((ctx->local_qkv_dim + 15) / 16) * 16;
@@ -2755,7 +2758,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
                                          (size_t)l * (size_t)Mpad_qkv * (size_t)Kpad_qkv;
       const hip_bfloat16 *b_qkv = ctx->weights.b_qkv + (size_t)l * (size_t)ctx->local_qkv_dim;
       launch_gemm16x16_mfma_f32_batched(
-        w_qkv_packed, ctx->state.xpack_f32, ctx->state.qkv, b_qkv,
+        w_qkv_packed, ctx->state.xpack_bf16, ctx->state.qkv, b_qkv,
         ctx->local_qkv_dim, hidden_dim, batch, Bpad, ctx->local_qkv_dim,
         ctx->d_slot_ids, ctx->batch_stream);
     }
@@ -2831,8 +2834,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int Bpad = ((batch + 15) / 16) * 16;
       dim3 block_pack(256);
       dim3 grid_pack((ctx->local_q_dim + block_pack.x - 1) / block_pack.x, batch);
-      gather_pack_x_fp32_to_fp32_mfma_kernel<<<grid_pack, block_pack, 0, ctx->batch_stream>>>(
-        ctx->state.tb, ctx->state.xpack_f32, ctx->local_q_dim, batch, Bpad, ctx->local_q_dim, ctx->d_slot_ids);
+      gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack, block_pack, 0, ctx->batch_stream>>>(
+        ctx->state.tb, ctx->state.xpack_bf16, ctx->local_q_dim, batch, Bpad, ctx->local_q_dim, ctx->d_slot_ids);
       
       // MFMA W_o
       const int Mpad_o = ((hidden_dim + 15) / 16) * 16;
@@ -2840,7 +2843,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       const hip_bfloat16 *w_o_packed = ctx->weights.w_o_packed16 +
                                        (size_t)l * (size_t)Mpad_o * (size_t)Kpad_o;
       launch_gemm16x16_mfma_f32_batched(
-        w_o_packed, ctx->state.xpack_f32, ctx->state.tb2, nullptr,  // no bias
+        w_o_packed, ctx->state.xpack_bf16, ctx->state.tb2, nullptr,  // no bias
         hidden_dim, ctx->local_q_dim, batch, Bpad, hidden_dim,
         ctx->d_slot_ids, ctx->batch_stream);
       record_batch_event(idx);
@@ -2919,8 +2922,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int Bpad = ((batch + 15) / 16) * 16;
       dim3 block_pack(256);
       dim3 grid_pack((hidden_dim + block_pack.x - 1) / block_pack.x, batch);
-      gather_pack_x_fp32_to_fp32_mfma_kernel<<<grid_pack, block_pack, 0, leader->batch_stream>>>(
-        leader->state.t, leader->state.xpack_f32, hidden_dim, batch, Bpad, hidden_dim, leader->d_slot_ids);
+      gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack, block_pack, 0, leader->batch_stream>>>(
+        leader->state.t, leader->state.xpack_bf16, hidden_dim, batch, Bpad, hidden_dim, leader->d_slot_ids);
       
       // MFMA router
       const int Mpad_router = ((p->n_experts + 15) / 16) * 16;
@@ -2929,7 +2932,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
                                             (size_t)l * (size_t)Mpad_router * (size_t)Kpad_router;
       const hip_bfloat16 *b_router = leader->weights.b_router + (size_t)l * (size_t)p->n_experts;
       launch_gemm16x16_mfma_f32_batched(
-        w_router_packed, leader->state.xpack_f32, leader->state.router_score, b_router,
+        w_router_packed, leader->state.xpack_bf16, leader->state.router_score, b_router,
         p->n_experts, hidden_dim, batch, Bpad, p->n_experts,
         leader->d_slot_ids, leader->batch_stream);
       
@@ -3159,13 +3162,13 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     int Bpad_logits = ((batch + 15) / 16) * 16;
     dim3 block_pack_logits(256);
     dim3 grid_pack_logits((hidden_dim + block_pack_logits.x - 1) / block_pack_logits.x, batch);
-    gather_pack_x_fp32_to_fp32_mfma_kernel<<<grid_pack_logits, block_pack_logits, 0, leader->batch_stream>>>(
-      leader->state.x, leader->state.xpack_f32,
+    gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack_logits, block_pack_logits, 0, leader->batch_stream>>>(
+      leader->state.x, leader->state.xpack_bf16,
       hidden_dim, batch, Bpad_logits, hidden_dim, leader->d_slot_ids);
 
     const hip_bfloat16 *w_out_packed = leader->weights.out_packed16;
     launch_gemm16x16_mfma_f32_batched(
-      w_out_packed, leader->state.xpack_f32, leader->state.logits_fp32, nullptr,
+      w_out_packed, leader->state.xpack_bf16, leader->state.logits_fp32, nullptr,
       vocab, hidden_dim, batch, Bpad_logits, vocab,
       leader->d_batch_iota, leader->batch_stream);
 
@@ -3652,7 +3655,7 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   // MFMA packed buffers
   int Bpad = ((int)B + 15) / 16 * 16; // align to 16
   int K_max = std::max({hidden_dim, p->n_experts, local_qkv_dim});
-  HIP_CHECK(hipMalloc(&s->xpack_f32, (size_t)K_max * (size_t)Bpad * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->xpack_bf16, (size_t)K_max * (size_t)Bpad * sizeof(hip_bfloat16)));
 }
 
 void gpu_free_run_state(GPUContext *ctx) {
@@ -3692,7 +3695,7 @@ void gpu_free_run_state(GPUContext *ctx) {
   HIP_CHECK(hipFree(s->gate_up_all));
   if (s->tb2_peer) HIP_CHECK(hipFree(s->tb2_peer));
   if (s->e_agg_peer) HIP_CHECK(hipFree(s->e_agg_peer));
-  HIP_CHECK(hipFree(s->xpack_f32));
+  HIP_CHECK(hipFree(s->xpack_bf16));
   if (s->kv_cache_manager) {
     delete s->kv_cache_manager;
     s->kv_cache_manager = nullptr;
