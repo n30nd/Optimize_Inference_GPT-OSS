@@ -526,6 +526,7 @@ typedef struct {
   GPURunState state;
   int max_batch; // number of concurrent slots per GPU for continuous batching
   hipStream_t batch_stream;              // shared stream for batched ops
+  hipEvent_t batch_event;
   // Staging device buffers for batched indices and positions
   int *d_slot_ids;
   int *d_pos_list;
@@ -2561,17 +2562,17 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     }
   }
 
-  std::vector<hipEvent_t> batch_events(ctxs.size(), nullptr);
-  for (size_t idx = 0; idx < ctxs.size(); ++idx) {
-    HIP_CHECK(hipSetDevice(ctxs[idx]->device_id));
-    HIP_CHECK(hipEventCreateWithFlags(&batch_events[idx], hipEventDisableTiming));
-  }
-  auto record_batch_event = [&](size_t idx) {
-    HIP_CHECK(hipSetDevice(ctxs[idx]->device_id));
-    HIP_CHECK(hipEventRecord(batch_events[idx], ctxs[idx]->batch_stream));
+  auto record_batch_event = [&](GPUContext *ctx) {
+    HIP_CHECK(hipSetDevice(ctx->device_id));
+    HIP_CHECK(hipEventRecord(ctx->batch_event, ctx->batch_stream));
   };
-  auto wait_batch_event = [&](size_t idx) {
-    HIP_CHECK(hipEventSynchronize(batch_events[idx]));
+  auto wait_batch_event_host = [&](GPUContext *ctx) {
+    HIP_CHECK(hipEventSynchronize(ctx->batch_event));
+  };
+  auto stream_wait_on = [&](GPUContext *dst, GPUContext *src) {
+    if (dst == src) return;
+    HIP_CHECK(hipSetDevice(dst->device_id));
+    HIP_CHECK(hipStreamWaitEvent(dst->batch_stream, src->batch_event, 0));
   };
 
   // Stage indices to every GPU
@@ -2830,25 +2831,24 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         w_o_packed, ctx->state.xpack_bf16, ctx->state.tb2, nullptr,  // no bias
         hidden_dim, ctx->local_q_dim, batch, Bpad, hidden_dim,
         ctx->d_slot_ids, ctx->batch_stream);
-      record_batch_event(idx);
+      record_batch_event(ctx);
     }
 
     // Sum partial tb2 on leader and broadcast
     if (ctxs.size() > 1) {
-      wait_batch_event(0);
       HIP_CHECK(hipSetDevice(leader->device_id));
       size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
-        wait_batch_event(idx);
-        HIP_CHECK(hipMemcpyPeer(leader->state.tb2_peer, leader->device_id,
-                                peer->state.tb2, peer->device_id, bytes));
+        stream_wait_on(leader, peer);
+        HIP_CHECK(hipMemcpyPeerAsync(leader->state.tb2_peer, leader->device_id,
+                                     peer->state.tb2, peer->device_id, bytes,
+                                     leader->batch_stream));
         HIP_CHECK(hipSetDevice(leader->device_id));
         dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
         add_selected_kernel_float<<<grid, block, 0, leader->batch_stream>>>(
           leader->state.tb2, leader->state.tb2_peer, hidden_dim, batch, leader->d_slot_ids);
       }
-      record_batch_event(0);
     }
 
     // Add bias once on leader and broadcast
@@ -2858,17 +2858,17 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
       add_bias_kernel_float_batched<<<grid, block, 0, leader->batch_stream>>>(
         leader->state.tb2, b_o, hidden_dim, batch, hidden_dim, leader->d_slot_ids);
-      record_batch_event(0);
-      wait_batch_event(0);
     }
+    record_batch_event(leader);
 
     if (ctxs.size() > 1) {
-      wait_batch_event(0);
       size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
-        HIP_CHECK(hipMemcpyPeer(peer->state.tb2, peer->device_id,
-                                leader->state.tb2, leader->device_id, bytes));
+        stream_wait_on(peer, leader);
+        HIP_CHECK(hipMemcpyPeerAsync(peer->state.tb2, peer->device_id,
+                                     leader->state.tb2, leader->device_id, bytes,
+                                     peer->batch_stream));
       }
     }
 
@@ -2945,8 +2945,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         leader->state.topk_v, leader->state.topk_i,
         leader->d_slot_ids, batch, p->experts_per_token,
         leader->state.sel_w, leader->state.sel_eids, leader->state.sel_sids);
-      record_batch_event(0);
-      wait_batch_event(0);
+      record_batch_event(leader);
+      wait_batch_event_host(leader);
     }
 
     std::vector<int> host_sel_sids(M);
@@ -3097,30 +3097,31 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         M_local, block_count,
         hidden_dim, p->intermediate_dim,
         l, ctx->local_experts, hidden_dim);
-      record_batch_event(idx);
+      record_batch_event(ctx);
     }
 
     // Sum e_agg on leader and broadcast
     if (ctxs.size() > 1) {
-      wait_batch_event(0);
       HIP_CHECK(hipSetDevice(leader->device_id));
       size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
-        wait_batch_event(idx);
-        HIP_CHECK(hipMemcpyPeer(leader->state.e_agg_peer, leader->device_id,
-                                peer->state.e_agg, peer->device_id, bytes));
+        stream_wait_on(leader, peer);
+        HIP_CHECK(hipMemcpyPeerAsync(leader->state.e_agg_peer, leader->device_id,
+                                     peer->state.e_agg, peer->device_id, bytes,
+                                     leader->batch_stream));
         HIP_CHECK(hipSetDevice(leader->device_id));
         dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
         add_selected_kernel_float<<<grid, block, 0, leader->batch_stream>>>(
           leader->state.e_agg, leader->state.e_agg_peer, hidden_dim, batch, leader->d_slot_ids);
       }
-      record_batch_event(0);
-      wait_batch_event(0);
+      record_batch_event(leader);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
-        HIP_CHECK(hipMemcpyPeer(peer->state.e_agg, peer->device_id,
-                                leader->state.e_agg, leader->device_id, bytes));
+        stream_wait_on(peer, leader);
+        HIP_CHECK(hipMemcpyPeerAsync(peer->state.e_agg, peer->device_id,
+                                     leader->state.e_agg, leader->device_id, bytes,
+                                     peer->batch_stream));
       }
     }
 
@@ -3166,8 +3167,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
     HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, leader->d_next_tokens,
                              batch * sizeof(int), hipMemcpyDeviceToHost, leader->batch_stream));
-    record_batch_event(0);
-    wait_batch_event(0);
+    record_batch_event(leader);
+    wait_batch_event_host(leader);
   }
 
   // Keep follower activations aligned (optional)
@@ -3180,12 +3181,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     }
   }
 
-  for (size_t idx = 0; idx < batch_events.size(); ++idx) {
-    if (batch_events[idx] != nullptr) {
-      HIP_CHECK(hipSetDevice(ctxs[idx]->device_id));
-      HIP_CHECK(hipEventDestroy(batch_events[idx]));
-    }
-  }
 }
 
 // ------------------------- Warm-up & Finish -------------------------
@@ -3342,6 +3337,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     gpu_malloc_run_state(&ctx, cfg, ctx.max_batch);
 
     HIP_CHECK(hipStreamCreate(&ctx.batch_stream));
+    HIP_CHECK(hipEventCreateWithFlags(&ctx.batch_event, hipEventDisableTiming));
     HIP_CHECK(hipMalloc(&ctx.d_slot_ids,  ctx.max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&ctx.d_pos_list,  ctx.max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&ctx.d_token_ids, ctx.max_batch * sizeof(int)));
@@ -3384,6 +3380,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
   for (auto &gpu_ctx : gpu_contexts) {
     HIP_CHECK(hipSetDevice(gpu_ctx.device_id));
+    if (gpu_ctx.batch_event) HIP_CHECK(hipEventDestroy(gpu_ctx.batch_event));
+    gpu_ctx.batch_event = nullptr;
     if (gpu_ctx.batch_stream) HIP_CHECK(hipStreamDestroy(gpu_ctx.batch_stream));
     if (gpu_ctx.d_slot_ids)    HIP_CHECK(hipFree(gpu_ctx.d_slot_ids));
     if (gpu_ctx.d_pos_list)    HIP_CHECK(hipFree(gpu_ctx.d_pos_list));
