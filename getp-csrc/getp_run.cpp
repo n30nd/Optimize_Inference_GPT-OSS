@@ -2976,16 +2976,31 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       }
       int sel_count = (int)sel_sids_local.size();
       local_M[idx] = sel_count;
-      HIP_CHECK(hipSetDevice(ctx->device_id));
-      if (sel_count == 0) {
-        continue;
-      }
 
       int local_experts = ctx->local_experts;
       std::vector<int> counts(local_experts, 0);
       for (int eid_local : sel_eids_local) {
         counts[eid_local]++;
       }
+
+      // Log expert selection counts per layer/GPU for debugging expert-parallel routing
+      if (local_experts > 0) {
+        printf("[MoE] layer %d GPU %d expert selections:", l, ctx->device_id);
+        for (int e = 0; e < local_experts; ++e) {
+          int global_eid = ctx->expert_offset + e;
+          printf(" %d:%d", global_eid, counts[e]);
+        }
+        printf("\n");
+      } else {
+        printf("[MoE] layer %d GPU %d has no local experts.\n", l, ctx->device_id);
+      }
+      fflush(stdout);
+
+      if (sel_count == 0) {
+        continue;
+      }
+
+      HIP_CHECK(hipSetDevice(ctx->device_id));
 
       std::vector<int> prefix(local_experts + 1, 0);
       for (int e = 0; e < local_experts; ++e) {
