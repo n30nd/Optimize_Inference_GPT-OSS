@@ -746,70 +746,6 @@ __global__ void convert_fp32_to_bf16_kernel(const float *fp32_data, hip_bfloat16
   if (tid < size) bf16_data[tid] = float_to_bfloat16(fp32_data[tid]);
 }
 
-// Embedding gather: write embedding row for each token into its slot buffer
-__global__ void embedding_gather_kernel(
-    float *x,
-    const hip_bfloat16 *emb,
-    const int *tok,
-    const int *slot_ids,
-    int hidden_dim,
-    int batch,
-    int stride) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int b = blockIdx.y;
-  if (i < hidden_dim && b < batch) {
-    int sid = slot_ids[b];
-    int t = tok[b];
-    const hip_bfloat16 *row = emb + (size_t)t * (size_t)hidden_dim;
-    float *dst = x + (size_t)sid * (size_t)stride;
-    dst[i] = bfloat16_to_float(row[i]);
-  }
-}
-
-// RoPE precompute per slot: produce cos/sin for half-dimension
-__global__ void rope_precompute_kernel(
-    float *cos_out,
-    float *sin_out,
-    const int *pos_list,
-    const int *slot_ids,
-    int batch,
-    float base,
-    int head_dim,
-    float scaling_factor,
-    float initial_context_length,
-    float ntk_beta,
-    float ntk_alpha,
-    int stride) {
-  int tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int b = blockIdx.y;
-  if (b >= batch) return;
-  int half = head_dim / 2;
-  if (tid < half) {
-    int sid = slot_ids[b];
-    float freq = powf(base, ((float)(2 * tid)) / (float)head_dim);
-    float inv_freq;
-    if (scaling_factor > 1.0f) {
-      float low  = half * logf(initial_context_length / (ntk_beta  * 2.0f * M_PI)) / logf(base);
-      float high = half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(base);
-      float interpolation = 1.0f / (scaling_factor * freq);
-      float extrapolation = 1.0f / freq;
-      float ramp = ((float)tid - low) / (high - low);
-      if (ramp < 0) ramp = 0;
-      if (ramp > 1) ramp = 1;
-      float mask = 1.0f - ramp;
-      inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
-    } else {
-      inv_freq = 1.0f / freq;
-    }
-    float concentration = (scaling_factor > 1.0f) ? (0.1f * logf(scaling_factor) + 1.0f) : 1.0f;
-    float val = (float)pos_list[b] * inv_freq;
-    float *cos_dst = cos_out + (size_t)sid * (size_t)stride;
-    float *sin_dst = sin_out + (size_t)sid * (size_t)stride;
-    cos_dst[tid] = cosf(val) * concentration;
-    sin_dst[tid] = sinf(val) * concentration;
-  }
-}
-
 // MFMA MLP1 directly from MXFP4-packed weights (no BF16 storage).
 // Dequantizes per element on-the-fly using e8m0 scales and 4-bit levels.
 __global__ __launch_bounds__(64)
@@ -1953,53 +1889,6 @@ void paged_flash_attention_kernel_batched(
   }
 }
 
-// Paged KV writers (V then K) operating on KVCacheDeviceData
-__global__ void paged_kv_writer_v_kernel(
-    const float *qkv,
-    KVCacheDeviceData *cache_data,
-    int layer,
-    int batch,
-    int q_stride,
-    int v_offset,
-    int v_size,
-    const int *pos_list,
-    const int *slot_ids) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int b = blockIdx.y;
-  if (i < v_size && b < batch) {
-    int sid = slot_ids[b];
-    int pos = pos_list[b];
-    int write_pos = cache_data->get_write_position(sid, layer, pos);
-    hip_bfloat16 *dst = cache_data->get_value_token_ptr(sid, layer, write_pos);
-    if (dst == nullptr) return;
-    const float *src = qkv + (size_t)sid * (size_t)q_stride + (size_t)v_offset;
-    dst[i] = float_to_bfloat16(src[i]);
-  }
-}
-
-__global__ void paged_kv_writer_k_kernel(
-    const float *qkv,
-    KVCacheDeviceData *cache_data,
-    int layer,
-    int batch,
-    int q_stride,
-    int k_offset,
-    int k_size,
-    const int *pos_list,
-    const int *slot_ids) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int b = blockIdx.y;
-  if (i < k_size && b < batch) {
-    int sid = slot_ids[b];
-    int pos = pos_list[b];
-    int write_pos = cache_data->get_write_position(sid, layer, pos);
-    hip_bfloat16 *dst = cache_data->get_key_token_ptr(sid, layer, write_pos);
-    if (dst == nullptr) return;
-    const float *src = qkv + (size_t)sid * (size_t)q_stride + (size_t)k_offset;
-    dst[i] = float_to_bfloat16(src[i]);
-  }
-}
-
 
 __global__ void sample_argmax_kernel(const float *logits, int *next_tokens,
                                      int batch, int vocab_size) {
@@ -2695,16 +2584,25 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
   // Embedding gather on each GPU
   auto launch_embed = [&](GPUContext *ctx) {
+    struct Kernel {
+      static __global__ void run(float *x, const hip_bfloat16 *emb, const int *tok,
+                                 const int *slot_ids, int hidden_dim, int batch, int stride) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        int b = blockIdx.y;
+        if (i < hidden_dim && b < batch) {
+          int sid = slot_ids[b];
+          int t = tok[b];
+          const hip_bfloat16 *row = emb + (size_t)t * (size_t)hidden_dim;
+          float *dst = x + (size_t)sid * (size_t)stride;
+          dst[i] = bfloat16_to_float(row[i]);
+        }
+      }
+    };
     dim3 block(256);
     dim3 grid((hidden_dim + block.x - 1) / block.x, batch);
-    embedding_gather_kernel<<<grid, block, 0, ctx->batch_stream>>>(
-      ctx->state.x,
-      ctx->weights.token_embedding_table,
-      ctx->d_token_ids,
-      ctx->d_slot_ids,
-      hidden_dim,
-      batch,
-      hidden_dim);
+    Kernel::run<<<grid, block, 0, ctx->batch_stream>>>(ctx->state.x, ctx->weights.token_embedding_table,
+                                                       ctx->d_token_ids, ctx->d_slot_ids,
+                                                       hidden_dim, batch, hidden_dim);
   };
 
   for (GPUContext *ctx : ctxs) {
@@ -2717,19 +2615,47 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     int d_half = head_dim / 2;
     dim3 block(256);
     dim3 grid((d_half + block.x - 1) / block.x, batch);
-    rope_precompute_kernel<<<grid, block, 0, ctx->batch_stream>>>(
-      ctx->state.cos_vals,
-      ctx->state.sin_vals,
-      ctx->d_pos_list,
-      ctx->d_slot_ids,
-      batch,
-      p->rope_theta,
-      head_dim,
-      p->rope_scaling_factor,
-      p->initial_context_length,
-      32.0f,
-      1.0f,
-      d_half);
+    struct Kernel {
+      static __global__ void run(float *cos_out, float *sin_out,
+                                 const int *pos_list, const int *slot_ids,
+                                 int batch, float base, int head_dim,
+                                 float scaling_factor, float initial_context_length,
+                                 float ntk_beta, float ntk_alpha, int stride) {
+        int tid = blockIdx.x * blockDim.x + threadIdx.x;
+        int b = blockIdx.y;
+        if (b >= batch) return;
+        int half = head_dim / 2;
+        if (tid < half) {
+          int sid = slot_ids[b];
+          float freq = powf(base, ((float)(2 * tid)) / (float)head_dim);
+          float inv_freq;
+          if (scaling_factor > 1.0f) {
+            float low  = half * logf(initial_context_length / (ntk_beta  * 2.0f * M_PI)) / logf(base);
+            float high = half * logf(initial_context_length / (ntk_alpha * 2.0f * M_PI)) / logf(base);
+            float interpolation = 1.0f / (scaling_factor * freq);
+            float extrapolation = 1.0f / freq;
+            float ramp = ((float)tid - low) / (high - low);
+            if (ramp < 0) ramp = 0;
+            if (ramp > 1) ramp = 1;
+            float mask = 1.0f - ramp;
+            inv_freq = interpolation * (1.0f - mask) + extrapolation * mask;
+          } else {
+            inv_freq = 1.0f / freq;
+          }
+          float concentration = (scaling_factor > 1.0f) ? (0.1f * logf(scaling_factor) + 1.0f) : 1.0f;
+          float val = (float)pos_list[b] * inv_freq;
+          float *cos_dst = cos_out + (size_t)sid * (size_t)stride;
+          float *sin_dst = sin_out + (size_t)sid * (size_t)stride;
+          cos_dst[tid] = cosf(val) * concentration;
+          sin_dst[tid] = sinf(val) * concentration;
+        }
+      }
+    };
+    Kernel::run<<<grid, block, 0, ctx->batch_stream>>>(ctx->state.cos_vals, ctx->state.sin_vals,
+                                                       ctx->d_pos_list, ctx->d_slot_ids,
+                                                       batch, p->rope_theta, head_dim,
+                                                       p->rope_scaling_factor, p->initial_context_length,
+                                                       32.0f, 1.0f, d_half);
   };
 
   for (GPUContext *ctx : ctxs) {
@@ -2737,7 +2663,41 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     launch_rope(ctx);
   }
 
-  // PagedKV writers now use top-level kernels
+  struct PagedKVWriterV {
+    static __global__ void run(const float *qkv, KVCacheDeviceData *cache_data, int layer,
+                               int batch, int q_stride, int v_offset, int v_size,
+                               const int *pos_list, const int *slot_ids) {
+      int i = blockIdx.x * blockDim.x + threadIdx.x;
+      int b = blockIdx.y;
+      if (i < v_size && b < batch) {
+        int sid = slot_ids[b];
+        int pos = pos_list[b];
+        int write_pos = cache_data->get_write_position(sid, layer, pos);
+        hip_bfloat16 *dst = cache_data->get_value_token_ptr(sid, layer, write_pos);
+        if (dst == nullptr) return;
+        const float *src = qkv + (size_t)sid * (size_t)q_stride + (size_t)v_offset;
+        dst[i] = float_to_bfloat16(src[i]);
+      }
+    }
+  };
+
+  struct PagedKVWriterK {
+    static __global__ void run(const float *qkv, KVCacheDeviceData *cache_data, int layer,
+                               int batch, int q_stride, int k_offset, int k_size,
+                               const int *pos_list, const int *slot_ids) {
+      int i = blockIdx.x * blockDim.x + threadIdx.x;
+      int b = blockIdx.y;
+      if (i < k_size && b < batch) {
+        int sid = slot_ids[b];
+        int pos = pos_list[b];
+        int write_pos = cache_data->get_write_position(sid, layer, pos);
+        hip_bfloat16 *dst = cache_data->get_key_token_ptr(sid, layer, write_pos);
+        if (dst == nullptr) return;
+        const float *src = qkv + (size_t)sid * (size_t)q_stride + (size_t)k_offset;
+        dst[i] = float_to_bfloat16(src[i]);
+      }
+    }
+  };
 
   for (int l = 0; l < p->n_layers; ++l) {
     for (GPUContext *ctx : ctxs) {
@@ -2797,7 +2757,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int v_size = ctx->local_kv_dim;
 
       dim3 block_v(256), grid_v((v_size + block_v.x - 1) / block_v.x, batch);
-      paged_kv_writer_v_kernel<<<grid_v, block_v, 0, ctx->batch_stream>>>(
+      PagedKVWriterV::run<<<grid_v, block_v, 0, ctx->batch_stream>>>(
         ctx->state.qkv,
         ctx->state.kv_cache_manager->get_device_data(), l,
         batch, q_stride, q_size + k_size, v_size,
@@ -2814,7 +2774,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         ctx->local_kv_heads, head_dim, batch, q_stride, head_dim / 2, ctx->d_slot_ids);
 
       dim3 block_k(256), grid_k((k_size + block_k.x - 1) / block_k.x, batch);
-      paged_kv_writer_k_kernel<<<grid_k, block_k, 0, ctx->batch_stream>>>(
+      PagedKVWriterK::run<<<grid_k, block_k, 0, ctx->batch_stream>>>(
         ctx->state.qkv,
         ctx->state.kv_cache_manager->get_device_data(), l,
         batch, q_stride, q_size, k_size,
