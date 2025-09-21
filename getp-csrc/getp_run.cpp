@@ -49,10 +49,6 @@
     } \
   } while(0)
 
-#ifndef MAX_EXPERT_STREAMS
-#define MAX_EXPERT_STREAMS 4
-#endif
-
 // ------------------------- GPU weights & run state -------------------------
 
 typedef struct {
@@ -465,20 +461,12 @@ typedef struct {
   float *gate_up;
   float *e_agg;
   float *qkv;
-  float *logits;      // (unused for final FP32 logits, but kept)
   KVCacheManager *kv_cache_manager;
   float *cos_vals;
   float *sin_vals;
   hip_bfloat16 *t_bf16;
-  // FP32 buffers for accumulation and precision-sensitive ops
-  float *acc_buffer;         // x in FP32 for output matvec
+  // FP32 outputs for sampling and host reads
   float *logits_fp32;        // final logits
-  // Per-stream scratch buffers for expert parallelization
-  float *mlp1_out_s;   // [MAX_EXPERT_STREAMS][2 * intermediate_dim]
-  float *gate_s;       // [MAX_EXPERT_STREAMS][intermediate_dim]
-  float *up_s;         // [MAX_EXPERT_STREAMS][intermediate_dim]
-  float *gate_up_s;    // [MAX_EXPERT_STREAMS][intermediate_dim]
-  float *tb2_s;        // [MAX_EXPERT_STREAMS][hidden_dim]
   // Batched MoE staging (for grouped GEMMs across slots/experts)
   int   *sel_sids;        // [max_batch * experts_per_token]
   int   *sel_eids;        // [max_batch * experts_per_token]
@@ -487,7 +475,6 @@ typedef struct {
   hip_bfloat16 *gate_up_all;     // [max_batch * experts_per_token][intermediate_dim]
   float *tb2_peer;        // cross-GPU accumulation buffers (leader)
   float *e_agg_peer;
-  float *router_score_full;
   // MFMA packed buffers
   hip_bfloat16 *xpack_bf16; // Packed input buffer for MFMA [K_max x Bpad]
   // Grouped MoE metadata per launch
@@ -537,10 +524,7 @@ typedef struct {
   bool is_leader;
   GPUTransformerWeights weights;
   GPURunState state;
-  hipStream_t expert_streams[MAX_EXPERT_STREAMS];
-  int num_expert_streams;
   int max_batch; // number of concurrent slots per GPU for continuous batching
-  std::vector<hipStream_t> slot_streams; // persistent stream per slot
   hipStream_t batch_stream;              // shared stream for batched ops
   // Staging device buffers for batched indices and positions
   int *d_slot_ids;
@@ -3357,10 +3341,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     }
     gpu_malloc_run_state(&ctx, cfg, ctx.max_batch);
 
-    ctx.slot_streams.resize(ctx.max_batch);
-    for (int s = 0; s < ctx.max_batch; ++s) {
-      HIP_CHECK(hipStreamCreate(&ctx.slot_streams[s]));
-    }
     HIP_CHECK(hipStreamCreate(&ctx.batch_stream));
     HIP_CHECK(hipMalloc(&ctx.d_slot_ids,  ctx.max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&ctx.d_pos_list,  ctx.max_batch * sizeof(int)));
@@ -3371,11 +3351,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     for (int i = 0; i < ctx.max_batch; ++i) host_batch_iota[i] = i;
     HIP_CHECK(hipMemcpy(ctx.d_batch_iota, host_batch_iota.data(),
                        ctx.max_batch * sizeof(int), hipMemcpyHostToDevice));
-
-    ctx.num_expert_streams = MAX_EXPERT_STREAMS;
-    for (int s = 0; s < ctx.num_expert_streams; ++s) {
-      HIP_CHECK(hipStreamCreate(&ctx.expert_streams[s]));
-    }
 
   }
 
@@ -3409,11 +3384,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
   for (auto &gpu_ctx : gpu_contexts) {
     HIP_CHECK(hipSetDevice(gpu_ctx.device_id));
-    // Destroy per-slot streams
-    for (auto &st : gpu_ctx.slot_streams) {
-      if (st != nullptr) HIP_CHECK(hipStreamDestroy(st));
-    }
-    gpu_ctx.slot_streams.clear();
     if (gpu_ctx.batch_stream) HIP_CHECK(hipStreamDestroy(gpu_ctx.batch_stream));
     if (gpu_ctx.d_slot_ids)    HIP_CHECK(hipFree(gpu_ctx.d_slot_ids));
     if (gpu_ctx.d_pos_list)    HIP_CHECK(hipFree(gpu_ctx.d_pos_list));
@@ -3433,9 +3403,6 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     ws.copy_stream = ws.convert_stream = ws.quant_stream = nullptr;
     ws.capacity_elems = 0;
     ws.logs.clear();
-    for (int s = 0; s < gpu_ctx.num_expert_streams; ++s) {
-      if (gpu_ctx.expert_streams[s] != nullptr) HIP_CHECK(hipStreamDestroy(gpu_ctx.expert_streams[s]));
-    }
     gpu_free_weights(&gpu_ctx.weights);
     gpu_free_run_state(&gpu_ctx);
   }
@@ -3614,23 +3581,13 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
                                            (size_t)local_kv_dim, p->sliding_window);
 
   if (ctx->is_leader) {
-    HIP_CHECK(hipMalloc(&s->logits,      B * (size_t)p->vocab_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&s->logits_fp32, B * (size_t)p->vocab_size * sizeof(float)));
   } else {
-    s->logits = nullptr;
     s->logits_fp32 = nullptr;
   }
 
   HIP_CHECK(hipMalloc(&s->cos_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->sin_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
-
-  s->acc_buffer = nullptr;
-
-  HIP_CHECK(hipMalloc(&s->mlp1_out_s, MAX_EXPERT_STREAMS * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_s,     MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->up_s,       MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up_s,  MAX_EXPERT_STREAMS * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->tb2_s,      MAX_EXPERT_STREAMS * (size_t)hidden_dim * sizeof(float)));
 
   size_t Mmax = (size_t)max_batch * (size_t)p->experts_per_token;
   HIP_CHECK(hipMalloc(&s->sel_sids,     Mmax * sizeof(int)));
@@ -3647,9 +3604,6 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   if (ctx->is_leader) {
     HIP_CHECK(hipMalloc(&s->tb2_peer, B * (size_t)hidden_dim * sizeof(float)));
     HIP_CHECK(hipMalloc(&s->e_agg_peer, B * (size_t)hidden_dim * sizeof(float)));
-    s->router_score_full = s->router_score;
-  } else {
-    s->router_score_full = nullptr;
   }
   
   // MFMA packed buffers
@@ -3675,16 +3629,9 @@ void gpu_free_run_state(GPUContext *ctx) {
   HIP_CHECK(hipFree(s->gate_up));
   HIP_CHECK(hipFree(s->e_agg));
   HIP_CHECK(hipFree(s->qkv));
-  if (s->logits) HIP_CHECK(hipFree(s->logits));
   HIP_CHECK(hipFree(s->cos_vals));
   HIP_CHECK(hipFree(s->sin_vals));
-  if (s->acc_buffer) HIP_CHECK(hipFree(s->acc_buffer));
   if (s->logits_fp32) HIP_CHECK(hipFree(s->logits_fp32));
-  HIP_CHECK(hipFree(s->mlp1_out_s));
-  HIP_CHECK(hipFree(s->gate_s));
-  HIP_CHECK(hipFree(s->up_s));
-  HIP_CHECK(hipFree(s->gate_up_s));
-  HIP_CHECK(hipFree(s->tb2_s));
   HIP_CHECK(hipFree(s->sel_sids));
   HIP_CHECK(hipFree(s->sel_eids));
   HIP_CHECK(hipFree(s->sel_w));
