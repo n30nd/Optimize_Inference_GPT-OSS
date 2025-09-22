@@ -2358,9 +2358,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int d = 0; d < max_devices; ++d) {
     HIP_CHECK(hipSetDevice(d));
     gpu_contexts[d].device_id = d;
-    // Configure per-GPU max batch from env, default 8
+    // Configure per-GPU max batch from env, default 512
     const char *env_mb = getenv("GETP_MAX_BATCH");
-    int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 8;
+    int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 512;
     gpu_contexts[d].max_batch = mb;
     log_gpu_mem(d, "[GPU] Before memory allocation on device:");
     gpu_copy_weights(&gpu_contexts[d].weights, &transformer->weights, &transformer->config);
