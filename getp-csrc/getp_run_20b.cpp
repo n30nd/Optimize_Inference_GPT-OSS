@@ -9,7 +9,6 @@
 // - Simplified kernel focused on stability and correctness
 // - Reduces global memory traffic by keeping scores in shared memory
 
-#include "getp_eval.cpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
 #include <limits>
@@ -26,8 +25,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
-#ifndef GETP_RUN
-#define GETP_RUN
+
+namespace getp_variants {
+namespace variant20b {
 
 #ifndef GB
 #define GB (1024.0*1024.0*1024.0)
@@ -2358,9 +2358,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int d = 0; d < max_devices; ++d) {
     HIP_CHECK(hipSetDevice(d));
     gpu_contexts[d].device_id = d;
-    // Configure per-GPU max batch from env, default 8
+    // Configure per-GPU max batch from env, default 512
     const char *env_mb = getenv("GETP_MAX_BATCH");
-    int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 8;
+    int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 512;
     gpu_contexts[d].max_batch = mb;
     log_gpu_mem(d, "[GPU] Before memory allocation on device:");
     gpu_copy_weights(&gpu_contexts[d].weights, &transformer->weights, &transformer->config);
@@ -2411,7 +2411,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
-  if (gpu_contexts.empty()) warm_up(transformer, tokenizer);
+  if (gpu_contexts.empty()) variant20b::warm_up(transformer, tokenizer);
   const int num_devices = (int)gpu_contexts.size();
   if (requests->num_reqs <= 0 || num_devices <= 0) return 0;
   // Global request index for all workers (lock-free producer)
@@ -2522,7 +2522,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
 }
 
 
-#endif // GETP_RUN
+// #endif // GETP_RUN
 
 
 
@@ -2965,3 +2965,6 @@ void gpu_free_weights(GPUTransformerWeights *gpu_w) {
   if (gpu_w->w_o_packed16)          HIP_CHECK(hipFree(gpu_w->w_o_packed16));
   if (gpu_w->w_router_packed16)     HIP_CHECK(hipFree(gpu_w->w_router_packed16));
 }
+
+} // namespace variant20b
+} // namespace getp_variants

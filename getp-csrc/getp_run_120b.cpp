@@ -29,8 +29,9 @@
 #include <string>
 #include <utility>
 
-#ifndef GETP_RUN
-#define GETP_RUN
+namespace getp_variants {
+namespace variant120b {
+
 
 #ifndef GB
 #define GB (1024.0*1024.0*1024.0)
@@ -3290,7 +3291,7 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     ensure_mxfp4_dequant_lut_initialized();
 
     const char *env_mb = getenv("GETP_MAX_BATCH");
-    int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 8;
+    int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 1024; //default BATCH 1024
     ctx.max_batch = mb;
 
     WeightCopyWorkspace &ws = ctx.copy_ws;
@@ -3412,7 +3413,7 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
-  if (gpu_contexts.empty()) warm_up(transformer, tokenizer);
+  if (gpu_contexts.empty()) variant120b::warm_up(transformer, tokenizer);
   if (requests->num_reqs <= 0 || gpu_contexts.empty()) return 0;
   const int num_devices = parallel_layout.dp_size;
   // Global request index for all workers (lock-free producer)
@@ -3545,7 +3546,7 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   return total_out.load(std::memory_order_relaxed);
 }
 
-#endif // GETP_RUN
+// #endif // GETP_RUN
 
 void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   HIP_CHECK(hipSetDevice(ctx->device_id));
@@ -3672,3 +3673,6 @@ void gpu_free_weights(GPUTransformerWeights *gpu_w) {
   if (gpu_w->w_o_packed16) HIP_CHECK(hipFree(gpu_w->w_o_packed16));
   if (gpu_w->w_router_packed16) HIP_CHECK(hipFree(gpu_w->w_router_packed16));
 }
+
+} // namespace variant120b
+} // namespace getp_variants
