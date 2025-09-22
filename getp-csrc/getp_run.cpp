@@ -18,6 +18,11 @@
 
 namespace {
 
+using WarmUpFn = void (*)(Transformer *, Tokenizer *);
+using InferenceFn = long long (*)(Transformer *, Tokenizer *, Sampler *,
+                                  Requests *);
+using FinishFn = void (*)(Transformer *, Tokenizer *);
+
 enum class ModelVariant {
   kUnknown = 0,
   k20B,
@@ -92,8 +97,31 @@ ModelVariant deduce_from_config(const Config &config) {
 std::mutex g_variant_mutex;
 ModelVariant g_selected_variant = ModelVariant::kUnknown;
 bool g_variant_initialized = false;
+WarmUpFn g_warmup_impl = nullptr;
+InferenceFn g_inference_impl = nullptr;
+FinishFn g_finish_impl = nullptr;
 
-ModelVariant ensure_variant_initialized(const Config &config) {
+void bind_variant(ModelVariant variant) {
+  switch (variant) {
+  case ModelVariant::k20B:
+    g_warmup_impl = &getp_variants::variant20b::warm_up;
+    g_inference_impl = &getp_variants::variant20b::inference;
+    g_finish_impl = &getp_variants::variant20b::finish;
+    break;
+  case ModelVariant::k120B:
+    g_warmup_impl = &getp_variants::variant120b::warm_up;
+    g_inference_impl = &getp_variants::variant120b::inference;
+    g_finish_impl = &getp_variants::variant120b::finish;
+    break;
+  default:
+    g_warmup_impl = nullptr;
+    g_inference_impl = nullptr;
+    g_finish_impl = nullptr;
+    break;
+  }
+}
+
+ModelVariant ensure_variant_initialized(const Config &config, bool verbose) {
   std::lock_guard<std::mutex> guard(g_variant_mutex);
   if (!g_variant_initialized) {
     ModelVariant variant = read_env_override();
@@ -101,12 +129,14 @@ ModelVariant ensure_variant_initialized(const Config &config) {
     if (variant == ModelVariant::kUnknown) {
       variant = inferred;
     } else if (inferred != ModelVariant::kUnknown && inferred != variant) {
-      std::fprintf(stderr,
-                   "[getp] GETP_MODEL_VARIANT=%s overrides configuration that "
-                   "maps to %s (n_layers=%d).\n",
-                   variant_name(variant), variant_name(inferred),
-                   config.n_layers);
-      std::fflush(stderr);
+      if (verbose) {
+        std::fprintf(stderr,
+                     "[getp] GETP_MODEL_VARIANT=%s overrides configuration that "
+                     "maps to %s (n_layers=%d).\n",
+                     variant_name(variant), variant_name(inferred),
+                     config.n_layers);
+        std::fflush(stderr);
+      }
     }
     if (variant == ModelVariant::kUnknown) {
       std::fprintf(stderr,
@@ -117,10 +147,13 @@ ModelVariant ensure_variant_initialized(const Config &config) {
       std::exit(EXIT_FAILURE);
     }
     g_selected_variant = variant;
+    bind_variant(variant);
     g_variant_initialized = true;
-    std::printf("[getp] Selected model variant: %s (n_layers=%d)\n",
-                variant_name(g_selected_variant), config.n_layers);
-    std::fflush(stdout);
+    if (verbose) {
+      std::printf("[getp] Selected model variant: %s (n_layers=%d)\n",
+                  variant_name(g_selected_variant), config.n_layers);
+      std::fflush(stdout);
+    }
   } else {
     ModelVariant inferred = deduce_from_config(config);
     if (inferred != ModelVariant::kUnknown && inferred != g_selected_variant) {
@@ -132,6 +165,9 @@ ModelVariant ensure_variant_initialized(const Config &config) {
       std::fflush(stderr);
       std::exit(EXIT_FAILURE);
     }
+    if (!g_warmup_impl || !g_inference_impl || !g_finish_impl) {
+      bind_variant(g_selected_variant);
+    }
   }
   return g_selected_variant;
 }
@@ -140,6 +176,9 @@ void clear_variant_selection() {
   std::lock_guard<std::mutex> guard(g_variant_mutex);
   g_variant_initialized = false;
   g_selected_variant = ModelVariant::kUnknown;
+  g_warmup_impl = nullptr;
+  g_inference_impl = nullptr;
+  g_finish_impl = nullptr;
 }
 
 } // namespace
@@ -150,59 +189,44 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     std::fflush(stderr);
     return;
   }
-  ModelVariant variant = ensure_variant_initialized(transformer->config);
-  switch (variant) {
-  case ModelVariant::k20B:
-    getp_variants::variant20b::warm_up(transformer, tokenizer);
-    break;
-  case ModelVariant::k120B:
-    getp_variants::variant120b::warm_up(transformer, tokenizer);
-    break;
-  default:
-    break;
+  ensure_variant_initialized(transformer->config, true);
+  WarmUpFn fn = g_warmup_impl;
+  if (fn) {
+    fn(transformer, tokenizer);
   }
 }
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
-  if (transformer == nullptr) {
-    std::fprintf(stderr,
-                 "[getp] inference received null transformer pointer; returning "
-                 "0 tokens.\n");
-    std::fflush(stderr);
+  if (!transformer) {
     return 0;
   }
-  ModelVariant variant = ensure_variant_initialized(transformer->config);
-  switch (variant) {
-  case ModelVariant::k20B:
-    return getp_variants::variant20b::inference(transformer, tokenizer,
-                                                sampler, requests);
-  case ModelVariant::k120B:
-    return getp_variants::variant120b::inference(transformer, tokenizer,
-                                                 sampler, requests);
-  default:
-    break;
+  InferenceFn fn = g_inference_impl;
+  if (!fn) {
+    ensure_variant_initialized(transformer->config, false);
+    fn = g_inference_impl;
+    if (!fn) {
+      return 0;
+    }
   }
-  return 0;
+  return fn(transformer, tokenizer, sampler, requests);
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
-  if (transformer == nullptr) {
-    std::fprintf(stderr, "[getp] finish received null transformer pointer.\n");
-    std::fflush(stderr);
+  if (!transformer) {
+    clear_variant_selection();
     return;
   }
-  ModelVariant variant = ensure_variant_initialized(transformer->config);
-  switch (variant) {
-  case ModelVariant::k20B:
-    getp_variants::variant20b::finish(transformer, tokenizer);
-    break;
-  case ModelVariant::k120B:
-    getp_variants::variant120b::finish(transformer, tokenizer);
-    break;
-  default:
-    break;
+  FinishFn fn = g_finish_impl;
+  if (!fn) {
+    ensure_variant_initialized(transformer->config, false);
+    fn = g_finish_impl;
+    if (!fn) {
+      clear_variant_selection();
+      return;
+    }
   }
+  fn(transformer, tokenizer);
   clear_variant_selection();
 }
 
