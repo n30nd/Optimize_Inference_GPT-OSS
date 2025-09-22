@@ -462,6 +462,9 @@ __device__ __forceinline__ hip_bfloat16 float_to_bfloat16(float f) {
 __device__ __host__ __forceinline__ float bfloat16_to_float(hip_bfloat16 bf) {
   return float(bf);
 }
+static_assert(sizeof(hip_bfloat16) == 2, "hip_bfloat16 is expected to be 2 bytes");
+
+__device__ __forceinline__ float4 bfloat16_to_float4(const hip_bfloat16 *bf16_ptr);
 __host__ __device__ __forceinline__ int round_up16(int x) { return ((x + 15) / 16) * 16; }
 
 // (removed) pack_bf16x2 helper no longer needed after switching to short4 MFMA operands
@@ -766,9 +769,37 @@ __global__ __launch_bounds__(256) void rmsnorm_kernel_float_batched(
   float inv_rms = rsqrtf(s_reduce[0] / hidden_dim + 1e-5f);
   __syncthreads();
 
-  for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
+  const int vec_chunks = hidden_dim >> 2; // number of 4-element groups
+  const int tail_start = vec_chunks << 2;
+  const float scale = inv_rms;
+
+  if (vec_chunks > 0) {
+    int lane = threadIdx.x;
+    if (lane < vec_chunks) {
+      float4 w_curr = bfloat16_to_float4(weight + lane * 4);
+      for (int chunk = lane; chunk < vec_chunks; chunk += blockDim.x) {
+        const bool has_next = (chunk + blockDim.x) < vec_chunks;
+        float4 w_next;
+        if (has_next) {
+          w_next = bfloat16_to_float4(weight + (chunk + blockDim.x) * 4);
+        }
+
+        const int base = chunk * 4;
+        out_slot[base + 0] = x_slot[base + 0] * scale * w_curr.x;
+        out_slot[base + 1] = x_slot[base + 1] * scale * w_curr.y;
+        out_slot[base + 2] = x_slot[base + 2] * scale * w_curr.z;
+        out_slot[base + 3] = x_slot[base + 3] * scale * w_curr.w;
+
+        if (has_next) {
+          w_curr = w_next;
+        }
+      }
+    }
+  }
+
+  for (int j = tail_start + threadIdx.x; j < hidden_dim; j += blockDim.x) {
     float w = bfloat16_to_float(weight[j]);
-    out_slot[j] = x_slot[j] * inv_rms * w;
+    out_slot[j] = x_slot[j] * scale * w;
   }
 }
 
@@ -918,11 +949,20 @@ __global__ void exclusive_prefix_sum_small_kernel(const int *counts, int *offset
 
 // Optimized vectorized bfloat16 to float conversion
 __device__ __forceinline__ float4 bfloat16_to_float4(const hip_bfloat16 *bf16_ptr) {
+  union BF16Pair {
+    unsigned int raw;
+    hip_bfloat16 vals[2];
+  } p0, p1;
+
+  const unsigned int *packed32 = reinterpret_cast<const unsigned int*>(bf16_ptr);
+  p0.raw = packed32[0];
+  p1.raw = packed32[1];
+
   float4 result;
-  result.x = bfloat16_to_float(bf16_ptr[0]);
-  result.y = bfloat16_to_float(bf16_ptr[1]);
-  result.z = bfloat16_to_float(bf16_ptr[2]);
-  result.w = bfloat16_to_float(bf16_ptr[3]);
+  result.x = bfloat16_to_float(p0.vals[0]);
+  result.y = bfloat16_to_float(p0.vals[1]);
+  result.z = bfloat16_to_float(p1.vals[0]);
+  result.w = bfloat16_to_float(p1.vals[1]);
   return result;
 }
 
@@ -1381,10 +1421,37 @@ __global__ void rmsnorm_final_batched_kernel(float *x, const hip_bfloat16 *weigh
     float inv_rms = 1.0f / sqrtf(s_reduce[0] / hidden_dim + 1e-5f);
     __syncthreads();
 
-    // Apply normalization and weight in-place
-    for (int j = threadIdx.x; j < hidden_dim; j += blockDim.x) {
+    const int vec_chunks = hidden_dim >> 2;
+    const int tail_start = vec_chunks << 2;
+    const float scale = inv_rms;
+
+    if (vec_chunks > 0) {
+        int lane = threadIdx.x;
+        if (lane < vec_chunks) {
+            float4 w_curr = bfloat16_to_float4(weight + lane * 4);
+            for (int chunk = lane; chunk < vec_chunks; chunk += blockDim.x) {
+                const bool has_next = (chunk + blockDim.x) < vec_chunks;
+                float4 w_next;
+                if (has_next) {
+                    w_next = bfloat16_to_float4(weight + (chunk + blockDim.x) * 4);
+                }
+
+                const int base = chunk * 4;
+                x_slot[base + 0] = x_slot[base + 0] * scale * w_curr.x;
+                x_slot[base + 1] = x_slot[base + 1] * scale * w_curr.y;
+                x_slot[base + 2] = x_slot[base + 2] * scale * w_curr.z;
+                x_slot[base + 3] = x_slot[base + 3] * scale * w_curr.w;
+
+                if (has_next) {
+                    w_curr = w_next;
+                }
+            }
+        }
+    }
+
+    for (int j = tail_start + threadIdx.x; j < hidden_dim; j += blockDim.x) {
         float w = bfloat16_to_float(weight[j]);
-        x_slot[j] = x_slot[j] * inv_rms * w;
+        x_slot[j] = x_slot[j] * scale * w;
     }
 }
 
