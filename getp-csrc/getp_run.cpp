@@ -1564,30 +1564,122 @@ __global__ void topk_softmax_batched_kernel_float(const float *router_scores,
                                                   const int *slot_ids, int batch) {
   int b = blockIdx.x;
   if (b >= batch) return;
-  if (threadIdx.x != 0) return;
+
+  constexpr int kMax = 8;
+  if (k <= 0) return;
+
   int sid = slot_ids[b];
   const float *scores = router_scores + (size_t)sid * (size_t)score_stride;
   float *topv_s = topv + (size_t)sid * (size_t)topk_stride;
   int   *topi_s = topi + (size_t)sid * (size_t)topk_stride;
-  // init
-  for (int i = 0; i < k; ++i) { topv_s[i] = -INFINITY; topi_s[i] = -1; }
-  // top-k selection
-  for (int j = 0; j < n; ++j) {
-    float v = scores[j];
+
+  if (k > kMax) {
+    if (threadIdx.x == 0) {
+      for (int i = 0; i < k; ++i) { topv_s[i] = -INFINITY; topi_s[i] = -1; }
+      for (int j = 0; j < n; ++j) {
+        float v = scores[j];
+        int pos = -1;
+        for (int t = 0; t < k; ++t) { if (v > topv_s[t]) { pos = t; break; } }
+        if (pos >= 0) {
+          for (int t = k - 1; t > pos; --t) {
+            topv_s[t] = topv_s[t - 1];
+            topi_s[t] = topi_s[t - 1];
+          }
+          topv_s[pos] = v;
+          topi_s[pos] = j;
+        }
+      }
+      float maxv = topv_s[0];
+      for (int i = 1; i < k; ++i) maxv = fmaxf(maxv, topv_s[i]);
+      float sum = 0.0f;
+      for (int i = 0; i < k; ++i) {
+        float ev = (topv_s[i] == -INFINITY) ? 0.0f : __expf(topv_s[i] - maxv);
+        topv_s[i] = ev;
+        sum += ev;
+      }
+      float inv = 1.0f / (sum + 1e-8f);
+      for (int i = 0; i < k; ++i) topv_s[i] *= inv;
+    }
+    return;
+  }
+
+  int tid = threadIdx.x;
+  float local_v[kMax];
+  int local_i[kMax];
+  for (int i = 0; i < k; ++i) {
+    local_v[i] = -INFINITY;
+    local_i[i] = -1;
+  }
+
+  for (int idx = tid; idx < n; idx += blockDim.x) {
+    float v = scores[idx];
     int pos = -1;
-    for (int t = 0; t < k; ++t) { if (v > topv_s[t]) { pos = t; break; } }
+    for (int t = 0; t < k; ++t) {
+      if (v > local_v[t]) { pos = t; break; }
+    }
     if (pos >= 0) {
-      for (int t = k - 1; t > pos; --t) { topv_s[t] = topv_s[t - 1]; topi_s[t] = topi_s[t - 1]; }
-      topv_s[pos] = v; topi_s[pos] = j;
+      for (int t = k - 1; t > pos; --t) {
+        local_v[t] = local_v[t - 1];
+        local_i[t] = local_i[t - 1];
+      }
+      local_v[pos] = v;
+      local_i[pos] = idx;
     }
   }
-  // softmax over top-k
-  float maxv = topv_s[0];
-  for (int i = 1; i < k; ++i) if (topv_s[i] > maxv) maxv = topv_s[i];
-  float sum = 0.0f;
-  for (int i = 0; i < k; ++i) { topv_s[i] = expf(topv_s[i] - maxv); sum += topv_s[i]; }
-  float inv = 1.0f / sum;
-  for (int i = 0; i < k; ++i) topv_s[i] *= inv;
+
+  extern __shared__ unsigned char smem[];
+  float *shared_vals = reinterpret_cast<float*>(smem);
+  int *shared_idx = reinterpret_cast<int*>(shared_vals + (size_t)blockDim.x * (size_t)k);
+
+  for (int t = 0; t < k; ++t) {
+    size_t write = (size_t)tid * (size_t)k + (size_t)t;
+    if (write < (size_t)blockDim.x * (size_t)k) {
+      shared_vals[write] = local_v[t];
+      shared_idx[write] = local_i[t];
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    for (int i = 0; i < k; ++i) {
+      topv_s[i] = -INFINITY;
+      topi_s[i] = -1;
+    }
+    int total = blockDim.x * k;
+    for (int idx = 0; idx < total; ++idx) {
+      float v = shared_vals[idx];
+      int id = shared_idx[idx];
+      if (id < 0) continue;
+      int pos = -1;
+      for (int t = 0; t < k; ++t) {
+        if (v > topv_s[t]) { pos = t; break; }
+      }
+      if (pos >= 0) {
+        for (int t = k - 1; t > pos; --t) {
+          topv_s[t] = topv_s[t - 1];
+          topi_s[t] = topi_s[t - 1];
+        }
+        topv_s[pos] = v;
+        topi_s[pos] = id;
+      }
+    }
+
+    float maxv = topv_s[0];
+    for (int i = 1; i < k; ++i) {
+      maxv = fmaxf(maxv, topv_s[i]);
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < k; ++i) {
+      float ev = (topv_s[i] == -INFINITY) ? 0.0f : __expf(topv_s[i] - maxv);
+      topv_s[i] = ev;
+      sum += ev;
+    }
+    float inv = 1.0f / (sum + 1e-8f);
+    for (int i = 0; i < k; ++i) {
+      topv_s[i] *= inv;
+    }
+  }
 }
 
 // Gather per-slot top-k into flattened [batch*k] lists
@@ -1725,16 +1817,27 @@ void paged_flash_attention_kernel_batched(
         const int cp = (t <= pos) ? cache_data->get_cache_position(sid, layer, t, pos) : -1;
         sColPos[tx] = cp;
         hip_bfloat16 *k_base = nullptr;
+        hip_bfloat16 *v_base = nullptr;
         if (cp >= 0) {
           k_base = cache_data->get_key_token_ptr(sid, layer, cp);
           if (k_base != nullptr) {
             k_base += head_base;
           }
+          hip_bfloat16 *value_ptr = cache_data->get_value_token_ptr(sid, layer, cp);
+          if (value_ptr != nullptr) {
+            v_base = value_ptr + head_base;
+          }
         }
         sKeyPtrs[tx] = k_base;
+        if (col < att_storage) {
+          shared_value_ptr[col] = v_base;
+        }
       } else {
         sColPos[tx] = -1;
         sKeyPtrs[tx] = nullptr;
+        if (col < att_storage) {
+          shared_value_ptr[col] = nullptr;
+        }
       }
     }
     __syncthreads();
@@ -1790,6 +1893,7 @@ void paged_flash_attention_kernel_batched(
   if (threadIdx.x == 0 && (pos + 1) < seq_len && s_att_len < layer_capacity + 1) {
     size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
     shared_att_paged[s_att_len] = bfloat16_to_float(attn_sinks[sink_idx]);
+    shared_value_ptr[s_att_len] = nullptr;
     s_att_len++;
   }
   __syncthreads();
@@ -1828,7 +1932,7 @@ void paged_flash_attention_kernel_batched(
   float local_sum = 0.0f;
   for (int i = threadIdx.x; i < len; i += blockDim.x) {
     float v = shared_att_paged[i];
-    v = (v == -INFINITY) ? 0.0f : expf(v - max_val);
+    v = (v == -INFINITY) ? 0.0f : __expf(v - max_val);
     shared_att_paged[i] = v;
     local_sum += v;
   }
@@ -1860,32 +1964,14 @@ void paged_flash_attention_kernel_batched(
   }
   __syncthreads();
 
-  for (int idx = threadIdx.x; idx < len; idx += blockDim.x) {
-    hip_bfloat16 *ptr = nullptr;
-    if (idx < att_len) {
-      const int t = start_pos + idx;
-      const int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
-      if (cache_pos >= 0) {
-        hip_bfloat16 *base = cache_data->get_value_token_ptr(sid, layer, cache_pos);
-        if (base != nullptr) {
-          ptr = base + head_base;
-        }
-      }
-    }
-    shared_value_ptr[idx] = ptr;
-  }
-  __syncthreads();
-
   for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
     float acc = 0.0f;
     for (int idx = 0; idx < len; ++idx) {
-      const int t = start_pos + idx;
       const float p = shared_att_paged[idx];
-      if (t <= pos && p > 0.0f) {
-        const hip_bfloat16 *v_ptr = shared_value_ptr[idx];
-        if (v_ptr != nullptr) {
-          acc += p * bfloat16_to_float(v_ptr[i]);
-        }
+      if (p <= 0.0f) continue;
+      const hip_bfloat16 *v_ptr = shared_value_ptr[idx];
+      if (v_ptr != nullptr) {
+        acc = fmaf(p, bfloat16_to_float(v_ptr[i]), acc);
       }
     }
     output[i] = acc;
@@ -2950,8 +3036,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         p->n_experts, hidden_dim, batch, Bpad, p->n_experts,
         leader->d_slot_ids, leader->batch_stream);
       
-      dim3 grid_topk(batch), block_topk(1);
-      topk_softmax_batched_kernel_float<<<grid_topk, block_topk, 0, leader->batch_stream>>>(
+      dim3 grid_topk(batch), block_topk(128);
+      size_t shared_topk = (size_t)block_topk.x * (size_t)p->experts_per_token * (sizeof(float) + sizeof(int));
+      topk_softmax_batched_kernel_float<<<grid_topk, block_topk, shared_topk, leader->batch_stream>>>(
         leader->state.router_score, p->n_experts, p->experts_per_token,
         leader->state.topk_v, leader->state.topk_i,
         p->n_experts, p->experts_per_token,
