@@ -408,7 +408,7 @@ typedef struct {
   int   *sel_eids;        // [max_batch * experts_per_token]
   float *sel_w;           // [max_batch * experts_per_token]
   float *mlp1_out_all;    // [max_batch * experts_per_token][2 * intermediate_dim]
-  float *gate_up_all;     // [max_batch * experts_per_token][intermediate_dim]
+  hip_bfloat16 *gate_up_all; // BF16 MoE activations packed row-major as [intermediate_dim][Bpad_total]
   int   *eid_counts;         // [n_experts]
   int   *eid_cursors;        // [n_experts] for scatter
   // --- New: Block-aligned MoE staging for MLP1 ---
@@ -1462,7 +1462,7 @@ __global__ void iota_kernel(int* a, int n) {
 // Fused GEMM (W_mlp1 * Xpack) + bias + SwiGLU + scatter to gate_up_all.
 // - W_packed: BF16 packed 16x16 tiles (Mpad x Kpad), Mout = 2*I
 // - Xpack:    FP32 [K x Bpad], ta xử lý Be cột liên tiếp (đã align BLOCK_B)
-// - gate_up_out: FP32 [B_global x I] (ở đây ta scatter theo "column id" toàn cục)
+// - gate_up_out: BF16 [B_global x I] (ở đây ta scatter theo "column id" toàn cục)
 // - slot_ids: ánh xạ cột local (0..Be-1) -> column id toàn cục (d_col_ids + c0)
 // Mỗi block: 64 threads (16x4) tính 1 tile 16x16 (M x N).
 // Grouped variant: handle all experts in a single launch by selecting the expert per 16-column block.
@@ -1471,11 +1471,11 @@ __global__ __launch_bounds__(64)
 void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
     const hip_bfloat16* __restrict__ W_packed_all,   // [n_layers*n_experts][Mpad*Kpad]
     const hip_bfloat16* __restrict__ Xpack,          // [K x Bpad_total] BF16, columns are globally sorted/padded
-    float*              __restrict__ gate_up_out,    // [Btotal x I] FP32, scatter by global column id
+    hip_bfloat16*       __restrict__ gate_up_out,    // [I x Bpad_total] BF16 row-major (row stride = Bpad_total)
     const hip_bfloat16* __restrict__ bias_all,       // [n_layers*n_experts][Mout]
     // Logical sizes
     int Mout, int K, int Btotal, int Bpad_total,
-    int out_stride,                                   // I = Mout/2
+    int out_stride_cols,                              // leading dimension across columns (Bpad_total)
     const int* __restrict__ d_col_ids,               // [Btotal] global column ids (iota)
     // Mapping from 16-col block -> expert id
     const int* __restrict__ block_expert_ids,        // [Bpad_total/BLOCK_B]
@@ -1607,7 +1607,8 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
   const int   I     = Mout >> 1;
 
   const int col_id = d_col_ids[col];
-  float* out_base  = gate_up_out + (size_t)col_id * (size_t)out_stride;
+
+  const int row_stride = out_stride_cols;
 
   #pragma unroll
   for (int iter = 0; iter < 2; ++iter) {     // even/odd pairs within this thread
@@ -1627,7 +1628,9 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
       gate *= (1.f / (1.f + __expf(-alpha * gate)));
       const int row_half = r >> 1;
       if (row_half < I) {
-        out_base[row_half] = gate * (up + 1.f);
+        float fused = gate * (up + 1.f);
+        hip_bfloat16* row_base = gate_up_out + (size_t)row_half * (size_t)row_stride;
+        row_base[col_id] = float_to_bfloat16(fused);
       }
     }
   }
@@ -1643,7 +1646,7 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
 __global__ __launch_bounds__(64)
 void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
     float* __restrict__ x,                    // [slots][hidden_dim] — destination (residual fused)
-    const float* __restrict__ gate_up_all,    // [Btotal][intermediate_dim]
+    const hip_bfloat16* __restrict__ gate_up_all, // BF16 inputs packed row-major [intermediate_dim][Bpad_total]
     const hip_bfloat16* __restrict__ w_packed_mlp2,
     const hip_bfloat16* __restrict__ b_mlp2,
     const int*   __restrict__ sorted_sids,
@@ -1652,6 +1655,7 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
     const int*   __restrict__ sorted_indices,
     int Btotal,
     int hidden_dim, int intermediate_dim,
+    int gate_stride,
     int layer, int n_experts,
     int x_stride,
     int Mpad, int Kpad,
@@ -1668,6 +1672,7 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
   const int col0 = block_b * 16;
   const int Btotal_live = *total_post_pad_ptr;
   const int Bpad_live   = ((Btotal_live + 15) / 16) * 16;
+  (void)Btotal;
   if (col0 >= Bpad_live) return;
   const int base_row = tile_m * 16;
 
@@ -1680,8 +1685,8 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
   const hip_bfloat16* __restrict__ W = w_packed_mlp2 + mat_index * per_mat_elems;
   const hip_bfloat16* __restrict__ B = b_mlp2 + mat_index * (size_t)hidden_dim;
 
-  __shared__ __align__(16) hip_bfloat16 sWb[16 * 16];
-  __shared__ __align__(16) float        sX[16 * 16];
+  __shared__ __align__(16) hip_bfloat16 sWb[2][16 * 16];
+  __shared__ __align__(16) hip_bfloat16 sX [2][16 * 16];
   __shared__ __align__(16) float        sBias[16];   // cache bias for this 16-row tile
 
   using float4v = __attribute__((ext_vector_type(4))) float;
@@ -1700,59 +1705,98 @@ void gemm16x16_mlp2_grouped_mfma_matvec_residual_kernel(
     __syncthreads();
   }
 
-  for (int kk = 0; kk < Ktiles; ++kk) {
-    // Load W tile (shared across the 16 selections in this block)
+  // Preload first tile (if any) into buffer 0
+  int curr = 0;
+  if (Ktiles > 0) {
+    const int kk = 0;
     if (lane < 32) {
       const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
       const hip_bfloat16* w_src = W + w_tile_base;
-      reinterpret_cast<u32x4*>(sWb)[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+      reinterpret_cast<u32x4*>(sWb[curr])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
     }
-
-    // Load 16 columns of X for this kk tile: gather one scalar from each selection
-    if (lane < 64) {
-      const int r   = lane % 16;           // K row within tile
-      const int c4  = (lane / 16) * 4;     // column group: 0,4,8,12
-      const int k_row = kk * 16 + r;       // absolute K index
-      float* dst_vec = sX + r * 16 + c4;
-
-      float v0 = 0.f, v1 = 0.f, v2 = 0.f, v3 = 0.f;
+    if (lane < 32) {
+      const int r   = lane & 15;
+      const int h   = lane >> 4;      // 0 or 1
+      const int c8  = h * 8;          // columns 0..7 or 8..15 within tile
+      const int k_row = kk * 16 + r;
+      hip_bfloat16* dst = &sX[curr][r * 16 + c8];
       if (k_row < K) {
-        // Gather from four selections (columns)
-        const int col_0 = col0 + (c4 + 0);
-        const int col_1 = col0 + (c4 + 1);
-        const int col_2 = col0 + (c4 + 2);
-        const int col_3 = col0 + (c4 + 3);
-
-        if (col_0 < Btotal_live) v0 = gate_up_all[(size_t)col_0 * (size_t)intermediate_dim + (size_t)k_row];
-        if (col_1 < Btotal_live) v1 = gate_up_all[(size_t)col_1 * (size_t)intermediate_dim + (size_t)k_row];
-        if (col_2 < Btotal_live) v2 = gate_up_all[(size_t)col_2 * (size_t)intermediate_dim + (size_t)k_row];
-        if (col_3 < Btotal_live) v3 = gate_up_all[(size_t)col_3 * (size_t)intermediate_dim + (size_t)k_row];
+        const int col_base = col0 + c8;
+        const size_t row_offset = (size_t)k_row * (size_t)gate_stride + (size_t)col_base;
+        const int remaining = Btotal_live - col_base;
+        if (remaining >= 8) {
+          const hip_bfloat16* src = gate_up_all + row_offset;
+          reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+        } else {
+          alignas(16) hip_bfloat16 tmp[8];
+          #pragma unroll
+          for (int t = 0; t < 8; ++t) {
+            const int c = col_base + t;
+            tmp[t] = (c < Btotal_live) ? gate_up_all[row_offset + t] : hip_bfloat16(0.0f);
+          }
+          reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(tmp)[0];
+        }
+      } else {
+        reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
       }
-      float4v vpack = {v0, v1, v2, v3};
-      reinterpret_cast<float4v*>(dst_vec)[0] = vpack;
+    }
+    __syncthreads();
+  }
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    int next = curr ^ 1;
+    if (kk + 1 < Ktiles) {
+      if (lane < 32) {
+        const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)(kk + 1)) * (size_t)256;
+        const hip_bfloat16* w_src = W + w_tile_base;
+        reinterpret_cast<u32x4*>(sWb[next])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+      }
+      if (lane < 32) {
+        const int r   = lane & 15;
+        const int h   = lane >> 4;
+        const int c8  = h * 8;
+        const int k_row = (kk + 1) * 16 + r;
+        hip_bfloat16* dst = &sX[next][r * 16 + c8];
+        if (k_row < K) {
+          const int col_base = col0 + c8;
+          const size_t row_offset = (size_t)k_row * (size_t)gate_stride + (size_t)col_base;
+          const int remaining = Btotal_live - col_base;
+          if (remaining >= 8) {
+            const hip_bfloat16* src = gate_up_all + row_offset;
+            reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+          } else {
+            alignas(16) hip_bfloat16 tmp[8];
+            #pragma unroll
+            for (int t = 0; t < 8; ++t) {
+              const int c = col_base + t;
+              tmp[t] = (c < Btotal_live) ? gate_up_all[row_offset + t] : hip_bfloat16(0.0f);
+            }
+            reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(tmp)[0];
+          }
+        } else {
+          reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+        }
+      }
     }
 
-    __syncthreads();
-
-    // Pre-convert four A scalars from BF16 to FP32 in registers and MFMA accumulate
-    const int k0 = ty +  0;  // 0..3
-    const int k1 = ty +  4;  // 4..7
-    const int k2 = ty +  8;  // 8..11
-    const int k3 = ty + 12;  // 12..15
-    float a0 = bfloat16_to_float(sWb[tx*16 + k0]);
-    float a1 = bfloat16_to_float(sWb[tx*16 + k1]);
-    float a2 = bfloat16_to_float(sWb[tx*16 + k2]);
-    float a3 = bfloat16_to_float(sWb[tx*16 + k3]);
-    float b0 = sX[k0*16 + tx];
-    float b1 = sX[k1*16 + tx];
-    float b2 = sX[k2*16 + tx];
-    float b3 = sX[k3*16 + tx];
-    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a0, b0, acc, 0, 0, 0);
-    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a1, b1, acc, 0, 0, 0);
-    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a2, b2, acc, 0, 0, 0);
-    acc = __builtin_amdgcn_mfma_f32_16x16x4f32(a3, b3, acc, 0, 0, 0);
+    // Build MFMA operands from BF16 tiles and accumulate
+    const int kbase = ty * 4;
+    using short4v = __attribute__((ext_vector_type(4))) short;
+    union BF16Bits { hip_bfloat16 b; unsigned short u; } a0, a1, a2, a3, b0, b1, b2, b3;
+    a0.b = sWb[curr][tx*16 + kbase + 0];
+    a1.b = sWb[curr][tx*16 + kbase + 1];
+    a2.b = sWb[curr][tx*16 + kbase + 2];
+    a3.b = sWb[curr][tx*16 + kbase + 3];
+    b0.b = sX[curr][(kbase + 0) * 16 + tx];
+    b1.b = sX[curr][(kbase + 1) * 16 + tx];
+    b2.b = sX[curr][(kbase + 2) * 16 + tx];
+    b3.b = sX[curr][(kbase + 3) * 16 + tx];
+    short4v Areg = {(short)a0.u, (short)a1.u, (short)a2.u, (short)a3.u};
+    short4v Breg = {(short)b0.u, (short)b1.u, (short)b2.u, (short)b3.u};
+    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
 
     __syncthreads();
+    curr = next;
   }
 
   // Helper to access accumulator lanes
@@ -2249,7 +2293,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
             /*dst*/     gpu_ctx->state.gate_up_all,
             /*bias_all*/gpu_ctx->weights.b_mlp1,
             /*sizes*/   Mout, p->hidden_dim, Bmlp1, Bpad_total,
-            /*stride*/  I,
+            /*stride*/  Bpad_total,
             /*col_ids*/ gpu_ctx->state.d_col_ids,
             /*blk→eid*/ gpu_ctx->state.block_expert_ids,
             /*BLOCK_B*/ BLOCK_B,
@@ -2284,6 +2328,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         gpu_ctx->state.sorted_w,
         gpu_ctx->state.sorted_indices,
         Btotal, hidden_dim, p->intermediate_dim,
+        Bpad_total,
         l, p->n_experts, hidden_dim,
         Mpad_mlp2, Kpad_mlp2,
         gpu_ctx->state.padded_offsets + p->n_experts);
@@ -2583,11 +2628,11 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   
   HIP_CHECK(hipMalloc(&s->xpack_bf16, Kmax_xpack * (size_t)Bpad_mlp1 * sizeof(hip_bfloat16)));
   // HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  // HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(float)));
+  // HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(hip_bfloat16)));
 
   // mlp1_out_all is unused in fused path; skip allocation to save memory
   s->mlp1_out_all = nullptr;
-  HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax_pad * (size_t)p->intermediate_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up_all,  (size_t)Bpad_mlp1 * (size_t)p->intermediate_dim * sizeof(hip_bfloat16)));
 
   // --- New: block-aligned staging buffers ---
   HIP_CHECK(hipMalloc(&s->sorted_indices,   Mmax_pad * sizeof(int)));
