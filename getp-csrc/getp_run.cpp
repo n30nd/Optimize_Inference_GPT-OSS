@@ -570,36 +570,34 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias(
   const int base_row = tile_m * 16;
   const int base_col = tile_n * 16;
 
-  const int Ktiles = (Kpad + 15) / 16;
-  const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+  const int tilesPerRow = (Kpad + 15) >> 4;
+  const int Ktiles = tilesPerRow;
 
-  __shared__ __align__(16) hip_bfloat16 sWb[2][16 * 16];
   __shared__ __align__(16) hip_bfloat16 sXb[2][16 * 16];
+  __shared__ int sSlotIds[16];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
+  using short4v = __attribute__((ext_vector_type(4))) short;
+
   float4v dmn = {0.f, 0.f, 0.f, 0.f};
 
-  // Preload first tile into buffer 0
+  const size_t w_tile_group_offset = (size_t)tile_m * (size_t)tilesPerRow * (size_t)256;
+
+  // Preload first X tile into shared memory buffer 0
   int curr = 0;
   {
     const int kk = 0;
     if (lane < 32) {
-      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
-      const hip_bfloat16* w_src = W_packed + w_tile_base;
-      reinterpret_cast<u32x4*>(sWb[curr])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
-    }
-    if (lane < 32) {
-      const int r   = lane % 16;
-      const int h   = lane / 16;  // 0 or 1
-      const int c8  = h * 8;      // columns 0..7 or 8..15
+      const int r   = lane & 15;
+      const int h   = lane >> 4;   // 0 or 1
+      const int c8  = h * 8;       // columns 0..7 or 8..15
       const int k_row = kk * 16 + r;
-      const bool in_k = (k_row < K);
-      hip_bfloat16* dst = &sXb[curr][0] + r * 16 + c8;
-      if (in_k) {
+      hip_bfloat16* dst_tile = &sXb[curr][0] + r * 16 + c8;
+      if (k_row < K) {
         const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
-        reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+        reinterpret_cast<u32x4*>(dst_tile)[0] = reinterpret_cast<const u32x4*>(src)[0];
       } else {
-        reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+        reinterpret_cast<u32x4*>(dst_tile)[0] = u32x4{0u, 0u, 0u, 0u};
       }
     }
     __syncthreads();
@@ -607,52 +605,61 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias(
 
   for (int kk = 0; kk < Ktiles; ++kk) {
     const int next = curr ^ 1;
-    // Prefetch next tile
+
+    // Prefetch next X tile while computing on current buffer
     if (kk + 1 < Ktiles) {
       if (lane < 32) {
-        const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)(kk + 1)) * (size_t)256;
-        const hip_bfloat16* w_src = W_packed + w_tile_base;
-        reinterpret_cast<u32x4*>(sWb[next])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
-      }
-      if (lane < 32) {
-        const int r   = lane % 16;
-        const int h   = lane / 16;  // 0 or 1
-        const int c8  = h * 8;      // columns 0..7 or 8..15
+        const int r   = lane & 15;
+        const int h   = lane >> 4;
+        const int c8  = h * 8;
         const int k_row = (kk + 1) * 16 + r;
-        const bool in_k = (k_row < K);
-        hip_bfloat16* dst = &sXb[next][0] + r * 16 + c8;
-        if (in_k) {
+        hip_bfloat16* dst_tile = &sXb[next][0] + r * 16 + c8;
+        if (k_row < K) {
           const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
-          reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+          reinterpret_cast<u32x4*>(dst_tile)[0] = reinterpret_cast<const u32x4*>(src)[0];
         } else {
-          reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+          reinterpret_cast<u32x4*>(dst_tile)[0] = u32x4{0u, 0u, 0u, 0u};
         }
       }
     }
 
-    // Compute on current tile
-    {
-      const int kbase = ty * 4;  // 4 BF16s per operand per lane
-      using short4v = __attribute__((ext_vector_type(4))) short;
-      union UB { hip_bfloat16 b; unsigned short u; } u0, u1, u2, u3;
-      short4v Areg, Breg;
-      u0.b = sWb[curr][tx * 16 + (kbase + 0)]; u1.b = sWb[curr][tx * 16 + (kbase + 1)];
-      u2.b = sWb[curr][tx * 16 + (kbase + 2)]; u3.b = sWb[curr][tx * 16 + (kbase + 3)];
-      Areg.x = (short)u0.u; Areg.y = (short)u1.u; Areg.z = (short)u2.u; Areg.w = (short)u3.u;
-      u0.b = sXb[curr][(kbase + 0) * 16 + tx]; u1.b = sXb[curr][(kbase + 1) * 16 + tx];
-      u2.b = sXb[curr][(kbase + 2) * 16 + tx]; u3.b = sXb[curr][(kbase + 3) * 16 + tx];
-      Breg.x = (short)u0.u; Breg.y = (short)u1.u; Breg.z = (short)u2.u; Breg.w = (short)u3.u;
-      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, dmn, 0, 0, 0);
-    }
+    const hip_bfloat16* w_tile = W_packed + w_tile_group_offset + (size_t)kk * (size_t)256;
+    const unsigned short* w_base = reinterpret_cast<const unsigned short*>(w_tile);
+    const int kbase = ty * 4;  // 4 BF16s per operand per lane
+    const int w_idx = tx * 16 + kbase;
 
-    __syncthreads();
-    curr = next;
+    short4v Areg;
+    Areg.x = static_cast<short>(w_base[w_idx + 0]);
+    Areg.y = static_cast<short>(w_base[w_idx + 1]);
+    Areg.z = static_cast<short>(w_base[w_idx + 2]);
+    Areg.w = static_cast<short>(w_base[w_idx + 3]);
+
+    const unsigned short* x_base = reinterpret_cast<const unsigned short*>(sXb[curr]);
+    const int x_idx = kbase * 16 + tx;
+
+    short4v Breg;
+    Breg.x = static_cast<short>(x_base[x_idx + 0 * 16]);
+    Breg.y = static_cast<short>(x_base[x_idx + 1 * 16]);
+    Breg.z = static_cast<short>(x_base[x_idx + 2 * 16]);
+    Breg.w = static_cast<short>(x_base[x_idx + 3 * 16]);
+
+    dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, dmn, 0, 0, 0);
+
+    if (kk + 1 < Ktiles) {
+      __syncthreads();
+      curr = next;
+    }
   }
 
   // Epilogue: add bias and scatter store
   const int col = base_col + tx;
+  if (ty == 0) {
+    sSlotIds[tx] = (col < B) ? slot_ids[col] : 0;
+  }
+  __syncthreads();
+
   if (col < B) {
-    const int sid = slot_ids[col];
+    const int sid = sSlotIds[tx];
     float* out_s = dst + (size_t)sid * (size_t)out_stride;
     // Each thread writes 4 rows: row = base_row + (ty*4 + i)
     #pragma unroll
