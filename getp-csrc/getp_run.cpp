@@ -891,8 +891,25 @@ void paged_flash_attention_kernel_batched(
     if (cache_base < 0) cache_base = 0;
   }
 
-  extern __shared__ float shared_att_paged[];
+  const int att_slots = layer_capacity + 1;
+  extern __shared__ unsigned char smem_raw[];
+  float *shared_att_paged = reinterpret_cast<float*>(smem_raw);
+  short *shared_q_bf16 = reinterpret_cast<short*>(shared_att_paged + att_slots);
+
+  const int head_dim_aligned = round_up16(head_dim);
+  for (int idx = threadIdx.x; idx < head_dim_aligned; idx += blockDim.x) {
+    short q_short = 0;
+    if (idx < head_dim) {
+      union { hip_bfloat16 b; unsigned short u; } uq;
+      uq.b = float_to_bfloat16(q_head[idx]);
+      q_short = static_cast<short>(uq.u);
+    }
+    shared_q_bf16[idx] = q_short;
+  }
+  __syncthreads();
+
   __shared__ int s_att_len;
+  __shared__ float s_softmax_stats[2];
   if (threadIdx.x == 0) s_att_len = att_len;
   __syncthreads();
 
@@ -908,7 +925,6 @@ void paged_flash_attention_kernel_batched(
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   using short4v = __attribute__((ext_vector_type(4))) short;
-  __shared__ short sQbf16[16];       // Q tile (16 bf16 packed to i16)
   __shared__ int   sColPos[16];      // cache positions for 16 tokens in this tile (-1 if invalid)
 
   for (int col0 = 0; col0 < att_len; col0 += 16) {
@@ -929,27 +945,15 @@ void paged_flash_attention_kernel_batched(
     float4v acc = {0.f, 0.f, 0.f, 0.f};
     const int Ktiles = (head_dim + 15) / 16;
     for (int kk = 0; kk < Ktiles; ++kk) {
-      if (ty == 0 && tx < 16) {
-        const int k_row = kk * 16 + tx;
-        unsigned short qbits = 0u;
-        if (k_row < head_dim) {
-          union { hip_bfloat16 b; unsigned short u; } uq;
-          uq.b = float_to_bfloat16(q_head[k_row]);
-          qbits = uq.u;
-        }
-        sQbf16[tx] = (short)qbits;
-      }
-      __syncthreads();
-
       const int kbase = ty * 4;
       short4v Areg, Breg;
       #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const int kij = kbase + j;
-        Areg[j] = (tx == kij) ? sQbf16[kij] : (short)0;
+        const int k_abs = kk * 16 + kij;
+        Areg[j] = (tx == kij && k_abs < head_dim) ? shared_q_bf16[k_abs] : (short)0;
         short kval = 0;
         const int cp = sColPos[tx];
-        const int k_abs = kk * 16 + kij;
         if (cp >= 0 && k_abs < head_dim) {
           const hip_bfloat16 *kb = key_head + (size_t)cp * (size_t)kv_dim + (size_t)k_abs;
           union { hip_bfloat16 b; unsigned short u; } uk;
@@ -960,7 +964,6 @@ void paged_flash_attention_kernel_batched(
       }
 
       acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
-      __syncthreads();
     }
 
     float partial = acc.x + acc.y + acc.z + acc.w;
@@ -984,54 +987,40 @@ void paged_flash_attention_kernel_batched(
   __syncthreads();
   const int len = s_att_len;
 
-  float local_max = -INFINITY;
+  float thread_max = -INFINITY;
   for (int i = threadIdx.x; i < len; i += blockDim.x) {
-    local_max = fmaxf(local_max, shared_att_paged[i]);
+    thread_max = fmaxf(thread_max, shared_att_paged[i]);
   }
-  const int W = 64;
-  for (int offset = W/2; offset > 0; offset >>= 1) {
-    float other = __shfl_down(local_max, offset, W);
-    local_max = fmaxf(local_max, other);
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    float other = __shfl_down(thread_max, offset, 64);
+    thread_max = fmaxf(thread_max, other);
   }
-  __shared__ float warp_max[4];
-  const int lane = threadIdx.x & (W-1);
-  const int wid  = threadIdx.x / W;
-  if (lane == 0) warp_max[wid] = local_max;
-  __syncthreads();
-  float max_val = -INFINITY;
-  if (wid == 0) {
-    int warps = blockDim.x / W;
-    float val = (lane < warps) ? warp_max[lane] : -INFINITY;
-    for (int offset = W/2; offset > 0; offset >>= 1) val = fmaxf(val, __shfl_down(val, offset, W));
-    if (lane == 0) warp_max[0] = val;
+  if ((threadIdx.x & 63) == 0) {
+    s_softmax_stats[0] = thread_max;
   }
   __syncthreads();
-  max_val = warp_max[0];
+  const float max_val = s_softmax_stats[0];
 
-  float local_sum = 0.0f;
+  float thread_sum = 0.0f;
   for (int i = threadIdx.x; i < len; i += blockDim.x) {
     float v = shared_att_paged[i];
     v = (v == -INFINITY) ? 0.0f : expf(v - max_val);
     shared_att_paged[i] = v;
-    local_sum += v;
+    thread_sum += v;
   }
-  for (int offset = W/2; offset > 0; offset >>= 1) {
-    local_sum += __shfl_down(local_sum, offset, W);
+  for (int offset = 32; offset > 0; offset >>= 1) {
+    thread_sum += __shfl_down(thread_sum, offset, 64);
   }
-  __shared__ float warp_sum[4];
-  if (lane == 0) warp_sum[wid] = local_sum;
-  __syncthreads();
-  float sum_val = 0.0f;
-  if (wid == 0) {
-    int warps = blockDim.x / W;
-    float val = (lane < warps) ? warp_sum[lane] : 0.0f;
-    for (int offset = W/2; offset > 0; offset >>= 1) val += __shfl_down(val, offset, W);
-    if (lane == 0) warp_sum[0] = val;
+  if ((threadIdx.x & 63) == 0) {
+    s_softmax_stats[1] = thread_sum;
   }
   __syncthreads();
-  sum_val = warp_sum[0];
-  const float inv_sum = 1.0f / (sum_val + 1e-8f);
+  float inv_sum = 1.0f / (s_softmax_stats[1] + 1e-8f);
+  if ((threadIdx.x & 63) == 0) {
+    s_softmax_stats[1] = inv_sum;
+  }
   __syncthreads();
+  inv_sum = s_softmax_stats[1];
   for (int i = threadIdx.x; i < len; i += blockDim.x) {
     shared_att_paged[i] *= inv_sum;
   }
@@ -1971,6 +1960,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       }
       // Allocate +1 element to store optional attention sink (baseline behavior) even for sliding-window layers.
       size_t shared_mem_bytes = (size_t)(max_attention_length + 1) * sizeof(float);
+      shared_mem_bytes += (size_t)round_up16(head_dim) * sizeof(short);
 
       // Use the new paged attention kernel that handles different layer types
       paged_flash_attention_kernel_batched<<<grid, block, shared_mem_bytes, gpu_ctx->batch_stream>>>(
