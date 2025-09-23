@@ -510,23 +510,26 @@ typedef struct {
   int tp_size;
   int dp_rank;
   int dp_size;
-  int ep_rank;
-  int ep_size;
   int head_offset_q;
   int head_offset_kv;
-  int expert_offset;
+  int moe_row_offset;
+  int moe_col_offset;
   int local_q_heads;
   int local_kv_heads;
-  int local_experts;
+  int local_moe_dim;
+  int local_mlp1_out_dim;
   int local_q_dim;
   int local_kv_dim;
   int local_qkv_dim;
+  int n_experts;
   bool is_leader;
   GPUTransformerWeights weights;
   GPURunState state;
   int max_batch; // number of concurrent slots per GPU for continuous batching
   hipStream_t batch_stream;              // shared stream for batched ops
   hipEvent_t batch_event;
+  hipStream_t comm_stream;              // high priority stream for inter-GPU copies
+  hipEvent_t comm_event;                // signals comm_stream completions
   // Staging device buffers for batched indices and positions
   int *d_slot_ids;
   int *d_pos_list;
@@ -1163,6 +1166,28 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
       }
     }
   }
+}
+
+__global__ void add_mlp2_bias_selected_kernel(
+    float* __restrict__ e_agg,
+    const hip_bfloat16* __restrict__ b_mlp2,
+    const int* __restrict__ sel_sids,
+    const int* __restrict__ sel_eids,
+    const float* __restrict__ sel_w,
+    int selections_M,
+    int hidden_dim,
+    int layer,
+    int n_experts,
+    int stride) {
+  int hid = blockIdx.x * blockDim.x + threadIdx.x;
+  int sel = blockIdx.y;
+  if (hid >= hidden_dim || sel >= selections_M) return;
+  int sid = sel_sids[sel];
+  int eid = sel_eids[sel];
+  if (eid < 0 || eid >= n_experts) return;
+  const hip_bfloat16 *bias_row = b_mlp2 + ((size_t)layer * (size_t)n_experts + (size_t)eid) * (size_t)hidden_dim;
+  float contrib = bfloat16_to_float(bias_row[hid]) * sel_w[sel];
+  atomicAdd(&e_agg[(size_t)sid * (size_t)stride + (size_t)hid], contrib);
 }
 
 // ========================= FLOAT KERNELS =========================
@@ -2166,8 +2191,14 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   size_t router_b_elems = (size_t)n_layers * (size_t)n_experts;
   copy_array(cpu_w->b_router, &gpu_w->b_router, router_b_elems, "b_router");
 
-  // MoE shards
-  size_t mlp1_local_elems = (size_t)n_layers * (size_t)ctx->local_experts * 2 * (size_t)intermediate_dim * (size_t)hidden_dim;
+  // MoE shards (tensor-parallel over intermediate dimension)
+  int local_moe_dim = ctx->local_moe_dim;
+  int local_mlp1_out = ctx->local_mlp1_out_dim;
+  int moe_row_offset = ctx->moe_row_offset;
+  int moe_col_offset = ctx->moe_col_offset;
+  int local_expert_count = ctx->n_experts;
+
+  size_t mlp1_local_elems = (size_t)n_layers * (size_t)local_expert_count * (size_t)local_mlp1_out * (size_t)hidden_dim;
   size_t mlp1_blocks = (mlp1_local_elems + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
   size_t mlp1_data_bytes = (mlp1_local_elems + 1) / 2;
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&gpu_w->w_mlp1_data), mlp1_data_bytes));
@@ -2179,24 +2210,27 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   size_t per_expert_mlp1 = 2 * (size_t)intermediate_dim * (size_t)hidden_dim;
   for (int l = 0; l < n_layers; ++l) {
     const float *layer_base = cpu_w->w_mlp1 + (size_t)l * (size_t)n_experts * per_expert_mlp1;
-    const float *segment = layer_base + (size_t)ctx->expert_offset * per_expert_mlp1;
-    size_t count = (size_t)ctx->local_experts * per_expert_mlp1;
-    quantize_segment(segment, count, mlp1_offset, gpu_w->w_mlp1_data, gpu_w->w_mlp1_scales);
-    mlp1_offset += count;
+    for (int e = 0; e < local_expert_count; ++e) {
+      const float *expert_base = layer_base + (size_t)e * per_expert_mlp1;
+      const float *segment = expert_base + (size_t)moe_row_offset * (size_t)hidden_dim;
+      size_t count = (size_t)local_mlp1_out * (size_t)hidden_dim;
+      quantize_segment(segment, count, mlp1_offset, gpu_w->w_mlp1_data, gpu_w->w_mlp1_scales);
+      mlp1_offset += count;
+    }
   }
   add_log("w_mlp1_shard", mlp1_data_bytes + mlp1_blocks * sizeof(uint8_t));
 
   // Build a tile-packed copy of MXFP4 nibbles for MLP1 to enable coalesced MFMA tiles.
-  // Layout per (layer,eid): rows = out_dim (2*I), cols = hidden_dim.
-  size_t out_dim = (size_t)2 * (size_t)intermediate_dim;
-  size_t Mpad = ((out_dim + 15) / 16) * 16;
+  // Layout per (layer,eid): rows = local_mlp1_out, cols = hidden_dim.
+  size_t out_dim_local = (size_t)local_mlp1_out;
+  size_t Mpad = ((out_dim_local + 15) / 16) * 16;
   size_t Kpad = ((size_t)hidden_dim + 15) / 16 * 16;
-  size_t tiles_m = (out_dim + 15) / 16;
+  size_t tiles_m = (out_dim_local + 15) / 16;
   size_t tiles_k = ((size_t)hidden_dim + 15) / 16;
   size_t packed_tiles_bytes_per_mat = ((Mpad * Kpad) + 1) / 2; // nibble-packed
   size_t scales_entries_per_mat = tiles_m * tiles_k * 16;       // 16 rows per tile
-  size_t scale_blocks_per_mat = ((out_dim * (size_t)hidden_dim) + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
-  size_t total_mats = (size_t)n_layers * (size_t)ctx->local_experts;
+  size_t scale_blocks_per_mat = ((out_dim_local * (size_t)hidden_dim) + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
+  size_t total_mats = (size_t)n_layers * (size_t)local_expert_count;
   size_t total_packed_bytes = total_mats * packed_tiles_bytes_per_mat;
   size_t total_scale_entries = total_mats * scales_entries_per_mat;
   uint8_t *w_mlp1_data_packed = nullptr;
@@ -2209,25 +2243,26 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   // Pack each (layer,eid) matrix independently
   {
     dim3 block(256);
+    size_t bytes_per_mat = ((size_t)local_mlp1_out * (size_t)hidden_dim + 1) / 2;
+    size_t scales_per_mat = ((size_t)local_mlp1_out * (size_t)hidden_dim + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
+    size_t tile_bytes = bytes_per_mat;
+    size_t scale_total_entries = tiles_m * tiles_k * 16;
     for (int l = 0; l < n_layers; ++l) {
-      for (int e = 0; e < ctx->local_experts; ++e) {
-        size_t mat_idx = (size_t)l * (size_t)ctx->local_experts + (size_t)e;
-        size_t rows = out_dim;
+      for (int e = 0; e < local_expert_count; ++e) {
+        size_t mat_idx = (size_t)l * (size_t)local_expert_count + (size_t)e;
+        size_t rows = out_dim_local;
         size_t cols = (size_t)hidden_dim;
-        size_t elems = rows * cols;
-        size_t bytes = (elems + 1) / 2;
-        size_t src_offset_bytes = ((size_t)l * (size_t)ctx->local_experts + (size_t)e) * bytes;
+        size_t src_offset_bytes = ((size_t)l * (size_t)local_expert_count + (size_t)e) * bytes_per_mat;
         size_t dst_offset_bytes = mat_idx * packed_tiles_bytes_per_mat;
-        size_t src_scale_offset = mat_idx * scale_blocks_per_mat;
+        size_t src_scale_offset = ((size_t)l * (size_t)local_expert_count + (size_t)e) * scales_per_mat;
         size_t dst_scale_offset = mat_idx * scales_entries_per_mat;
-        dim3 grid((bytes + block.x - 1) / block.x);
+        dim3 grid((tile_bytes + block.x - 1) / block.x);
         pack_mxfp4_row_to_tile16_kernel<<<grid, block, 0, ws.quant_stream>>>(
           gpu_w->w_mlp1_data + src_offset_bytes,
           w_mlp1_data_packed + dst_offset_bytes,
           rows, cols);
         HIP_CHECK(hipGetLastError());
 
-        size_t scale_total_entries = tiles_m * tiles_k * 16;
         dim3 grid_scale((scale_total_entries + block.x - 1) / block.x);
         pack_mxfp4_scales_row_to_tile16_kernel<<<grid_scale, block, 0, ws.quant_stream>>>(
           gpu_w->w_mlp1_scales + src_scale_offset,
@@ -2249,19 +2284,21 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   gpu_w->w_mlp1_scales = w_mlp1_scales_packed;
   // Associated scale codes now mirror the tile layout: 16 entries per tile (one per row).
 
-  size_t mlp1_bias_elems = (size_t)n_layers * (size_t)ctx->local_experts * 2 * (size_t)intermediate_dim;
+  size_t mlp1_bias_elems = (size_t)n_layers * (size_t)local_expert_count * (size_t)local_mlp1_out;
   HIP_CHECK(hipMalloc(&gpu_w->b_mlp1, mlp1_bias_elems * sizeof(hip_bfloat16)));
   size_t mlp1_bias_offset = 0;
   size_t per_expert_bias = 2 * (size_t)intermediate_dim;
   for (int l = 0; l < n_layers; ++l) {
     const float *layer_base = cpu_w->b_mlp1 + (size_t)l * (size_t)n_experts * per_expert_bias;
-    const float *segment = layer_base + (size_t)ctx->expert_offset * per_expert_bias;
-    copy_fp32_to_bf16(segment, gpu_w->b_mlp1 + mlp1_bias_offset, (size_t)ctx->local_experts * per_expert_bias);
-    mlp1_bias_offset += (size_t)ctx->local_experts * per_expert_bias;
+    for (int e = 0; e < local_expert_count; ++e) {
+      const float *segment = layer_base + (size_t)e * per_expert_bias + (size_t)moe_row_offset;
+      copy_fp32_to_bf16(segment, gpu_w->b_mlp1 + mlp1_bias_offset, (size_t)local_mlp1_out);
+      mlp1_bias_offset += (size_t)local_mlp1_out;
+    }
   }
   add_log("b_mlp1_shard", mlp1_bias_elems * sizeof(hip_bfloat16));
 
-  size_t mlp2_local_elems = (size_t)n_layers * (size_t)ctx->local_experts * (size_t)hidden_dim * (size_t)intermediate_dim;
+  size_t mlp2_local_elems = (size_t)n_layers * (size_t)local_expert_count * (size_t)hidden_dim * (size_t)local_moe_dim;
   size_t mlp2_blocks = (mlp2_local_elems + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
   size_t mlp2_data_bytes = (mlp2_local_elems + 1) / 2;
   HIP_CHECK(hipMalloc(reinterpret_cast<void**>(&gpu_w->w_mlp2_data), mlp2_data_bytes));
@@ -2273,18 +2310,22 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
   size_t per_expert_mlp2 = (size_t)hidden_dim * (size_t)intermediate_dim;
   for (int l = 0; l < n_layers; ++l) {
     const float *layer_base = cpu_w->w_mlp2 + (size_t)l * (size_t)n_experts * per_expert_mlp2;
-    const float *segment = layer_base + (size_t)ctx->expert_offset * per_expert_mlp2;
-    size_t count = (size_t)ctx->local_experts * per_expert_mlp2;
-    quantize_segment(segment, count, mlp2_offset, gpu_w->w_mlp2_data, gpu_w->w_mlp2_scales);
-    mlp2_offset += count;
+    for (int e = 0; e < local_expert_count; ++e) {
+      const float *expert_base = layer_base + (size_t)e * per_expert_mlp2;
+      for (int row = 0; row < hidden_dim; ++row) {
+        const float *segment = expert_base + (size_t)row * (size_t)intermediate_dim + (size_t)moe_col_offset;
+        quantize_segment(segment, (size_t)local_moe_dim, mlp2_offset, gpu_w->w_mlp2_data, gpu_w->w_mlp2_scales);
+        mlp2_offset += (size_t)local_moe_dim;
+      }
+    }
   }
   add_log("w_mlp2_shard", mlp2_data_bytes + mlp2_blocks * sizeof(uint8_t));
 
   // Build a tile-packed copy of MXFP4 nibbles for MLP2 to enable coalesced MFMA tiles.
-  // Layout per (layer,eid): rows = hidden_dim, cols = intermediate_dim.
+  // Layout per (layer,eid): rows = hidden_dim, cols = local_moe_dim.
   {
     size_t rows = (size_t)hidden_dim;
-    size_t cols = (size_t)intermediate_dim;
+    size_t cols = (size_t)local_moe_dim;
     size_t Mpad2 = ((rows + 15) / 16) * 16;
     size_t Kpad2 = ((cols + 15) / 16) * 16;
     size_t tiles_m2 = (rows + 15) / 16;
@@ -2292,7 +2333,7 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
     size_t packed_tiles_bytes_per_mat = ((Mpad2 * Kpad2) + 1) / 2; // nibble-packed
     size_t scales_entries_per_mat = tiles_m2 * tiles_k2 * 16;
     size_t scale_blocks_per_mat = ((rows * cols) + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
-    size_t total_mats = (size_t)n_layers * (size_t)ctx->local_experts;
+    size_t total_mats = (size_t)n_layers * (size_t)local_expert_count;
     size_t total_packed_bytes = total_mats * packed_tiles_bytes_per_mat;
     size_t total_scale_entries = total_mats * scales_entries_per_mat;
     uint8_t *w_mlp2_data_packed = nullptr;
@@ -2303,23 +2344,24 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
     HIP_CHECK(hipMemsetAsync(w_mlp2_scales_packed, 0x7F, total_scale_entries, ws.quant_stream));
 
     dim3 block(256);
+    size_t bytes_per_mat = ((size_t)hidden_dim * (size_t)local_moe_dim + 1) / 2;
+    size_t scales_per_mat = ((size_t)hidden_dim * (size_t)local_moe_dim + MXFP4_BLOCK_SIZE - 1) / MXFP4_BLOCK_SIZE;
+    size_t tile_bytes = bytes_per_mat;
+    size_t scale_total_entries = tiles_m2 * tiles_k2 * 16;
     for (int l = 0; l < n_layers; ++l) {
-      for (int e = 0; e < ctx->local_experts; ++e) {
-        size_t mat_idx = (size_t)l * (size_t)ctx->local_experts + (size_t)e;
-        size_t elems = rows * cols;
-        size_t bytes = (elems + 1) / 2;
-        size_t src_offset_bytes = ((size_t)l * (size_t)ctx->local_experts + (size_t)e) * bytes;
+      for (int e = 0; e < local_expert_count; ++e) {
+        size_t mat_idx = (size_t)l * (size_t)local_expert_count + (size_t)e;
+        size_t src_offset_bytes = ((size_t)l * (size_t)local_expert_count + (size_t)e) * bytes_per_mat;
         size_t dst_offset_bytes = mat_idx * packed_tiles_bytes_per_mat;
-        size_t src_scale_offset = mat_idx * scale_blocks_per_mat;
+        size_t src_scale_offset = ((size_t)l * (size_t)local_expert_count + (size_t)e) * scales_per_mat;
         size_t dst_scale_offset = mat_idx * scales_entries_per_mat;
-        dim3 grid((unsigned int)((bytes + block.x - 1) / block.x));
+        dim3 grid((unsigned int)((tile_bytes + block.x - 1) / block.x));
         pack_mxfp4_row_to_tile16_kernel<<<grid, block, 0, ws.quant_stream>>>(
           gpu_w->w_mlp2_data + src_offset_bytes,
           w_mlp2_data_packed + dst_offset_bytes,
           rows, cols);
         HIP_CHECK(hipGetLastError());
 
-        size_t scale_total_entries = tiles_m2 * tiles_k2 * 16;
         dim3 grid_scale((unsigned int)((scale_total_entries + block.x - 1) / block.x));
         pack_mxfp4_scales_row_to_tile16_kernel<<<grid_scale, block, 0, ws.quant_stream>>>(
           gpu_w->w_mlp2_scales + src_scale_offset,
@@ -2340,14 +2382,13 @@ void gpu_copy_weights(GPUContext *ctx, TransformerWeights *cpu_w, Config *p) {
     // Scales are tile-packed alongside MXFP4 data (16 codes per tile/row slice).
   }
 
-  size_t mlp2_bias_elems = (size_t)n_layers * (size_t)ctx->local_experts * (size_t)hidden_dim;
+  size_t mlp2_bias_elems = (size_t)n_layers * (size_t)local_expert_count * (size_t)hidden_dim;
   HIP_CHECK(hipMalloc(&gpu_w->b_mlp2, mlp2_bias_elems * sizeof(hip_bfloat16)));
   size_t mlp2_bias_offset = 0;
   for (int l = 0; l < n_layers; ++l) {
     const float *layer_base = cpu_w->b_mlp2 + (size_t)l * (size_t)n_experts * (size_t)hidden_dim;
-    const float *segment = layer_base + (size_t)ctx->expert_offset * (size_t)hidden_dim;
-    copy_fp32_to_bf16(segment, gpu_w->b_mlp2 + mlp2_bias_offset, (size_t)ctx->local_experts * (size_t)hidden_dim);
-    mlp2_bias_offset += (size_t)ctx->local_experts * (size_t)hidden_dim;
+    copy_fp32_to_bf16(layer_base, gpu_w->b_mlp2 + mlp2_bias_offset, (size_t)local_expert_count * (size_t)hidden_dim);
+    mlp2_bias_offset += (size_t)local_expert_count * (size_t)hidden_dim;
   }
   add_log("b_mlp2_shard", mlp2_bias_elems * sizeof(hip_bfloat16));
 
@@ -2484,8 +2525,8 @@ void gpu_clone_weights(GPUContext *dst_ctx, GPUContext *src_ctx, Config *p) {
   size_t router_b_elems = (size_t)n_layers * (size_t)n_experts;
   clone_array(&dst->b_router, src->b_router, router_b_elems, "b_router");
 
-  size_t total_expert_mats = (size_t)n_layers * (size_t)dst_ctx->local_experts;
-  size_t mlp1_rows = (size_t)2 * (size_t)intermediate_dim;
+  size_t total_expert_mats = (size_t)n_layers * (size_t)dst_ctx->n_experts;
+  size_t mlp1_rows = (size_t)dst_ctx->local_mlp1_out_dim;
   size_t mlp1_cols = (size_t)hidden_dim;
   size_t mlp1_packed_bytes_per_mat = (round16(mlp1_rows) * round16(mlp1_cols) + 1) / 2;
   size_t mlp1_scales_per_mat = tiles16(mlp1_rows) * tiles16(mlp1_cols) * 16;
@@ -2497,7 +2538,7 @@ void gpu_clone_weights(GPUContext *dst_ctx, GPUContext *src_ctx, Config *p) {
   clone_array(&dst->b_mlp1, src->b_mlp1, mlp1_bias_elems, "b_mlp1_shard");
 
   size_t mlp2_rows = (size_t)hidden_dim;
-  size_t mlp2_cols = (size_t)intermediate_dim;
+  size_t mlp2_cols = (size_t)dst_ctx->local_moe_dim;
   size_t mlp2_packed_bytes_per_mat = (round16(mlp2_rows) * round16(mlp2_cols) + 1) / 2;
   size_t mlp2_scales_per_mat = tiles16(mlp2_rows) * tiles16(mlp2_cols) * 16;
   size_t mlp2_total_bytes = total_expert_mats * mlp2_packed_bytes_per_mat;
@@ -2569,10 +2610,10 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
   auto wait_batch_event_host = [&](GPUContext *ctx) {
     HIP_CHECK(hipEventSynchronize(ctx->batch_event));
   };
-  auto stream_wait_on = [&](GPUContext *dst, GPUContext *src) {
+  auto stream_wait_on = [&](GPUContext *dst, GPUContext *src, hipStream_t stream) {
     if (dst == src) return;
     HIP_CHECK(hipSetDevice(dst->device_id));
-    HIP_CHECK(hipStreamWaitEvent(dst->batch_stream, src->batch_event, 0));
+    HIP_CHECK(hipStreamWaitEvent(stream, src->batch_event, 0));
   };
 
   // Stage indices to every GPU
@@ -2840,7 +2881,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
-        stream_wait_on(leader, peer);
+        stream_wait_on(leader, peer, leader->comm_stream);
+        HIP_CHECK(hipStreamWaitEvent(leader->batch_stream, peer->batch_event, 0));
         HIP_CHECK(hipMemcpyPeerAsync(leader->state.tb2_peer, leader->device_id,
                                      peer->state.tb2, peer->device_id, bytes,
                                      leader->batch_stream));
@@ -2865,7 +2907,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
-        stream_wait_on(peer, leader);
+        stream_wait_on(peer, leader, peer->comm_stream);
+        HIP_CHECK(hipStreamWaitEvent(peer->batch_stream, leader->batch_event, 0));
         HIP_CHECK(hipMemcpyPeerAsync(peer->state.tb2, peer->device_id,
                                      leader->state.tb2, leader->device_id, bytes,
                                      peer->batch_stream));
@@ -2956,91 +2999,74 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     HIP_CHECK(hipMemcpy(host_sel_eids.data(), leader->state.sel_eids, M * sizeof(int), hipMemcpyDeviceToHost));
     HIP_CHECK(hipMemcpy(host_sel_w.data(), leader->state.sel_w, M * sizeof(float), hipMemcpyDeviceToHost));
 
-    std::vector<int> local_M(ctxs.size(), 0);
+    std::vector<int> local_M(ctxs.size(), M);
     std::vector<int> local_block_counts(ctxs.size(), 0);
+
+    std::vector<int> counts(p->n_experts, 0);
+    for (int eid : host_sel_eids) {
+      if (eid >= 0 && eid < p->n_experts) counts[eid]++;
+    }
+
+    std::vector<int> prefix(p->n_experts + 1, 0);
+    for (int e = 0; e < p->n_experts; ++e) {
+      prefix[e + 1] = prefix[e] + counts[e];
+    }
+
+    std::vector<int> write_pos = prefix;
+    std::vector<int> order(M);
+    for (int i = 0; i < M; ++i) {
+      int eid = host_sel_eids[i];
+      if (eid < 0 || eid >= p->n_experts) continue;
+      int pos = write_pos[eid]++;
+      order[pos] = i;
+    }
+
+    std::vector<int> grouped_sids(M);
+    std::vector<int> grouped_eids(M);
+    std::vector<float> grouped_w(M);
+    for (int dst = 0; dst < M; ++dst) {
+      int src = order[dst];
+      grouped_sids[dst] = host_sel_sids[src];
+      grouped_eids[dst] = host_sel_eids[src];
+      grouped_w[dst] = host_sel_w[src];
+    }
+
+    std::vector<int> block_cols;
+    std::vector<int> block_sizes;
+    std::vector<int> block_eids;
+    block_cols.reserve((M + 15) / 16);
+    block_sizes.reserve((M + 15) / 16);
+    block_eids.reserve((M + 15) / 16);
+
+    for (int e = 0; e < p->n_experts; ++e) {
+      int start = prefix[e];
+      int end = prefix[e + 1];
+      int remaining = end - start;
+      int col = start;
+      while (remaining > 0) {
+        int chunk = remaining >= 16 ? 16 : remaining;
+        block_cols.push_back(col);
+        block_sizes.push_back(chunk);
+        block_eids.push_back(e);
+        col += chunk;
+        remaining -= chunk;
+      }
+    }
+
+    int block_count = (int)block_cols.size();
     for (size_t idx = 0; idx < ctxs.size(); ++idx) {
       GPUContext *ctx = ctxs[idx];
-      std::vector<int> sel_sids_local;
-      std::vector<int> sel_eids_local;
-      std::vector<float> sel_w_local;
-      sel_sids_local.reserve(M);
-      sel_eids_local.reserve(M);
-      sel_w_local.reserve(M);
-      for (int m = 0; m < M; ++m) {
-        int eid = host_sel_eids[m];
-        if (eid >= ctx->expert_offset && eid < ctx->expert_offset + ctx->local_experts) {
-          sel_sids_local.push_back(host_sel_sids[m]);
-          sel_eids_local.push_back(eid - ctx->expert_offset);
-          sel_w_local.push_back(host_sel_w[m]);
-        }
-      }
-      int sel_count = (int)sel_sids_local.size();
-      local_M[idx] = sel_count;
+      local_block_counts[idx] = block_count;
       HIP_CHECK(hipSetDevice(ctx->device_id));
-      if (sel_count == 0) {
-        continue;
+      if (M > 0) {
+        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_sids, grouped_sids.data(), M * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_eids, grouped_eids.data(), M * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_w, grouped_w.data(), M * sizeof(float), hipMemcpyHostToDevice, ctx->batch_stream));
       }
-
-      int local_experts = ctx->local_experts;
-      std::vector<int> counts(local_experts, 0);
-      for (int eid_local : sel_eids_local) {
-        counts[eid_local]++;
-      }
-
-      std::vector<int> prefix(local_experts + 1, 0);
-      for (int e = 0; e < local_experts; ++e) {
-        prefix[e + 1] = prefix[e] + counts[e];
-      }
-
-      std::vector<int> write_pos = prefix;
-      std::vector<int> order(sel_count);
-      for (int i = 0; i < sel_count; ++i) {
-        int e = sel_eids_local[i];
-        int pos = write_pos[e]++;
-        order[pos] = i;
-      }
-
-      std::vector<int> grouped_sids(sel_count);
-      std::vector<int> grouped_eids(sel_count);
-      std::vector<float> grouped_w(sel_count);
-      for (int dst = 0; dst < sel_count; ++dst) {
-        int src = order[dst];
-        grouped_sids[dst] = sel_sids_local[src];
-        grouped_eids[dst] = sel_eids_local[src];
-        grouped_w[dst] = sel_w_local[src];
-      }
-
-      std::vector<int> block_cols;
-      std::vector<int> block_sizes;
-      std::vector<int> block_eids;
-      block_cols.reserve((sel_count + 15) / 16);
-      block_sizes.reserve((sel_count + 15) / 16);
-      block_eids.reserve((sel_count + 15) / 16);
-
-      for (int e = 0; e < local_experts; ++e) {
-        int start = prefix[e];
-        int end = prefix[e + 1];
-        int remaining = end - start;
-        int col = start;
-        while (remaining > 0) {
-          int chunk = remaining >= 16 ? 16 : remaining;
-          block_cols.push_back(col);
-          block_sizes.push_back(chunk);
-          block_eids.push_back(e);
-          col += chunk;
-          remaining -= chunk;
-        }
-      }
-
-      local_block_counts[idx] = (int)block_cols.size();
-
-      HIP_CHECK(hipMemcpyAsync(ctx->state.sel_sids, grouped_sids.data(), sel_count * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
-      HIP_CHECK(hipMemcpyAsync(ctx->state.sel_eids, grouped_eids.data(), sel_count * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
-      HIP_CHECK(hipMemcpyAsync(ctx->state.sel_w, grouped_w.data(), sel_count * sizeof(float), hipMemcpyHostToDevice, ctx->batch_stream));
-      if (!block_cols.empty()) {
-        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_cols, block_cols.data(), block_cols.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
-        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_sizes, block_sizes.data(), block_sizes.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
-        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_eids, block_eids.data(), block_eids.size() * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+      if (block_count > 0) {
+        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_cols, block_cols.data(), block_count * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_sizes, block_sizes.data(), block_count * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
+        HIP_CHECK(hipMemcpyAsync(ctx->state.sel_block_eids, block_eids.data(), block_count * sizeof(int), hipMemcpyHostToDevice, ctx->batch_stream));
       }
     }
 
@@ -3063,7 +3089,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           ctx->d_slot_ids);
       }
       // Launch MFMA matvec over 16-row tiles in output dimension
-      const int out_dim = 2 * p->intermediate_dim;
+      const int out_dim = ctx->local_mlp1_out_dim;
       dim3 block1(16,4,1); // 64 threads per block for 16x16x4 MFMA
       dim3 grid1((out_dim + 15) / 16, block_count, 1);
       mlp1_grouped_mfma_matvec_mxfp4_kernel<<<grid1, block1, 0, ctx->batch_stream>>>(
@@ -3076,27 +3102,28 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         ctx->state.sel_block_eids,
         M_local, block_count,
         hidden_dim, out_dim,
-        l, ctx->local_experts);
+        l, ctx->n_experts);
 
-      dim3 block2(256), grid2((p->intermediate_dim + block2.x - 1) / block2.x, M_local);
+      dim3 block2(256), grid2((ctx->local_moe_dim + block2.x - 1) / block2.x, M_local);
       swiglu_grouped_kernel_bf16<<<grid2, block2, 0, ctx->batch_stream>>>(
         ctx->state.gate_up_all, ctx->state.mlp1_out_all,
-        M_local, p->intermediate_dim, p->swiglu_limit);
+        M_local, ctx->local_moe_dim, p->swiglu_limit);
 
       // Launch MFMA MLP2 accumulation over 16-row tiles in hidden_dim
       dim3 block3(16,4,1);
       dim3 grid3((hidden_dim + 15) / 16, block_count, 1);
+      const hip_bfloat16 *mlp2_bias_ptr = (ctx->tp_size == 1) ? ctx->weights.b_mlp2 : nullptr;
       mlp2_accum_grouped_mfma_matvec_mxfp4_kernel<<<grid3, block3, 0, ctx->batch_stream>>>(
         ctx->state.e_agg, ctx->state.gate_up_all,
         ctx->weights.w_mlp2_data, ctx->weights.w_mlp2_scales,
-        ctx->weights.b_mlp2,
+        mlp2_bias_ptr,
         ctx->state.sel_sids, ctx->state.sel_w,
         ctx->state.sel_block_cols,
         ctx->state.sel_block_sizes,
         ctx->state.sel_block_eids,
         M_local, block_count,
-        hidden_dim, p->intermediate_dim,
-        l, ctx->local_experts, hidden_dim);
+        hidden_dim, ctx->local_moe_dim,
+        l, ctx->n_experts, hidden_dim);
       record_batch_event(ctx);
     }
 
@@ -3106,7 +3133,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
-        stream_wait_on(leader, peer);
+        stream_wait_on(leader, peer, leader->comm_stream);
         HIP_CHECK(hipMemcpyPeerAsync(leader->state.e_agg_peer, leader->device_id,
                                      peer->state.e_agg, peer->device_id, bytes,
                                      leader->batch_stream));
@@ -3115,10 +3142,25 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         add_selected_kernel_float<<<grid, block, 0, leader->batch_stream>>>(
           leader->state.e_agg, leader->state.e_agg_peer, hidden_dim, batch, leader->d_slot_ids);
       }
+      if (leader->tp_size > 1 && M > 0) {
+        dim3 block_bias(256);
+        dim3 grid_bias((hidden_dim + block_bias.x - 1) / block_bias.x, M);
+        add_mlp2_bias_selected_kernel<<<grid_bias, block_bias, 0, leader->batch_stream>>>(
+          leader->state.e_agg,
+          leader->weights.b_mlp2,
+          leader->state.sel_sids,
+          leader->state.sel_eids,
+          leader->state.sel_w,
+          M,
+          hidden_dim,
+          l,
+          p->n_experts,
+          hidden_dim);
+      }
       record_batch_event(leader);
       for (size_t idx = 1; idx < ctxs.size(); ++idx) {
         GPUContext *peer = ctxs[idx];
-        stream_wait_on(peer, leader);
+        stream_wait_on(peer, leader, peer->comm_stream);
         HIP_CHECK(hipMemcpyPeerAsync(peer->state.e_agg, peer->device_id,
                                      leader->state.e_agg, leader->device_id, bytes,
                                      peer->batch_stream));
@@ -3217,12 +3259,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   if (desired_tp < 1) desired_tp = 1;
   if (desired_tp > device_count) desired_tp = device_count;
 
-  int desired_ep = (device_count >= 2) ? 2 : 1;
-  const char *env_ep = getenv("GETP_EP_SIZE");
-  if (env_ep && atoi(env_ep) > 0) desired_ep = atoi(env_ep);
-  if (desired_ep < 1) desired_ep = 1;
-  if (desired_ep > device_count) desired_ep = device_count;
-
   int desired_dp = std::max(1, device_count / 2);
   const char *env_dp = getenv("GETP_DP_SIZE");
   if (env_dp && atoi(env_dp) > 0) desired_dp = atoi(env_dp);
@@ -3232,14 +3268,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     if (desired_dp < 1) desired_dp = 1;
   }
 
-  if (desired_tp != desired_ep) {
-    fprintf(stderr, "[GPU] Only matching TP/EP sizes are supported (got TP=%d, EP=%d).\n",
-            desired_tp, desired_ep);
-    exit(EXIT_FAILURE);
-  }
-
   parallel_layout.tp_size = desired_tp;
-  parallel_layout.ep_size = desired_ep;
+  parallel_layout.ep_size = 1;
   parallel_layout.dp_size = desired_dp;
   int used_devices = parallel_layout.tp_size * parallel_layout.dp_size;
 
@@ -3249,9 +3279,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
             parallel_layout.tp_size, cfg->n_attn_heads, cfg->n_kv_heads);
     exit(EXIT_FAILURE);
   }
-  if ((cfg->n_experts % parallel_layout.ep_size) != 0) {
-    fprintf(stderr, "[GPU] Expert parallel size %d incompatible with experts %d.\n",
-            parallel_layout.ep_size, cfg->n_experts);
+  if ((cfg->intermediate_dim % parallel_layout.tp_size) != 0) {
+    fprintf(stderr, "[GPU] Tensor parallel size %d incompatible with MoE intermediate dim %d.\n",
+            parallel_layout.tp_size, cfg->intermediate_dim);
     exit(EXIT_FAILURE);
   }
 
@@ -3260,7 +3290,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   int local_q_heads = cfg->n_attn_heads / parallel_layout.tp_size;
   int local_kv_heads = cfg->n_kv_heads / parallel_layout.tp_size;
-  int local_experts = cfg->n_experts / parallel_layout.ep_size;
+  int local_moe_dim = cfg->intermediate_dim / parallel_layout.tp_size;
+  int local_mlp1_out_dim = 2 * local_moe_dim;
   int head_dim = cfg->head_dim;
 
   for (int d = 0; d < used_devices; ++d) {
@@ -3274,17 +3305,18 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     ctx.tp_size = parallel_layout.tp_size;
     ctx.dp_rank = dp_rank;
     ctx.dp_size = parallel_layout.dp_size;
-    ctx.ep_rank = tp_rank;
-    ctx.ep_size = parallel_layout.ep_size;
     ctx.head_offset_q = tp_rank * local_q_heads;
     ctx.head_offset_kv = tp_rank * local_kv_heads;
-    ctx.expert_offset = tp_rank * local_experts;
+    ctx.moe_row_offset = tp_rank * local_mlp1_out_dim;
+    ctx.moe_col_offset = tp_rank * local_moe_dim;
     ctx.local_q_heads = local_q_heads;
     ctx.local_kv_heads = local_kv_heads;
-    ctx.local_experts = local_experts;
+    ctx.local_moe_dim = local_moe_dim;
+    ctx.local_mlp1_out_dim = local_mlp1_out_dim;
     ctx.local_q_dim = ctx.local_q_heads * head_dim;
     ctx.local_kv_dim = ctx.local_kv_heads * head_dim;
     ctx.local_qkv_dim = ctx.local_q_dim + 2 * ctx.local_kv_dim;
+    ctx.n_experts = cfg->n_experts;
     ctx.is_leader = (tp_rank == 0);
 
     ensure_mxfp4_dequant_lut_initialized();
@@ -3337,7 +3369,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     gpu_malloc_run_state(&ctx, cfg, ctx.max_batch);
 
     HIP_CHECK(hipStreamCreate(&ctx.batch_stream));
+    HIP_CHECK(hipStreamCreateWithPriority(&ctx.comm_stream, hipStreamNonBlocking, -1));
     HIP_CHECK(hipEventCreateWithFlags(&ctx.batch_event, hipEventDisableTiming));
+    HIP_CHECK(hipEventCreateWithFlags(&ctx.comm_event, hipEventDisableTiming));
     HIP_CHECK(hipMalloc(&ctx.d_slot_ids,  ctx.max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&ctx.d_pos_list,  ctx.max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&ctx.d_token_ids, ctx.max_batch * sizeof(int)));
@@ -3401,6 +3435,10 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     ws.copy_stream = ws.convert_stream = ws.quant_stream = nullptr;
     ws.capacity_elems = 0;
     ws.logs.clear();
+    if (gpu_ctx.comm_event) HIP_CHECK(hipEventDestroy(gpu_ctx.comm_event));
+    if (gpu_ctx.comm_stream) HIP_CHECK(hipStreamDestroy(gpu_ctx.comm_stream));
+    gpu_ctx.comm_event = nullptr;
+    gpu_ctx.comm_stream = nullptr;
     gpu_free_weights(&gpu_ctx.weights);
     gpu_free_run_state(&gpu_ctx);
   }
@@ -3562,15 +3600,18 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->tb,  B * (size_t)local_q_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->tb2, B * (size_t)hidden_dim * sizeof(float)));
 
-  size_t router_elems = ctx->is_leader ? (size_t)p->n_experts : (size_t)ctx->local_experts;
+  size_t router_elems = (size_t)p->n_experts;
   HIP_CHECK(hipMalloc(&s->router_score, B * router_elems * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->topk_v,       B * (size_t)p->experts_per_token * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->topk_i,       B * (size_t)p->experts_per_token * sizeof(int)));
 
-  HIP_CHECK(hipMalloc(&s->mlp1_out, B * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate,     B * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->up,       B * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up,  B * (size_t)p->intermediate_dim * sizeof(float)));
+  size_t local_moe_dim = (size_t)ctx->local_moe_dim;
+  size_t local_mlp1_out = (size_t)ctx->local_mlp1_out_dim;
+
+  HIP_CHECK(hipMalloc(&s->mlp1_out, B * local_mlp1_out * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate,     B * local_moe_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->up,       B * local_moe_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up,  B * local_moe_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->e_agg,    B * (size_t)hidden_dim * sizeof(float)));
 
   HIP_CHECK(hipMalloc(&s->qkv, B * (size_t)local_qkv_dim * sizeof(float)));
@@ -3594,8 +3635,8 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->sel_block_cols,  Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sel_block_sizes, Mmax * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sel_block_eids,  Mmax * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * local_mlp1_out * sizeof(float)));
+  HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * local_moe_dim * sizeof(hip_bfloat16)));
 
   s->tb2_peer = nullptr;
   s->e_agg_peer = nullptr;
