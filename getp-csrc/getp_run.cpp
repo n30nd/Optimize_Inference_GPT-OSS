@@ -2621,7 +2621,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   hipStream_t load_stream;
   hipError_t stream_status = hipStreamCreateWithFlags(&load_stream, hipStreamNonBlocking);
   if (stream_status != hipSuccess) {
-    hipGetLastError();
+    HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipStreamCreate(&load_stream));
   }
 
@@ -2656,7 +2656,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
     hipError_t pin_ret = maybe_pin_host(cpu_data, count, sizeof(float));
     if (pin_ret != hipSuccess && pin_ret != hipErrorInvalidValue) {
-      hipGetLastError(); // clear sticky error state if registration failed
+      HIP_CHECK(hipGetLastError()); // clear sticky error state if registration failed
     }
 
     size_t done = 0;
@@ -2697,7 +2697,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     size_t total_f32 = (size_t)layers * (size_t)M * (size_t)K;
     hipError_t pin_ret = maybe_pin_host(cpu_data, total_f32, sizeof(float));
     if (pin_ret != hipSuccess && pin_ret != hipErrorInvalidValue) {
-      hipGetLastError();
+      HIP_CHECK(hipGetLastError());
     }
 
     size_t max_rows = staging_elems / (size_t)K;
@@ -2789,7 +2789,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     size_t total_f32 = (size_t)n_layers * (size_t)n_experts * (size_t)M_mlp1 * (size_t)K_mlp1;
     hipError_t pin_ret_mlp1 = maybe_pin_host(cpu_w->w_mlp1, total_f32, sizeof(float));
     if (pin_ret_mlp1 != hipSuccess && pin_ret_mlp1 != hipErrorInvalidValue) {
-      hipGetLastError();
+      HIP_CHECK(hipGetLastError());
     }
     int layers_flat = n_layers * n_experts;
     int Mpad = round_up16(M_mlp1);
@@ -2842,7 +2842,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     hipError_t pin_ret_mlp2 = maybe_pin_host(cpu_w->w_mlp2,
         total_f32, sizeof(float));
     if (pin_ret_mlp2 != hipSuccess && pin_ret_mlp2 != hipErrorInvalidValue) {
-      hipGetLastError();
+      HIP_CHECK(hipGetLastError());
     }
 
     int Mpad = round_up16(M_mlp2);
