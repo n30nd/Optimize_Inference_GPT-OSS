@@ -64,6 +64,7 @@ static const int BLOCK_B = read_BLOCK_B_env();
 // 128-bit alias cho load/stor 16B
 using u32x4 = __attribute__((ext_vector_type(4))) unsigned int;
 using u32x2 = __attribute__((ext_vector_type(2))) unsigned int;
+using ushort4v = __attribute__((ext_vector_type(4))) unsigned short;
 
 // ------------------------- Utility: GPU Memory Logging -------------------------
 static inline void log_gpu_mem(int device_id, const char* tag) {
@@ -946,20 +947,35 @@ void paged_flash_attention_kernel_batched(
     const int Ktiles = (head_dim + 15) / 16;
     for (int kk = 0; kk < Ktiles; ++kk) {
       const int kbase = ty * 4;
-      short4v Areg, Breg;
+      const int k_col_base = kk * 16 + kbase;
+      const int cp = sColPos[tx];
+      short4v Areg;
+      short4v Breg;
+      ushort4v kval4 = {0u, 0u, 0u, 0u};
+
+      if (cp >= 0 && k_col_base < head_dim) {
+        const hip_bfloat16 *k_ptr = key_head + (size_t)cp * (size_t)kv_dim + (size_t)k_col_base;
+        if ((k_col_base + 3) < head_dim) {
+          kval4 = *reinterpret_cast<const ushort4v*>(k_ptr);
+        } else {
+          #pragma unroll
+          for (int t = 0; t < 4; ++t) {
+            const int idx = k_col_base + t;
+            if (idx < head_dim) {
+              union { hip_bfloat16 b; unsigned short u; } uk;
+              uk.b = k_ptr[t];
+              kval4[t] = uk.u;
+            }
+          }
+        }
+      }
+
       #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const int kij = kbase + j;
-        const int k_abs = kk * 16 + kij;
+        const int k_abs = k_col_base + j;
         Areg[j] = (tx == kij && k_abs < head_dim) ? shared_q_bf16[k_abs] : (short)0;
-        short kval = 0;
-        const int cp = sColPos[tx];
-        if (cp >= 0 && k_abs < head_dim) {
-          const hip_bfloat16 *kb = key_head + (size_t)cp * (size_t)kv_dim + (size_t)k_abs;
-          union { hip_bfloat16 b; unsigned short u; } uk;
-          uk.b = *kb;
-          kval = (short)uk.u;
-        }
+        short kval = (k_abs < head_dim) ? static_cast<short>(kval4[j]) : (short)0;
         Breg[j] = kval;
       }
 
@@ -1026,19 +1042,49 @@ void paged_flash_attention_kernel_batched(
   }
   __syncthreads();
 
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    float acc = 0.0f;
+  constexpr int vec_width = 4;
+  const int lane_stride = blockDim.x * vec_width;
+  for (int base = threadIdx.x * vec_width; base < head_dim; base += lane_stride) {
+    float4 acc4 = {0.f, 0.f, 0.f, 0.f};
+    float tail_acc[vec_width] = {0.f, 0.f, 0.f, 0.f};
+    const bool full_vec = (base + (vec_width - 1)) < head_dim;
+
     for (int idx = 0; idx < len; idx++) {
       const float p = shared_att_paged[idx];
-      const bool valid_token = (idx < token_count);
-      if (valid_token && p > 0.f) {
-        int cache_pos = cache_base + idx;
-        if (layer_is_sliding && cache_pos >= layer_capacity) cache_pos -= layer_capacity;
-        const hip_bfloat16 *v_bf16 = value_head + (size_t)cache_pos * (size_t)kv_dim;
-        acc += p * bfloat16_to_float(v_bf16[i]);
+      if (!(idx < token_count) || p <= 0.f) continue;
+      int cache_pos = cache_base + idx;
+      if (layer_is_sliding && cache_pos >= layer_capacity) cache_pos -= layer_capacity;
+      const hip_bfloat16 *v_bf16 = value_head + (size_t)cache_pos * (size_t)kv_dim + (size_t)base;
+
+      if (full_vec) {
+        float4 v = bfloat16_to_float4(v_bf16);
+        acc4.x += p * v.x;
+        acc4.y += p * v.y;
+        acc4.z += p * v.z;
+        acc4.w += p * v.w;
+      } else {
+        #pragma unroll
+        for (int t = 0; t < vec_width; ++t) {
+          const int elem = base + t;
+          if (elem < head_dim) {
+            tail_acc[t] += p * bfloat16_to_float(v_bf16[t]);
+          }
+        }
       }
     }
-    output[i] = acc;
+
+    if (full_vec) {
+      output[base + 0] = acc4.x;
+      output[base + 1] = acc4.y;
+      output[base + 2] = acc4.z;
+      output[base + 3] = acc4.w;
+    } else {
+      #pragma unroll
+      for (int t = 0; t < vec_width; ++t) {
+        const int elem = base + t;
+        if (elem < head_dim) output[elem] = tail_acc[t];
+      }
+    }
   }
 }
 
