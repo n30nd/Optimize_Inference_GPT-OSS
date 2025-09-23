@@ -84,90 +84,76 @@ enum LayerType {
   SLIDING_WINDOW = 1
 };
 
-struct KVCacheSlot {
-  int page_table_offset;  // Base index into page table for this slot+layer
-  int max_pages;          // Logical pages available for this layer
-  LayerType layer_type;
-};
-
 struct KVCacheDeviceData {
-  hip_bfloat16 *key_pages;
-  hip_bfloat16 *value_pages;
-  KVCacheSlot *slots;
-  int *page_table;
+  hip_bfloat16 *key_cache;
+  hip_bfloat16 *value_cache;
+  int *layer_offsets;
+  int *layer_capacities;
   size_t kv_dim;
   int max_batch;
   int n_layers;
   int seq_len;
   int sliding_window_size;
-  int page_size;
-  int pages_per_slot;
+  int tokens_per_slot;
 
   __device__ __forceinline__ LayerType get_layer_type(int layer) const {
     return (sliding_window_size > 0 && (layer % 2 == 0)) ? SLIDING_WINDOW : FULL_ATTENTION;
   }
 
   __device__ __forceinline__ int layer_capacity(int layer) const {
-    LayerType lt = get_layer_type(layer);
-    if (lt == SLIDING_WINDOW && sliding_window_size > 0) {
-      return sliding_window_size;
-    }
-    return seq_len;
-  }
-
-  __device__ __forceinline__ int slot_table_base(int slot_id, int layer) const {
-    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
-    return slot_id * pages_per_slot + slot.page_table_offset;
+    return layer_capacities[layer];
   }
 
   __device__ __forceinline__ hip_bfloat16 *get_key_token_ptr(int slot_id, int layer, int cache_pos) const {
-    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
-    if (slot.max_pages <= 0) return nullptr;
-    int logical_page = cache_pos / page_size;
-    if (logical_page >= slot.max_pages) return nullptr;
-    int within_page = cache_pos % page_size;
-    int table_index = slot_table_base(slot_id, layer) + logical_page;
-    int physical_page = page_table[table_index];
-    if (physical_page < 0) return nullptr;
-    size_t token_offset = ((size_t)physical_page * (size_t)page_size + (size_t)within_page) * kv_dim;
-    return key_pages + token_offset;
+    if (slot_id < 0 || slot_id >= max_batch) return nullptr;
+    if (layer < 0 || layer >= n_layers) return nullptr;
+    if (cache_pos < 0) return nullptr;
+    int capacity = layer_capacities[layer];
+    if (cache_pos >= capacity) return nullptr;
+    size_t token_offset = ((size_t)slot_id * (size_t)tokens_per_slot +
+                           (size_t)layer_offsets[layer] +
+                           (size_t)cache_pos) * kv_dim;
+    return key_cache + token_offset;
   }
 
   __device__ __forceinline__ hip_bfloat16 *get_value_token_ptr(int slot_id, int layer, int cache_pos) const {
-    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
-    if (slot.max_pages <= 0) return nullptr;
-    int logical_page = cache_pos / page_size;
-    if (logical_page >= slot.max_pages) return nullptr;
-    int within_page = cache_pos % page_size;
-    int table_index = slot_table_base(slot_id, layer) + logical_page;
-    int physical_page = page_table[table_index];
-    if (physical_page < 0) return nullptr;
-    size_t token_offset = ((size_t)physical_page * (size_t)page_size + (size_t)within_page) * kv_dim;
-    return value_pages + token_offset;
+    if (slot_id < 0 || slot_id >= max_batch) return nullptr;
+    if (layer < 0 || layer >= n_layers) return nullptr;
+    if (cache_pos < 0) return nullptr;
+    int capacity = layer_capacities[layer];
+    if (cache_pos >= capacity) return nullptr;
+    size_t token_offset = ((size_t)slot_id * (size_t)tokens_per_slot +
+                           (size_t)layer_offsets[layer] +
+                           (size_t)cache_pos) * kv_dim;
+    return value_cache + token_offset;
   }
 
   __device__ __forceinline__ int get_write_position(int slot_id, int layer, int pos) const {
-    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
-    if (slot.layer_type == SLIDING_WINDOW && sliding_window_size > 0) {
-      return pos % sliding_window_size;
+    (void)slot_id;
+    LayerType lt = get_layer_type(layer);
+    int capacity = layer_capacities[layer];
+    if (lt == SLIDING_WINDOW && sliding_window_size > 0 && capacity > 0) {
+      return pos % capacity;
     }
     return pos;
   }
 
   __device__ __forceinline__ int get_cache_position(int slot_id, int layer,
                                                     int logical_pos, int current_pos) const {
-    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
-    if (slot.layer_type == SLIDING_WINDOW && sliding_window_size > 0) {
-      if (current_pos < sliding_window_size) {
+    (void)slot_id;
+    LayerType lt = get_layer_type(layer);
+    int capacity = layer_capacities[layer];
+    if (lt == SLIDING_WINDOW && sliding_window_size > 0 && capacity > 0) {
+      if (current_pos < capacity) {
         return logical_pos;
       }
-      int window_start = current_pos - sliding_window_size + 1;
+      int window_start = current_pos - capacity + 1;
       if (logical_pos < window_start) {
         return -1;
       }
       int offset_in_window = logical_pos - window_start;
-      int cache_start_offset = window_start % sliding_window_size;
-      return (cache_start_offset + offset_in_window) % sliding_window_size;
+      int cache_start_offset = window_start % capacity;
+      return (cache_start_offset + offset_in_window) % capacity;
     }
     return logical_pos;
   }
@@ -177,7 +163,8 @@ struct KVCacheDeviceData {
     (void)slot_id;
     LayerType lt = get_layer_type(layer);
     if (lt == SLIDING_WINDOW && sliding_window_size > 0) {
-      int start = current_pos - sliding_window_size + 1;
+      int capacity = layer_capacities[layer];
+      int start = current_pos - capacity + 1;
       if (start < 0) start = 0;
       *start_pos = start;
       *end_pos = current_pos;
@@ -196,236 +183,120 @@ public:
         seq_len_(seq_len),
         kv_dim_(kv_dim),
         sliding_window_size_(sliding_window_size),
-        page_size_(16),
-        pages_per_slot_(0),
-        total_logical_pages_(0),
-        total_physical_pages_(0),
-        key_pages_(nullptr),
-        value_pages_(nullptr),
-        page_table_(nullptr),
-        d_slots_(nullptr),
+        tokens_per_slot_(0),
+        key_cache_(nullptr),
+        value_cache_(nullptr),
+        d_layer_offsets_(nullptr),
+        d_layer_capacities_(nullptr),
         d_device_data_(nullptr) {
-    const char *env_page = getenv("GETP_KV_PAGE_SIZE");
-    if (env_page && atoi(env_page) > 0) {
-      int candidate = atoi(env_page);
-      if (candidate > 0 && (candidate % 4 == 0)) {
-        page_size_ = candidate;
-      }
+    if (max_batch_ <= 0 || n_layers_ <= 0 || kv_dim_ == 0) {
+      fprintf(stderr, "KVCacheManager: invalid configuration.\n");
+      exit(EXIT_FAILURE);
     }
 
-    // Build per-layer metadata (shared across slots)
     layer_offsets_.resize(n_layers_);
-    slots_.resize(max_batch_);
-    for (int b = 0; b < max_batch_; ++b) {
-      slots_[b].resize(n_layers_);
-    }
+    layer_capacities_.resize(n_layers_);
 
-    int running_offset = 0;
-    std::vector<int> layer_pages(n_layers_);
+    size_t running = 0;
     for (int l = 0; l < n_layers_; ++l) {
       LayerType lt = host_layer_type(l);
-      int capacity = (lt == SLIDING_WINDOW && sliding_window_size_ > 0)
-                     ? sliding_window_size_ : seq_len_;
-      int pages = (capacity + page_size_ - 1) / page_size_;
-      if (pages < 1) pages = 1;
-      layer_offsets_[l] = running_offset;
-      layer_pages[l] = pages;
-      running_offset += pages;
-      for (int b = 0; b < max_batch_; ++b) {
-        KVCacheSlot slot;
-        slot.page_table_offset = layer_offsets_[l];
-        slot.max_pages = pages;
-        slot.layer_type = lt;
-        slots_[b][l] = slot;
-      }
-    }
-    pages_per_slot_ = running_offset;
-    total_logical_pages_ = max_batch_ * pages_per_slot_;
-
-    size_t total_entries = (size_t)max_batch_ * (size_t)pages_per_slot_;
-    if (total_entries == 0) {
-      fprintf(stderr, "KVCacheManager: zero-sized page table.\n");
-      exit(EXIT_FAILURE);
-    }
-
-    // Determine physical page budget from available memory.
-    size_t bytes_per_page = (size_t)page_size_ * kv_dim_ * sizeof(hip_bfloat16);
-    size_t free_bytes = 0, total_bytes = 0;
-    HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
-    double usage_fraction = 0.80;
-    const char *env_frac = getenv("GETP_KV_PAGE_FRACTION");
-    if (env_frac && atof(env_frac) > 0.0) {
-      double f = atof(env_frac);
-      if (f > 0.0 && f <= 1.0) usage_fraction = f;
-    }
-    size_t budget_bytes = (size_t)(usage_fraction * (double)free_bytes);
-    if (budget_bytes < bytes_per_page * 2) {
-      fprintf(stderr, "KVCacheManager: insufficient free memory for paged cache.\n");
-      exit(EXIT_FAILURE);
-    }
-
-    size_t max_pages_by_mem = budget_bytes / (bytes_per_page * 2);
-    if (max_pages_by_mem > (size_t)total_logical_pages_) {
-      max_pages_by_mem = (size_t)total_logical_pages_;
-    }
-
-    // Ensure minimal pages to cover sliding windows + first token for full layers
-    size_t min_required_pages = 0;
-    for (int l = 0; l < n_layers_; ++l) {
-      LayerType lt = host_layer_type(l);
+      int capacity = seq_len_;
       if (lt == SLIDING_WINDOW && sliding_window_size_ > 0) {
-        min_required_pages += (size_t)max_batch_ * (size_t)layer_pages[l];
-      } else {
-        min_required_pages += (size_t)max_batch_;
+        capacity = std::min(sliding_window_size_, seq_len_);
       }
-    }
-    if (max_pages_by_mem < min_required_pages) {
-      // Attempt to allocate minimum pages; if impossible, fail explicitly.
-      if (budget_bytes < min_required_pages * bytes_per_page * 2) {
-        fprintf(stderr, "KVCacheManager: not enough memory for minimal KV allocation (need %.2f GB).\n",
-                (min_required_pages * bytes_per_page * 2) / GB);
+      if (capacity <= 0) capacity = 1;
+      if (running > (size_t)std::numeric_limits<int>::max()) {
+        fprintf(stderr, "KVCacheManager: layer offset overflow.\n");
         exit(EXIT_FAILURE);
       }
-      max_pages_by_mem = min_required_pages;
+      layer_offsets_[l] = static_cast<int>(running);
+      layer_capacities_[l] = capacity;
+      running += static_cast<size_t>(capacity);
     }
 
-    total_physical_pages_ = (int)max_pages_by_mem;
-    if (total_physical_pages_ <= 0) {
-      fprintf(stderr, "KVCacheManager: zero physical pages after budgeting.\n");
+    if (running == 0) {
+      fprintf(stderr, "KVCacheManager: zero-sized cache.\n");
+      exit(EXIT_FAILURE);
+    }
+    if (running > (size_t)std::numeric_limits<int>::max()) {
+      fprintf(stderr, "KVCacheManager: total token count overflow.\n");
       exit(EXIT_FAILURE);
     }
 
-    // Allocate page pools for keys/values and page table (managed memory for ease of updates).
-    HIP_CHECK(hipMalloc(&key_pages_, (size_t)total_physical_pages_ * bytes_per_page));
-    HIP_CHECK(hipMalloc(&value_pages_, (size_t)total_physical_pages_ * bytes_per_page));
+    tokens_per_slot_ = static_cast<int>(running);
+    size_t total_tokens = (size_t)max_batch_ * (size_t)tokens_per_slot_;
+    size_t bytes_per_token = kv_dim_ * sizeof(hip_bfloat16);
+    size_t total_bytes = total_tokens * bytes_per_token;
 
-    HIP_CHECK(hipMallocManaged(&page_table_, total_entries * sizeof(int), hipMemAttachGlobal));
-    HIP_CHECK(hipMemset(page_table_, 0xFF, total_entries * sizeof(int))); // -1 marks free
+    HIP_CHECK(hipMalloc(&key_cache_, total_bytes));
+    HIP_CHECK(hipMalloc(&value_cache_, total_bytes));
 
-    free_pages_.reserve(total_physical_pages_);
-    for (int i = 0; i < total_physical_pages_; ++i) {
-      free_pages_.push_back(i);
-    }
-
-    // Copy slot metadata to device
-    size_t slots_bytes = (size_t)max_batch_ * (size_t)n_layers_ * sizeof(KVCacheSlot);
-    HIP_CHECK(hipMalloc(&d_slots_, slots_bytes));
-    std::vector<KVCacheSlot> flat_slots;
-    flat_slots.reserve((size_t)max_batch_ * (size_t)n_layers_);
-    for (int b = 0; b < max_batch_; ++b) {
-      for (int l = 0; l < n_layers_; ++l) {
-        flat_slots.push_back(slots_[b][l]);
-      }
-    }
-    HIP_CHECK(hipMemcpy(d_slots_, flat_slots.data(), slots_bytes, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMalloc(&d_layer_offsets_, n_layers_ * sizeof(int)));
+    HIP_CHECK(hipMalloc(&d_layer_capacities_, n_layers_ * sizeof(int)));
+    HIP_CHECK(hipMemcpy(d_layer_offsets_, layer_offsets_.data(), n_layers_ * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_layer_capacities_, layer_capacities_.data(), n_layers_ * sizeof(int), hipMemcpyHostToDevice));
 
     HIP_CHECK(hipMalloc(&d_device_data_, sizeof(KVCacheDeviceData)));
-    KVCacheDeviceData device_data;
-    device_data.key_pages = key_pages_;
-    device_data.value_pages = value_pages_;
-    device_data.slots = d_slots_;
-    device_data.page_table = page_table_;
+    KVCacheDeviceData device_data{};
+    device_data.key_cache = key_cache_;
+    device_data.value_cache = value_cache_;
+    device_data.layer_offsets = d_layer_offsets_;
+    device_data.layer_capacities = d_layer_capacities_;
     device_data.kv_dim = kv_dim_;
     device_data.max_batch = max_batch_;
     device_data.n_layers = n_layers_;
     device_data.seq_len = seq_len_;
     device_data.sliding_window_size = sliding_window_size_;
-    device_data.page_size = page_size_;
-    device_data.pages_per_slot = pages_per_slot_;
+    device_data.tokens_per_slot = tokens_per_slot_;
     HIP_CHECK(hipMemcpy(d_device_data_, &device_data, sizeof(KVCacheDeviceData), hipMemcpyHostToDevice));
 
-    double total_gb = ((double)total_physical_pages_ * (double)page_size_ * (double)kv_dim_ * sizeof(hip_bfloat16) * 2.0) / GB;
-    double tokens_capacity = (double)total_physical_pages_ * (double)page_size_;
-    printf("KVCacheManager (paged): %d physical pages, page_size=%d tokens (capacity %.2fM tokens, %.2f GB)\n",
-           total_physical_pages_, page_size_, tokens_capacity / 1e6, total_gb);
+    double total_gb = ((double)total_bytes * 2.0) / GB;
+    double tokens_capacity = (double)tokens_per_slot_;
+    printf("KVCacheManager (prealloc): tokens_per_slot=%d (%.2fK summed tokens per slot), %.2f GB\n",
+           tokens_per_slot_, tokens_capacity / 1e3, total_gb);
     if (sliding_window_size_ > 0) {
-      printf("  - Sliding window tokens per layer: %d\n", sliding_window_size_);
-    }
-
-    // Advise managed memory for all visible GPUs (best-effort)
-    int device_count = 0;
-    hipError_t dev_err = hipGetDeviceCount(&device_count);
-    if (dev_err == hipSuccess) {
-      for (int dev = 0; dev < device_count; ++dev) {
-        hipError_t advise_err = hipMemAdvise(page_table_, total_entries * sizeof(int), hipMemAdviseSetAccessedBy, dev);
-        if (advise_err != hipSuccess && advise_err != hipErrorNotSupported) {
-          fprintf(stderr, "KVCacheManager: hipMemAdvise failed on device %d: %s\n",
-                  dev, hipGetErrorString(advise_err));
-        }
-      }
+      printf("  - Sliding window tokens on even layers: %d\n", std::min(sliding_window_size_, seq_len_));
     }
   }
 
   ~KVCacheManager() {
     if (d_device_data_) HIP_CHECK(hipFree(d_device_data_));
-    if (d_slots_) HIP_CHECK(hipFree(d_slots_));
-    if (page_table_) HIP_CHECK(hipFree(page_table_));
-    if (key_pages_) HIP_CHECK(hipFree(key_pages_));
-    if (value_pages_) HIP_CHECK(hipFree(value_pages_));
+    if (d_layer_capacities_) HIP_CHECK(hipFree(d_layer_capacities_));
+    if (d_layer_offsets_) HIP_CHECK(hipFree(d_layer_offsets_));
+    if (value_cache_) HIP_CHECK(hipFree(value_cache_));
+    if (key_cache_) HIP_CHECK(hipFree(key_cache_));
   }
 
   KVCacheDeviceData *get_device_data() const { return d_device_data_; }
 
   void prepare_layer(int layer, const int *slot_ids, const int *positions, int batch) {
     if (batch <= 0) return;
-    for (int bi = 0; bi < batch; ++bi) {
-      int sid = slot_ids[bi];
-      if (sid < 0 || sid >= max_batch_) continue;
-      int pos = positions[bi];
-      if (pos < 0) pos = 0;
-      const KVCacheSlot &slot_info = slots_[sid][layer];
-      int write_pos = (slot_info.layer_type == SLIDING_WINDOW && sliding_window_size_ > 0)
-                        ? (pos % sliding_window_size_) : pos;
-      int logical_page = write_pos / page_size_;
-      if (logical_page >= slot_info.max_pages) {
-        fprintf(stderr, "KVCacheManager: token position overflow (slot=%d layer=%d pos=%d).\n",
-                sid, layer, pos);
-        exit(EXIT_FAILURE);
-      }
-      size_t table_index = slot_table_index(sid, layer, logical_page);
-      if (page_table_[table_index] < 0) {
-        int phys = allocate_page();
-        if (phys < 0) {
-          fprintf(stderr, "KVCacheManager: ran out of KV pages (slot=%d layer=%d pos=%d).\n",
-                  sid, layer, pos);
+    if (layer < 0 || layer >= n_layers_) return;
+    int capacity = layer_capacities_[layer];
+    LayerType lt = host_layer_type(layer);
+    if (lt == FULL_ATTENTION) {
+      for (int bi = 0; bi < batch; ++bi) {
+        int sid = slot_ids[bi];
+        if (sid < 0 || sid >= max_batch_) continue;
+        int pos = positions[bi];
+        if (pos < 0) pos = 0;
+        if (pos >= capacity) {
+          fprintf(stderr, "KVCacheManager: token position overflow (slot=%d layer=%d pos=%d cap=%d).\n",
+                  sid, layer, pos, capacity);
           exit(EXIT_FAILURE);
         }
-        page_table_[table_index] = phys;
       }
     }
   }
 
   void reset_slot(int slot_id) {
-    if (slot_id < 0 || slot_id >= max_batch_) return;
-    size_t base = (size_t)slot_id * (size_t)pages_per_slot_;
-    for (int offset = 0; offset < pages_per_slot_; ++offset) {
-      int idx = page_table_[base + offset];
-      if (idx >= 0) {
-        free_pages_.push_back(idx);
-        page_table_[base + offset] = -1;
-      }
-    }
+    (void)slot_id;
+    // No-op: cache entries are overwritten sequentially for each request.
   }
-
-  int page_size() const { return page_size_; }
 
 private:
   LayerType host_layer_type(int layer) const {
     return (sliding_window_size_ > 0 && (layer % 2 == 0)) ? SLIDING_WINDOW : FULL_ATTENTION;
-  }
-
-  size_t slot_table_index(int slot_id, int layer, int logical_page) const {
-    const KVCacheSlot &slot = slots_[slot_id][layer];
-    return (size_t)slot_id * (size_t)pages_per_slot_ + (size_t)slot.page_table_offset + (size_t)logical_page;
-  }
-
-  int allocate_page() {
-    if (free_pages_.empty()) {
-      return -1;
-    }
-    int page = free_pages_.back();
-    free_pages_.pop_back();
-    return page;
   }
 
   int max_batch_;
@@ -433,17 +304,13 @@ private:
   int seq_len_;
   size_t kv_dim_;
   int sliding_window_size_;
-  int page_size_;
-  int pages_per_slot_;
-  int total_logical_pages_;
-  int total_physical_pages_;
-  hip_bfloat16 *key_pages_;
-  hip_bfloat16 *value_pages_;
-  int *page_table_;
-  std::vector<int> free_pages_;
+  int tokens_per_slot_;
+  hip_bfloat16 *key_cache_;
+  hip_bfloat16 *value_cache_;
   std::vector<int> layer_offsets_;
-  std::vector<std::vector<KVCacheSlot>> slots_;
-  KVCacheSlot *d_slots_;
+  std::vector<int> layer_capacities_;
+  int *d_layer_offsets_;
+  int *d_layer_capacities_;
   KVCacheDeviceData *d_device_data_;
 };
 
@@ -1749,234 +1616,213 @@ __device__ inline float block_reduce_sum(float val, float *shared) {
   return result;
 }
 
+// ==================== FlashAttention V2 (online softmax, BK=64) ====================
+#ifndef FA_V2_BK
+#define FA_V2_BK 64  // có thể đổi 32/64/128; 64 thường tốt cho head_dim 64..128
+#endif
 
-// Paged FlashAttention kernel that operates on KVCacheManager tiles (BF16 storage with sliding-window support).
+// Gợi ý tính shared mem host-side
+static inline size_t paged_flash_attention_v2_smem_bytes(int head_dim, int BK = FA_V2_BK) {
+  // q_sh (float * head_dim) + p_sh (float * BK) + vptr_sh (BK * ptr) + padding
+  size_t bytes = (size_t)head_dim * sizeof(float)
+               + (size_t)BK * sizeof(float)
+               + (size_t)BK * sizeof(hip_bfloat16*);
+  // căn lề một chút
+  bytes += 64;
+  return bytes;
+}
+
 __global__ __launch_bounds__(64)
-void paged_flash_attention_kernel_batched(
+void paged_flash_attention_kernel_batched_v2(
     const float * __restrict__ all_q,
     KVCacheDeviceData * __restrict__ cache_data,
     const hip_bfloat16 * __restrict__ attn_sinks,
     float * __restrict__ all_output,
-    int head_dim, int kv_dim, int kv_mul,
+    int head_dim, int /*kv_dim_unused*/, int kv_mul,
     int n_heads, int seq_len, int layer,
     const int * __restrict__ pos_list,
     int batch,
     int q_stride,
     const int * __restrict__ slot_ids) {
 
-  int h = blockIdx.y;
-  int b = blockIdx.z;
+  const int h = blockIdx.y;
+  const int b = blockIdx.z;
   if (h >= n_heads || b >= batch) return;
 
-  int pos = pos_list[b];
+  const int lane = threadIdx.x;          // 0..63
+  const int tx   = lane;                 // mỗi thread phụ trách 1 token trong block BK
+  const int sid  = slot_ids[b];
+  int       pos  = pos_list[b];
   if (pos < 0) return;
 
-  int sid = slot_ids[b];
-  const float *q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
-  float *output = all_output + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
-
-  (void)kv_dim;
-
-  int start_pos = 0;
-  int end_pos = 0;
-  cache_data->get_attention_range(sid, layer, pos, &start_pos, &end_pos);
-  int att_len = end_pos - start_pos + 1;
-  if (att_len <= 0) return;
-
-  int layer_capacity = cache_data->layer_capacity(layer);
-
-  extern __shared__ unsigned char shared_storage[];
-  float *shared_att_paged = reinterpret_cast<float*>(shared_storage);
-  size_t att_storage = (size_t)layer_capacity + 1;
-  uintptr_t value_ptr_base = reinterpret_cast<uintptr_t>(shared_att_paged + att_storage);
-  const uintptr_t value_ptr_align = alignof(hip_bfloat16*);
-  value_ptr_base = (value_ptr_base + value_ptr_align - 1) & ~(value_ptr_align - 1);
-  hip_bfloat16 **shared_value_ptr = reinterpret_cast<hip_bfloat16 **>(value_ptr_base);
-
-  __shared__ int s_att_len;
-  if (threadIdx.x == 0) s_att_len = att_len;
-  __syncthreads();
-
-  const int lane_id = threadIdx.x;
-  const int tx = lane_id & 15;
-  const int ty = (lane_id >> 4) & 3;
   const float inv_sqrt_d = rsqrtf((float)head_dim);
   const int head_base = (h / kv_mul) * head_dim;
 
-  __shared__ short sQbf16[16];
-  __shared__ int sColPos[16];
-  __shared__ hip_bfloat16 *sKeyPtrs[16];
+  const float * __restrict__ q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
+  float * __restrict__ out_head = all_output + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
 
-  for (int col0 = 0; col0 < att_len; col0 += 16) {
-    const int col = col0 + tx;
-    const bool col_in_range = (col < att_len);
+  // Range (causal/sliding window) theo cache manager
+  int start_pos = 0, end_pos = 0;
+  cache_data->get_attention_range(sid, layer, pos, &start_pos, &end_pos);
+  int att_len = end_pos - start_pos + 1;
+  if (att_len <= 0) {
+    // không có KV khả dụng -> output = 0
+    for (int i = lane; i < head_dim; i += blockDim.x) out_head[i] = 0.f;
+    return;
+  }
 
-    if (ty == 0 && tx < 16) {
-      if (col_in_range) {
-        const int t = start_pos + col;
-        const int cp = (t <= pos) ? cache_data->get_cache_position(sid, layer, t, pos) : -1;
-        sColPos[tx] = cp;
-        hip_bfloat16 *k_base = nullptr;
-        hip_bfloat16 *v_base = nullptr;
-        if (cp >= 0) {
-          k_base = cache_data->get_key_token_ptr(sid, layer, cp);
-          if (k_base != nullptr) {
-            k_base += head_base;
-          }
-          hip_bfloat16 *value_ptr = cache_data->get_value_token_ptr(sid, layer, cp);
-          if (value_ptr != nullptr) {
-            v_base = value_ptr + head_base;
-          }
+  // -------------------- Dynamic shared memory layout --------------------
+  extern __shared__ unsigned char smem_raw[];
+  unsigned char* p = smem_raw;
+
+  // q_sh: [head_dim] float
+  float* q_sh = reinterpret_cast<float*>(p);
+  p += (size_t)head_dim * sizeof(float);
+
+  // p_sh: [BK] float  (softmax weight của block hiện tại)
+  float* p_sh = reinterpret_cast<float*>(p);
+  p += (size_t)FA_V2_BK * sizeof(float);
+
+  // vptr_sh: [BK] hip_bfloat16* (pointer tới V của từng token trong block)
+  uintptr_t align = alignof(hip_bfloat16*);
+  p = reinterpret_cast<unsigned char*>((reinterpret_cast<uintptr_t>(p) + align - 1) & ~(align - 1));
+  hip_bfloat16** vptr_sh = reinterpret_cast<hip_bfloat16**>(p);
+  // ----------------------------------------------------------------------
+
+  // Tải Q vào shared (để tránh đọc lặp)
+  for (int i = lane; i < head_dim; i += blockDim.x) {
+    q_sh[i] = q_head[i];
+  }
+  __syncthreads();
+
+  // Online softmax trạng thái
+  float m = -INFINITY;  // running max
+  float l = 0.f;        // running normalizer (sum of exp-shifted)
+
+  // Zero hoá output tích luỹ (y) đầu head
+  for (int i = lane; i < head_dim; i += blockDim.x) {
+    out_head[i] = 0.f;
+  }
+
+  // Duyệt theo block K/V dài BK
+  for (int base = 0; base < att_len; base += FA_V2_BK) {
+    const int valid = min(FA_V2_BK, att_len - base);
+
+    // Mỗi thread ánh xạ 1 token trong block
+    float s_val = -INFINITY;     // score của token do thread này phụ trách
+    float p_val = 0.f;           // weight sau softmax (block-local)
+    hip_bfloat16* v_ptr_this = nullptr;
+
+    if (tx < valid) {
+      const int t = start_pos + base + tx;
+      const int cp = (t <= pos) ? cache_data->get_cache_position(sid, layer, t, pos) : -1;
+      if (cp >= 0) {
+        // Lấy K/V base pointer cho token này và head hiện tại
+        const hip_bfloat16* k_base = cache_data->get_key_token_ptr(sid, layer, cp);
+        hip_bfloat16* v_base = cache_data->get_value_token_ptr(sid, layer, cp);
+        if (k_base != nullptr) k_base += head_base;
+        if (v_base != nullptr) v_base += head_base;
+        v_ptr_this = v_base;
+
+        // Tính dot(Q, K_t)
+        float dot = 0.f;
+        int k = 0;
+        // vector hoá theo 4 phần tử (dùng BF16->float4v helper)
+        for (; k + 3 < head_dim; k += 4) {
+          float4v q4; q4[0]=q_sh[k+0]; q4[1]=q_sh[k+1]; q4[2]=q_sh[k+2]; q4[3]=q_sh[k+3];
+          float4v k4 = load_bf16x4_as_float4v(k_base + k);
+          dot += q4[0]*k4[0] + q4[1]*k4[1] + q4[2]*k4[2] + q4[3]*k4[3];
         }
-        sKeyPtrs[tx] = k_base;
-        if (col < att_storage) {
-          shared_value_ptr[col] = v_base;
+        for (; k < head_dim; ++k) {
+          dot = fmaf(q_sh[k], bfloat16_to_float(k_base[k]), dot);
         }
+        s_val = dot * inv_sqrt_d;
+      }
+    }
+
+    // Block-wide max của s_val
+    float blk_max = s_val;
+    // wave64 reduce max
+    #pragma unroll
+    for (int off = 32; off > 0; off >>= 1) {
+      float other = __shfl_down(blk_max, off, 64);
+      blk_max = fmaxf(blk_max, other);
+    }
+    // phát tán max lên toàn block (dùng lane 0 làm nguồn)
+    blk_max = __shfl(blk_max, 0, 64);
+
+    // m_new = max(m, blk_max)
+    float m_new = fmaxf(m, blk_max);
+    float scale_old = expf(m - m_new);
+
+    // p_val = exp(s - m_new) (hoặc 0 nếu invalid)
+    if (tx < valid) {
+      if (s_val == -INFINITY) {
+        p_val = 0.f;
       } else {
-        sColPos[tx] = -1;
-        sKeyPtrs[tx] = nullptr;
-        if (col < att_storage) {
-          shared_value_ptr[col] = nullptr;
-        }
+        p_val = expf(s_val - m_new);
       }
+      p_sh[tx]   = p_val;
+      vptr_sh[tx]= v_ptr_this;
     }
     __syncthreads();
 
-    float4v acc = {0.f, 0.f, 0.f, 0.f};
-    const int Ktiles = (head_dim + 15) / 16;
-    for (int kk = 0; kk < Ktiles; ++kk) {
-      if (ty == 0 && tx < 16) {
-        const int k_row = kk * 16 + tx;
-        unsigned short qbits = 0u;
-        if (k_row < head_dim) {
-          union { hip_bfloat16 b; unsigned short u; } uq;
-          uq.b = float_to_bfloat16(q_head[k_row]);
-          qbits = uq.u;
-        }
-        sQbf16[tx] = (short)qbits;
-      }
-      __syncthreads();
+    // Tổng p trong block (dùng p_val local trước khi sync cũng được, giờ ta đã sync rồi)
+    float sum_p = (tx < valid) ? p_val : 0.f;
+    #pragma unroll
+    for (int off = 32; off > 0; off >>= 1) {
+      sum_p += __shfl_down(sum_p, off, 64);
+    }
+    sum_p = __shfl(sum_p, 0, 64);
 
-      const int kbase = ty * 4;
-      short4v Areg;
-      short4v Breg;
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const int kij = kbase + j;
-        Areg[j] = (tx == kij) ? sQbf16[kij] : (short)0;
-        short kval = 0;
-        const int k_abs = kk * 16 + kij;
-        const hip_bfloat16 *kb = sKeyPtrs[tx];
-        if (kb != nullptr && k_abs < head_dim) {
-          union { hip_bfloat16 b; unsigned short u; } uk;
-          uk.b = kb[k_abs];
-          kval = (short)uk.u;
+    // Cập nhật y (out_head) theo y = y*scale_old + sum_j p_j * V_j
+    for (int i = lane; i < head_dim; i += blockDim.x) {
+      float yi = out_head[i] * scale_old;
+      // duyệt mọi token trong block (đọc coalesced theo i)
+      #pragma unroll 1
+      for (int j = 0; j < valid; ++j) {
+        const float pw = p_sh[j];
+        hip_bfloat16* vj = vptr_sh[j];
+        if (pw > 0.f && vj != nullptr) {
+          yi = fmaf(pw, bfloat16_to_float(vj[i]), yi);
         }
-        Breg[j] = kval;
       }
-
-      acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
-      __syncthreads();
+      out_head[i] = yi;
     }
 
-    float partial = acc.x + acc.y + acc.z + acc.w;
-    partial += __shfl_xor(partial, 16, 64);
-    partial += __shfl_xor(partial, 32, 64);
-
-    if (ty == 0 && col_in_range) {
-      float score = (sColPos[tx] >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
-      shared_att_paged[col] = score;
-    }
+    // Cập nhật l & m
+    l = l * scale_old + sum_p;
+    m = m_new;
     __syncthreads();
   }
 
-  if (threadIdx.x == 0 && (pos + 1) < seq_len && s_att_len < layer_capacity + 1) {
-    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
-    shared_att_paged[s_att_len] = bfloat16_to_float(attn_sinks[sink_idx]);
-    shared_value_ptr[s_att_len] = nullptr;
-    s_att_len++;
-  }
-  __syncthreads();
-  const int len = s_att_len;
+  // Attention sink (giống logic bản cũ: chỉ cộng vào mẫu số, không cộng giá trị)
+  // Chỉ thêm khi còn bước phía trước và còn dung lượng
+  const int layer_cap = cache_data->layer_capacity(layer);
+  bool use_sink = ((pos + 1) < seq_len) && (att_len < layer_cap + 1);
+  if (use_sink) {
+    const size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
+    const float sink_val = bfloat16_to_float(attn_sinks[sink_idx]);
+    const float m_new = fmaxf(m, sink_val);
+    const float scale_old = expf(m - m_new);
 
-  float local_max = -INFINITY;
-  for (int i = threadIdx.x; i < len; i += blockDim.x) {
-    local_max = fmaxf(local_max, shared_att_paged[i]);
-  }
-
-  const int W = 64;
-  for (int offset = W / 2; offset > 0; offset >>= 1) {
-    float other = __shfl_down(local_max, offset, W);
-    local_max = fmaxf(local_max, other);
-  }
-
-  __shared__ float warp_max[4];
-  const int lane = threadIdx.x & (W - 1);
-  const int wid = threadIdx.x / W;
-  if (lane == 0) warp_max[wid] = local_max;
-  __syncthreads();
-
-  float max_val = -INFINITY;
-  if (wid == 0) {
-    int warps = blockDim.x / W;
-    float val = (lane < warps) ? warp_max[lane] : -INFINITY;
-    for (int offset = W / 2; offset > 0; offset >>= 1) {
-      float other = __shfl_down(val, offset, W);
-      val = fmaxf(val, other);
+    // y *= scale_old (không cộng thêm gì vì sink không có V)
+    for (int i = lane; i < head_dim; i += blockDim.x) {
+      out_head[i] *= scale_old;
     }
-    if (lane == 0) warp_max[0] = val;
-  }
-  __syncthreads();
-  max_val = warp_max[0];
-
-  float local_sum = 0.0f;
-  for (int i = threadIdx.x; i < len; i += blockDim.x) {
-    float v = shared_att_paged[i];
-    v = (v == -INFINITY) ? 0.0f : __expf(v - max_val);
-    shared_att_paged[i] = v;
-    local_sum += v;
+    l = l * scale_old + expf(sink_val - m_new);
+    m = m_new;
+    __syncthreads();
   }
 
-  for (int offset = W / 2; offset > 0; offset >>= 1) {
-    local_sum += __shfl_down(local_sum, offset, W);
-  }
-
-  __shared__ float warp_sum[4];
-  if (lane == 0) warp_sum[wid] = local_sum;
-  __syncthreads();
-
-  float sum_val = 0.0f;
-  if (wid == 0) {
-    int warps = blockDim.x / W;
-    float val = (lane < warps) ? warp_sum[lane] : 0.0f;
-    for (int offset = W / 2; offset > 0; offset >>= 1) {
-      val += __shfl_down(val, offset, W);
-    }
-    if (lane == 0) warp_sum[0] = val;
-  }
-  __syncthreads();
-  sum_val = warp_sum[0];
-  float inv_sum = 1.0f / (sum_val + 1e-8f);
-  __syncthreads();
-
-  for (int i = threadIdx.x; i < len; i += blockDim.x) {
-    shared_att_paged[i] *= inv_sum;
-  }
-  __syncthreads();
-
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    float acc = 0.0f;
-    for (int idx = 0; idx < len; ++idx) {
-      const float p = shared_att_paged[idx];
-      if (p <= 0.0f) continue;
-      const hip_bfloat16 *v_ptr = shared_value_ptr[idx];
-      if (v_ptr != nullptr) {
-        acc = fmaf(p, bfloat16_to_float(v_ptr[i]), acc);
-      }
-    }
-    output[i] = acc;
+  // Chuẩn hoá cuối: out = y / (l + eps)
+  const float inv_l = 1.f / (l + 1e-8f);
+  for (int i = lane; i < head_dim; i += blockDim.x) {
+    out_head[i] *= inv_l;
   }
 }
+
+
 
 
 __global__ void sample_argmax_kernel(const float *logits, int *next_tokens,
@@ -2902,28 +2748,30 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     for (size_t idx = 0; idx < ctxs.size(); ++idx) {
       GPUContext *ctx = ctxs[idx];
       HIP_CHECK(hipSetDevice(ctx->device_id));
-      const int block_size = 64;
+      // [MỚI]
+      const int block_size = 64;                 // giữ 64 thread/block (wave64)
       dim3 block(block_size);
-      int max_attention_length = (p->sliding_window > 0 && (l % 2 == 0)) ? p->sliding_window : p->seq_len;
-      size_t shared_mem_bytes = (size_t)(max_attention_length + 1) * sizeof(float);
-      shared_mem_bytes += (size_t)(max_attention_length + 1) * sizeof(hip_bfloat16*);
-      shared_mem_bytes += sizeof(hip_bfloat16*);
       dim3 grid(1, ctx->local_q_heads, batch);
-      paged_flash_attention_kernel_batched<<<grid, block, shared_mem_bytes, ctx->batch_stream>>>(
-        ctx->state.qkv,
-        ctx->state.kv_cache_manager->get_device_data(),
-        ctx->weights.attn_sinks,
-        ctx->state.tb,
-        head_dim,
-        ctx->local_kv_dim,
-        kv_mul,
-        ctx->local_q_heads,
-        p->seq_len,
-        l,
-        ctx->d_pos_list,
-        batch,
-        ctx->local_qkv_dim,
-        ctx->d_slot_ids);
+
+      // BK = FA_V2_BK (mặc định 64). Bạn có thể chỉnh macro ở trên.
+      size_t shared_mem_bytes = paged_flash_attention_v2_smem_bytes(/*head_dim=*/head_dim, /*BK=*/FA_V2_BK);
+
+      paged_flash_attention_kernel_batched_v2<<<grid, block, shared_mem_bytes, ctx->batch_stream>>>(
+          ctx->state.qkv,
+          ctx->state.kv_cache_manager->get_device_data(),
+          ctx->weights.attn_sinks,
+          ctx->state.tb,                  // output per-head
+          head_dim,
+          /*kv_dim_unused=*/0,            // tham số này không dùng trong v2 (giữ chỗ)
+          kv_mul,
+          ctx->local_q_heads,
+          p->seq_len,
+          l,
+          ctx->d_pos_list,
+          batch,
+          ctx->local_qkv_dim,
+          ctx->d_slot_ids);
+
     }
 
     // Output projection without bias using MFMA
