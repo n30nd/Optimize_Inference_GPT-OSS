@@ -116,6 +116,23 @@ struct KVCacheDeviceData {
     *cache_size = (size_t)layer_capacities[layer] * kv_dim;
   }
 
+  __device__ __forceinline__ int get_layer_offset_tokens(int layer) const {
+    return layer_offsets[layer];
+  }
+
+  __device__ __forceinline__ size_t get_layer_base_index(int slot_id, int layer) const {
+    size_t token_offset = (size_t)slot_id * (size_t)tokens_per_slot + (size_t)get_layer_offset_tokens(layer);
+    return token_offset * (size_t)kv_dim;
+  }
+
+  __device__ __forceinline__ hip_bfloat16* get_key_ptr(int slot_id, int layer) const {
+    return key_cache_base + get_layer_base_index(slot_id, layer);
+  }
+
+  __device__ __forceinline__ hip_bfloat16* get_value_ptr(int slot_id, int layer) const {
+    return value_cache_base + get_layer_base_index(slot_id, layer);
+  }
+
   __device__ __forceinline__ int get_layer_capacity(int layer) const {
     return layer_capacities[layer];
   }
@@ -123,11 +140,6 @@ struct KVCacheDeviceData {
   __device__ __forceinline__ int get_write_position(int layer, int pos) const {
     int cap = layer_capacities[layer];
     return (cap < seq_len) ? (pos % cap) : pos;
-  }
-
-  __device__ __forceinline__ int get_cache_position(int layer, int logical_pos) const {
-    int cap = layer_capacities[layer];
-    return (cap < seq_len) ? (logical_pos % cap) : logical_pos;
   }
 
   __device__ __forceinline__ void get_attention_range(int layer, int current_pos,
@@ -233,14 +245,11 @@ public:
     *cache_size = (size_t)layer_capacities[layer] * kv_dim;
   }
 
+  int get_layer_offset_tokens(int layer) const { return layer_offsets[layer]; }
+
   int get_write_position(int layer, int pos) const {
     int cap = layer_capacities[layer];
     return (cap < seq_len) ? (pos % cap) : pos;
-  }
-
-  int get_cache_position(int layer, int logical_pos) const {
-    int cap = layer_capacities[layer];
-    return (cap < seq_len) ? (logical_pos % cap) : logical_pos;
   }
 
   void get_attention_range(int layer, int current_pos, int *start_pos, int *end_pos) const {
@@ -996,9 +1005,8 @@ void paged_flash_attention_kernel_batched(
   float *output = all_output + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
 
   // Get cache pointers for this slot and layer
-  hip_bfloat16 *key_cache_layer, *value_cache_layer;
-  size_t cache_size;
-  cache_data->get_cache_ptrs(sid, layer, &key_cache_layer, &value_cache_layer, &cache_size);
+  hip_bfloat16 *key_cache_layer = cache_data->get_key_ptr(sid, layer);
+  hip_bfloat16 *value_cache_layer = cache_data->get_value_ptr(sid, layer);
   
   // Get attention range for this layer type
   int start_pos, end_pos;
@@ -1010,6 +1018,15 @@ void paged_flash_attention_kernel_batched(
   int att_len = end_pos - start_pos + 1;
   // Capacity (tokens) for this layer's cache (without sink). We allocate +1 slot in shared mem via host launch.
   int layer_capacity = cache_data->get_layer_capacity(layer);
+  const int token_count = att_len;
+  const bool layer_is_sliding = (layer_capacity < seq_len);
+  int cache_base = start_pos;
+  if (layer_is_sliding && token_count > 0) {
+    int write_pos_mod = cache_data->get_write_position(layer, pos);
+    int tmp = write_pos_mod - (token_count - 1);
+    int mod = tmp % layer_capacity;
+    cache_base = (mod < 0) ? (mod + layer_capacity) : mod;
+  }
   if (threadIdx.x == 0) s_att_len = att_len;
   __syncthreads();
   
@@ -1036,8 +1053,8 @@ void paged_flash_attention_kernel_batched(
     // Compute cache position for each column once
     if (ty == 0 && tx < 16) {
       if (col_in_range) {
-        const int t = start_pos + col;
-        const int cp = (t <= pos) ? cache_data->get_cache_position(layer, t) : -1;
+        int cp = cache_base + col;
+        if (layer_is_sliding && cp >= layer_capacity) cp -= layer_capacity;
         sColPos[tx] = cp;
       } else {
         sColPos[tx] = -1;
@@ -1184,14 +1201,13 @@ void paged_flash_attention_kernel_batched(
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
       float acc = 0.0f;
       for (int idx = 0; idx < len; idx++) {
-        const int t = start_pos + idx;
         const float p = shared_att_paged[idx];
-        if (t <= pos && p > 0.f) {
-        const int cache_pos = cache_data->get_cache_position(layer, t);
-          if (cache_pos >= 0) {
-            const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)head_base;
-            acc += p * bfloat16_to_float(v_bf16[i]);
-          }
+        const bool valid_token = (idx < token_count);
+        if (valid_token && p > 0.f) {
+          int cache_pos = cache_base + idx;
+          if (layer_is_sliding && cache_pos >= layer_capacity) cache_pos -= layer_capacity;
+          const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)head_base;
+          acc += p * bfloat16_to_float(v_bf16[i]);
         }
       }
       output[i] = acc;
@@ -1978,13 +1994,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         int write_pos = cache_data->get_write_position(layer, pos);
         
         // Get cache pointers for this slot and layer
-        hip_bfloat16 *key_ptr;
-        hip_bfloat16 *value_ptr;
-        size_t cache_size;
-        cache_data->get_cache_ptrs(sid, layer, &key_ptr, &value_ptr, &cache_size);
-        (void)key_ptr;
-        (void)cache_size;
-
+        hip_bfloat16 *value_ptr = cache_data->get_value_ptr(sid, layer);
         const float *v_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)v_offset;
         hip_bfloat16 *v_dst = value_ptr + (size_t)write_pos * (size_t)kv_dim;
         v_dst[i] = float_to_bfloat16(v_src[i]);
@@ -2006,13 +2016,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         int write_pos = cache_data->get_write_position(layer, pos);
         
         // Get cache pointers for this slot and layer
-        hip_bfloat16 *key_ptr;
-        hip_bfloat16 *value_ptr;
-        size_t cache_size;
-        cache_data->get_cache_ptrs(sid, layer, &key_ptr, &value_ptr, &cache_size);
-        (void)value_ptr;
-        (void)cache_size;
-
+        hip_bfloat16 *key_ptr = cache_data->get_key_ptr(sid, layer);
         const float *k_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)k_offset;
         hip_bfloat16 *k_dst = key_ptr + (size_t)write_pos * (size_t)kv_dim;
         k_dst[i] = float_to_bfloat16(k_src[i]);
