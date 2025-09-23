@@ -1023,9 +1023,9 @@ void paged_flash_attention_kernel_batched(
   int cache_base = start_pos;
   if (layer_is_sliding && token_count > 0) {
     int write_pos_mod = cache_data->get_write_position(layer, pos);
-    int tmp = write_pos_mod - (token_count - 1);
-    int mod = tmp % layer_capacity;
-    cache_base = (mod < 0) ? (mod + layer_capacity) : mod;
+    int base = write_pos_mod - (token_count - 1);
+    if (base < 0) base += layer_capacity;
+    cache_base = base;
   }
   if (threadIdx.x == 0) s_att_len = att_len;
   __syncthreads();
@@ -1038,12 +1038,14 @@ void paged_flash_attention_kernel_batched(
   const float inv_sqrt_d = rsqrtf((float)head_dim);
   const int head_base = (h / kv_mul) * head_dim;
 
+  const hip_bfloat16 *key_head = key_cache_layer + (size_t)head_base;
+  const hip_bfloat16 *value_head = value_cache_layer + (size_t)head_base;
+
   // Shared helpers for MFMA tiling
   using float4v = __attribute__((ext_vector_type(4))) float;
   using short4v = __attribute__((ext_vector_type(4))) short;
   __shared__ short sQbf16[16];       // Q tile (16 bf16 packed to i16)
   __shared__ int   sColPos[16];      // cache positions for 16 tokens in this tile (-1 if invalid)
-  __shared__ float sColSum[16];      // accumulate partial sums across rows for each column
 
   // Iterate over attention columns (positions) in tiles of 16
   for (int col0 = 0; col0 < att_len; col0 += 16) {
@@ -1059,7 +1061,6 @@ void paged_flash_attention_kernel_batched(
       } else {
         sColPos[tx] = -1;
       }
-      sColSum[tx] = 0.0f;
     }
     __syncthreads();
 
@@ -1095,7 +1096,7 @@ void paged_flash_attention_kernel_batched(
         const int cp = sColPos[tx];
         const int k_abs = kk * 16 + kij;
         if (cp >= 0 && k_abs < head_dim) {
-          const hip_bfloat16 *kb = key_cache_layer + (size_t)cp * (size_t)kv_dim + (size_t)head_base + (size_t)k_abs;
+          const hip_bfloat16 *kb = key_head + (size_t)cp * (size_t)kv_dim + (size_t)k_abs;
           union { hip_bfloat16 b; unsigned short u; } uk;
           uk.b = *kb;
           kval = (short)uk.u;
@@ -1206,7 +1207,7 @@ void paged_flash_attention_kernel_batched(
         if (valid_token && p > 0.f) {
           int cache_pos = cache_base + idx;
           if (layer_is_sliding && cache_pos >= layer_capacity) cache_pos -= layer_capacity;
-          const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)head_base;
+          const hip_bfloat16 *v_bf16 = value_head + (size_t)cache_pos * (size_t)kv_dim;
           acc += p * bfloat16_to_float(v_bf16[i]);
         }
       }
