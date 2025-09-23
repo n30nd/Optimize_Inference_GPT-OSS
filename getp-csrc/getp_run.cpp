@@ -26,6 +26,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include <stdexcept>
 #ifndef GETP_RUN
 #define GETP_RUN
 
@@ -89,79 +90,55 @@ enum LayerType {
   SLIDING_WINDOW = 1
 };
 
-struct KVCacheSlot {
-  hip_bfloat16 *key_ptr;
-  hip_bfloat16 *value_ptr;
-  size_t allocated_tokens;  // Number of tokens allocated for this slot
-  int current_pos;          // Current position in the cache
-  LayerType layer_type;     // Type of layer this slot serves
-};
-
-// Device-side KV cache management data structure
 struct KVCacheDeviceData {
   hip_bfloat16 *key_cache_base;
   hip_bfloat16 *value_cache_base;
-  KVCacheSlot *slots;  // Device pointer to slots data [max_batch][n_layers]
+  const int *layer_offsets;     // prefix sum (tokens) per layer
+  const int *layer_capacities;  // tokens kept per layer
   size_t kv_dim;
   int max_batch;
   int n_layers;
   int seq_len;
   int sliding_window_size;
-  
-  __device__ LayerType get_layer_type(int layer) const {
-    // Even layers use sliding window, odd layers use full attention
-    return (sliding_window_size > 0 && (layer % 2 == 0)) ? SLIDING_WINDOW : FULL_ATTENTION;
+  int tokens_per_slot;
+
+  __device__ __forceinline__ LayerType get_layer_type(int layer) const {
+    return (layer_capacities[layer] < seq_len) ? SLIDING_WINDOW : FULL_ATTENTION;
   }
-  
-  __device__ void get_cache_ptrs(int slot_id, int layer, hip_bfloat16 **key_ptr, hip_bfloat16 **value_ptr, size_t *cache_size) const {
-    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
-    *key_ptr = slot.key_ptr;
-    *value_ptr = slot.value_ptr;
-    *cache_size = slot.allocated_tokens * kv_dim;
+
+  __device__ __forceinline__ void get_cache_ptrs(int slot_id, int layer,
+                                                 hip_bfloat16 **key_ptr,
+                                                 hip_bfloat16 **value_ptr,
+                                                 size_t *cache_size) const {
+    size_t slot_base = (size_t)slot_id * (size_t)tokens_per_slot + (size_t)layer_offsets[layer];
+    *key_ptr = key_cache_base + slot_base * kv_dim;
+    *value_ptr = value_cache_base + slot_base * kv_dim;
+    *cache_size = (size_t)layer_capacities[layer] * kv_dim;
   }
-  
-  __device__ int get_write_position(int slot_id, int layer, int pos) const {
-    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
-    if (slot.layer_type == SLIDING_WINDOW) {
-      return pos % sliding_window_size;
-    }
-    return pos;
+
+  __device__ __forceinline__ int get_layer_capacity(int layer) const {
+    return layer_capacities[layer];
   }
-  
-  __device__ int get_cache_position(int slot_id, int layer, int logical_pos, int current_pos) const {
-    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
-    if (slot.layer_type == SLIDING_WINDOW) {
-      // For sliding window, we need to map logical position to cache position
-      // maintaining the sliding window invariant
-      if (current_pos < sliding_window_size) {
-        // Still filling the initial window
-        return logical_pos;
-      } else {
-        // Window is full, map to circular buffer position
-        // The cache contains positions [current_pos - sliding_window_size + 1, current_pos]
-        // mapped to cache positions [0, sliding_window_size - 1]
-        int window_start = current_pos - sliding_window_size + 1;
-        if (logical_pos < window_start) {
-          // Position is outside the sliding window, should not happen in correct usage
-          return -1;
-        }
-        int offset_in_window = logical_pos - window_start;
-        int cache_start_offset = window_start % sliding_window_size;
-        return (cache_start_offset + offset_in_window) % sliding_window_size;
-      }
-    }
-    return logical_pos;
+
+  __device__ __forceinline__ int get_write_position(int layer, int pos) const {
+    int cap = layer_capacities[layer];
+    return (cap < seq_len) ? (pos % cap) : pos;
   }
-  
-  __device__ void get_attention_range(int slot_id, int layer, int current_pos, int *start_pos, int *end_pos) const {
-    const KVCacheSlot &slot = slots[slot_id * n_layers + layer];
-    if (slot.layer_type == SLIDING_WINDOW) {
-      *start_pos = max(0, current_pos - sliding_window_size + 1);
-      *end_pos = current_pos;
+
+  __device__ __forceinline__ int get_cache_position(int layer, int logical_pos) const {
+    int cap = layer_capacities[layer];
+    return (cap < seq_len) ? (logical_pos % cap) : logical_pos;
+  }
+
+  __device__ __forceinline__ void get_attention_range(int layer, int current_pos,
+                                                      int *start_pos, int *end_pos) const {
+    int cap = layer_capacities[layer];
+    if (cap < seq_len) {
+      *start_pos = max(0, current_pos - cap + 1);
     } else {
       *start_pos = 0;
-      *end_pos = current_pos;
     }
+    *end_pos = current_pos;
   }
 };
 
@@ -169,186 +146,128 @@ class KVCacheManager {
 private:
   hip_bfloat16 *key_cache_base;
   hip_bfloat16 *value_cache_base;
-  std::vector<std::vector<KVCacheSlot>> slots; // [max_batch][n_layers]
-  KVCacheSlot *d_slots; // Device copy of slots data
-  KVCacheDeviceData *d_device_data; // Device copy of device data structure
+  KVCacheDeviceData *d_device_data;
+  int *d_layer_offsets;
+  int *d_layer_capacities;
+  std::vector<int> layer_offsets;
+  std::vector<int> layer_capacities;
   size_t kv_dim;
   int max_batch;
   int n_layers;
   int seq_len;
   int sliding_window_size;
+  int tokens_per_slot;
   size_t total_allocated_elements;
 
 public:
   KVCacheManager(int max_batch, int n_layers, int seq_len, size_t kv_dim, int sliding_window_size)
-    : max_batch(max_batch), n_layers(n_layers), seq_len(seq_len), kv_dim(kv_dim), 
-      sliding_window_size(sliding_window_size), total_allocated_elements(0), d_slots(nullptr), d_device_data(nullptr) {
-    
-    slots.resize(max_batch);
-    for (int batch_idx = 0; batch_idx < max_batch; batch_idx++) {
-      slots[batch_idx].resize(n_layers);
+    : key_cache_base(nullptr), value_cache_base(nullptr), d_device_data(nullptr),
+      d_layer_offsets(nullptr), d_layer_capacities(nullptr), layer_offsets(n_layers),
+      layer_capacities(n_layers), kv_dim(kv_dim), max_batch(max_batch), n_layers(n_layers),
+      seq_len(seq_len), sliding_window_size(sliding_window_size), tokens_per_slot(0),
+      total_allocated_elements(0) {
+
+    int offset_tokens = 0;
+    for (int layer = 0; layer < n_layers; ++layer) {
+      bool use_sliding = (sliding_window_size > 0) && ((layer & 1) == 0);
+      int capacity = use_sliding ? sliding_window_size : seq_len;
+      layer_offsets[layer] = offset_tokens;
+      layer_capacities[layer] = capacity;
+      offset_tokens += capacity;
     }
-    
-    // Calculate total memory needed
-    size_t total_elements = 0;
-    for (int batch_idx = 0; batch_idx < max_batch; batch_idx++) {
-      for (int layer = 0; layer < n_layers; layer++) {
-        LayerType layer_type = get_layer_type(layer);
-        size_t layer_tokens = (layer_type == SLIDING_WINDOW) ? sliding_window_size : seq_len;
-        total_elements += layer_tokens * kv_dim;
-      }
+    tokens_per_slot = offset_tokens;
+    size_t total_tokens = (size_t)tokens_per_slot * (size_t)max_batch;
+    total_allocated_elements = total_tokens * kv_dim;
+
+    if (total_tokens == 0 || kv_dim == 0) {
+      throw std::runtime_error("KVCacheManager: zero-sized cache allocation");
     }
-    
-    // Allocate base memory
-  HIP_CHECK(hipMalloc(&key_cache_base, total_elements * sizeof(hip_bfloat16)));
-  HIP_CHECK(hipMalloc(&value_cache_base, total_elements * sizeof(hip_bfloat16)));
-    
-  // Setup slot pointers
-  hip_bfloat16 *key_offset = key_cache_base;
-  hip_bfloat16 *value_offset = value_cache_base;
-    
-    for (int batch_idx = 0; batch_idx < max_batch; batch_idx++) {
-      for (int layer = 0; layer < n_layers; layer++) {
-        LayerType layer_type = get_layer_type(layer);
-        size_t layer_tokens = (layer_type == SLIDING_WINDOW) ? sliding_window_size : seq_len;
-        size_t layer_size = layer_tokens * kv_dim;
-        
-        slots[batch_idx][layer].key_ptr = key_offset;
-        slots[batch_idx][layer].value_ptr = value_offset;
-        slots[batch_idx][layer].allocated_tokens = layer_tokens;
-        slots[batch_idx][layer].current_pos = 0;
-        slots[batch_idx][layer].layer_type = layer_type;
-        
-        key_offset += layer_size;
-        value_offset += layer_size;
-      }
-    }
-    
-    // Copy slots data to device
-    size_t slots_size = max_batch * n_layers * sizeof(KVCacheSlot);
-    HIP_CHECK(hipMalloc(&d_slots, slots_size));
-    
-    // Flatten slots for device copy
-    std::vector<KVCacheSlot> flat_slots;
-    for (int batch_idx = 0; batch_idx < max_batch; batch_idx++) {
-      for (int layer = 0; layer < n_layers; layer++) {
-        flat_slots.push_back(slots[batch_idx][layer]);
-      }
-    }
-    HIP_CHECK(hipMemcpy(d_slots, flat_slots.data(), slots_size, hipMemcpyHostToDevice));
-    
-    // Create and copy device data structure
+
+    HIP_CHECK(hipMalloc(&key_cache_base, total_allocated_elements * sizeof(hip_bfloat16)));
+    HIP_CHECK(hipMalloc(&value_cache_base, total_allocated_elements * sizeof(hip_bfloat16)));
+
+    HIP_CHECK(hipMalloc(&d_layer_offsets, (size_t)n_layers * sizeof(int)));
+    HIP_CHECK(hipMalloc(&d_layer_capacities, (size_t)n_layers * sizeof(int)));
+    HIP_CHECK(hipMemcpy(d_layer_offsets, layer_offsets.data(), (size_t)n_layers * sizeof(int), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_layer_capacities, layer_capacities.data(), (size_t)n_layers * sizeof(int), hipMemcpyHostToDevice));
+
     HIP_CHECK(hipMalloc(&d_device_data, sizeof(KVCacheDeviceData)));
-  KVCacheDeviceData device_data;
+    KVCacheDeviceData device_data;
     device_data.key_cache_base = key_cache_base;
     device_data.value_cache_base = value_cache_base;
-    device_data.slots = d_slots;
+    device_data.layer_offsets = d_layer_offsets;
+    device_data.layer_capacities = d_layer_capacities;
     device_data.kv_dim = kv_dim;
     device_data.max_batch = max_batch;
     device_data.n_layers = n_layers;
     device_data.seq_len = seq_len;
     device_data.sliding_window_size = sliding_window_size;
+    device_data.tokens_per_slot = tokens_per_slot;
     HIP_CHECK(hipMemcpy(d_device_data, &device_data, sizeof(KVCacheDeviceData), hipMemcpyHostToDevice));
-    
-    total_allocated_elements = total_elements;
-    
-  printf("KVCacheManager allocated: %.2f GB (BF16, optimized per-layer)\n", 
-       (float)(2 * total_elements * sizeof(hip_bfloat16)) / (1024.0f * 1024.0f * 1024.0f));
+
+    printf("KVCacheManager allocated: %.2f GB (BF16, per-layer capacities)\n",
+           (float)(2 * total_allocated_elements * sizeof(hip_bfloat16)) / (1024.0f * 1024.0f * 1024.0f));
     printf("  - Full attention layers: %d tokens per slot\n", seq_len);
     printf("  - Sliding window layers: %d tokens per slot\n", sliding_window_size);
   }
-  
+
   ~KVCacheManager() {
     if (key_cache_base) HIP_CHECK(hipFree(key_cache_base));
     if (value_cache_base) HIP_CHECK(hipFree(value_cache_base));
+    if (d_layer_offsets) HIP_CHECK(hipFree(d_layer_offsets));
+    if (d_layer_capacities) HIP_CHECK(hipFree(d_layer_capacities));
+    if (d_device_data) HIP_CHECK(hipFree(d_device_data));
   }
-  
+
   LayerType get_layer_type(int layer) const {
-    // Even layers use sliding window, odd layers use full attention
-    // This matches the existing logic: (l % 2 == 0) for sliding window
-    return (sliding_window_size > 0 && (layer % 2 == 0)) ? SLIDING_WINDOW : FULL_ATTENTION;
+    return (layer_capacities[layer] < seq_len) ? SLIDING_WINDOW : FULL_ATTENTION;
   }
-  
-  // Get device data pointer for kernels
+
   KVCacheDeviceData* get_device_data() const { return d_device_data; }
-  
-  // Get cache pointers for a specific slot and layer
-  void get_cache_ptrs(int slot_id, int layer, hip_bfloat16 **key_ptr, hip_bfloat16 **value_ptr, size_t *cache_size) const {
-    const KVCacheSlot &slot = slots[slot_id][layer];
-    *key_ptr = slot.key_ptr;
-    *value_ptr = slot.value_ptr;
-    *cache_size = slot.allocated_tokens * kv_dim;
+
+  void get_cache_ptrs(int slot_id, int layer, hip_bfloat16 **key_ptr,
+                      hip_bfloat16 **value_ptr, size_t *cache_size) const {
+    size_t slot_base = (size_t)slot_id * (size_t)tokens_per_slot + (size_t)layer_offsets[layer];
+    *key_ptr = key_cache_base + slot_base * kv_dim;
+    *value_ptr = value_cache_base + slot_base * kv_dim;
+    *cache_size = (size_t)layer_capacities[layer] * kv_dim;
   }
-  
-  // Get the effective cache position for writing (handles sliding window wraparound)
-  int get_write_position(int slot_id, int layer, int pos) const {
-    const KVCacheSlot &slot = slots[slot_id][layer];
-    if (slot.layer_type == SLIDING_WINDOW) {
-      return pos % sliding_window_size;
-    }
-    return pos;
+
+  int get_write_position(int layer, int pos) const {
+    int cap = layer_capacities[layer];
+    return (cap < seq_len) ? (pos % cap) : pos;
   }
-  
-  // Get the cache position for reading a specific logical position
-  int get_cache_position(int slot_id, int layer, int logical_pos, int current_pos) const {
-    const KVCacheSlot &slot = slots[slot_id][layer];
-    if (slot.layer_type == SLIDING_WINDOW) {
-      // For sliding window, we need to map logical position to cache position
-      // maintaining the sliding window invariant
-      if (current_pos < sliding_window_size) {
-        // Still filling the initial window
-        return logical_pos;
-      } else {
-        // Window is full, map to circular buffer position
-        // The cache contains positions [current_pos - sliding_window_size + 1, current_pos]
-        // mapped to cache positions [0, sliding_window_size - 1]
-        int window_start = current_pos - sliding_window_size + 1;
-        if (logical_pos < window_start) {
-          // Position is outside the sliding window, should not happen in correct usage
-          return -1;
-        }
-        int offset_in_window = logical_pos - window_start;
-        int cache_start_offset = window_start % sliding_window_size;
-        return (cache_start_offset + offset_in_window) % sliding_window_size;
-      }
-    }
-    return logical_pos;
+
+  int get_cache_position(int layer, int logical_pos) const {
+    int cap = layer_capacities[layer];
+    return (cap < seq_len) ? (logical_pos % cap) : logical_pos;
   }
-  
-  // Get the range of valid positions for attention computation
-  void get_attention_range(int slot_id, int layer, int current_pos, int *start_pos, int *end_pos) const {
-    const KVCacheSlot &slot = slots[slot_id][layer];
-    if (slot.layer_type == SLIDING_WINDOW) {
-      *start_pos = std::max(0, current_pos - sliding_window_size + 1);
-      *end_pos = current_pos;
+
+  void get_attention_range(int layer, int current_pos, int *start_pos, int *end_pos) const {
+    int cap = layer_capacities[layer];
+    if (cap < seq_len) {
+      *start_pos = std::max(0, current_pos - cap + 1);
     } else {
       *start_pos = 0;
-      *end_pos = current_pos;
     }
+    *end_pos = current_pos;
   }
-  
-  // Legacy compatibility: get base pointers (for existing code)
+
   hip_bfloat16 *get_key_cache_base() const { return key_cache_base; }
   hip_bfloat16 *get_value_cache_base() const { return value_cache_base; }
-  
-  // Get the block size for a specific slot (for existing KV access patterns)
-  size_t get_kv_block_size(int slot_id) const {
-    size_t total_size = 0;
-    for (int layer = 0; layer < n_layers; layer++) {
-      total_size += slots[slot_id][layer].allocated_tokens * kv_dim;
-    }
-    return total_size;
+
+  size_t get_kv_block_size(int /*slot_id*/) const {
+    return (size_t)tokens_per_slot * kv_dim;
   }
-  
-  // Get layer offset within a slot's cache block
-  size_t get_layer_offset(int slot_id, int layer) const {
-    size_t offset = 0;
-    for (int l = 0; l < layer; l++) {
-      offset += slots[slot_id][l].allocated_tokens * kv_dim;
-    }
-    return offset;
+
+  size_t get_layer_offset(int /*slot_id*/, int layer) const {
+    return (size_t)layer_offsets[layer] * kv_dim;
   }
-  
+
+  int get_tokens_per_slot() const { return tokens_per_slot; }
+
+  int get_layer_capacity(int layer) const { return layer_capacities[layer]; }
+
   size_t get_total_allocated_elements() const { return total_allocated_elements; }
 };
 
@@ -1083,14 +1002,14 @@ void paged_flash_attention_kernel_batched(
   
   // Get attention range for this layer type
   int start_pos, end_pos;
-  cache_data->get_attention_range(sid, layer, pos, &start_pos, &end_pos);
+  cache_data->get_attention_range(layer, pos, &start_pos, &end_pos);
 
   // Simple shared memory for attention scores (allocate enough for sliding window)
   extern __shared__ float shared_att_paged[];
   __shared__ int s_att_len;
   int att_len = end_pos - start_pos + 1;
   // Capacity (tokens) for this layer's cache (without sink). We allocate +1 slot in shared mem via host launch.
-  int layer_capacity = (cache_data->get_layer_type(layer) == SLIDING_WINDOW) ? cache_data->sliding_window_size : seq_len;
+  int layer_capacity = cache_data->get_layer_capacity(layer);
   if (threadIdx.x == 0) s_att_len = att_len;
   __syncthreads();
   
@@ -1118,7 +1037,7 @@ void paged_flash_attention_kernel_batched(
     if (ty == 0 && tx < 16) {
       if (col_in_range) {
         const int t = start_pos + col;
-        const int cp = (t <= pos) ? cache_data->get_cache_position(sid, layer, t, pos) : -1;
+        const int cp = (t <= pos) ? cache_data->get_cache_position(layer, t) : -1;
         sColPos[tx] = cp;
       } else {
         sColPos[tx] = -1;
@@ -1268,7 +1187,7 @@ void paged_flash_attention_kernel_batched(
         const int t = start_pos + idx;
         const float p = shared_att_paged[idx];
         if (t <= pos && p > 0.f) {
-          const int cache_pos = cache_data->get_cache_position(sid, layer, t, pos);
+        const int cache_pos = cache_data->get_cache_position(layer, t);
           if (cache_pos >= 0) {
             const hip_bfloat16 *v_bf16 = value_cache_layer + (size_t)cache_pos * (size_t)kv_dim + (size_t)head_base;
             acc += p * bfloat16_to_float(v_bf16[i]);
@@ -2002,7 +1921,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
   }
 
   // Precompute constants for caches
-  const size_t kv_block_size  = (size_t)p->n_layers * (size_t)p->seq_len * (size_t)kv_dim;
+  const size_t kv_block_size = (gpu_ctx->state.kv_cache_manager != nullptr)
+                                 ? gpu_ctx->state.kv_cache_manager->get_kv_block_size(0)
+                                 : (size_t)p->n_layers * (size_t)p->seq_len * (size_t)kv_dim;
   const int q_size = head_dim * p->n_attn_heads;
   const int k_size = head_dim * p->n_kv_heads;
   const int v_size = head_dim * p->n_kv_heads;
@@ -2054,16 +1975,19 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         int pos = pos_list[b];
         
         // Get the write position (handles sliding window wraparound)
-        int write_pos = cache_data->get_write_position(sid, layer, pos);
+        int write_pos = cache_data->get_write_position(layer, pos);
         
         // Get cache pointers for this slot and layer
-  hip_bfloat16 *key_ptr, *value_ptr;
+        hip_bfloat16 *key_ptr;
+        hip_bfloat16 *value_ptr;
         size_t cache_size;
         cache_data->get_cache_ptrs(sid, layer, &key_ptr, &value_ptr, &cache_size);
-        
+        (void)key_ptr;
+        (void)cache_size;
+
         const float *v_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)v_offset;
-  hip_bfloat16 *v_dst = value_ptr + (size_t)write_pos * (size_t)kv_dim;
-  v_dst[i] = float_to_bfloat16(v_src[i]);
+        hip_bfloat16 *v_dst = value_ptr + (size_t)write_pos * (size_t)kv_dim;
+        v_dst[i] = float_to_bfloat16(v_src[i]);
       }
     }
   };
@@ -2079,16 +2003,19 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         int pos = pos_list[b];
         
         // Get the write position (handles sliding window wraparound)
-        int write_pos = cache_data->get_write_position(sid, layer, pos);
+        int write_pos = cache_data->get_write_position(layer, pos);
         
         // Get cache pointers for this slot and layer
-  hip_bfloat16 *key_ptr, *value_ptr;
+        hip_bfloat16 *key_ptr;
+        hip_bfloat16 *value_ptr;
         size_t cache_size;
         cache_data->get_cache_ptrs(sid, layer, &key_ptr, &value_ptr, &cache_size);
-        
+        (void)value_ptr;
+        (void)cache_size;
+
         const float *k_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)k_offset;
-  hip_bfloat16 *k_dst = key_ptr + (size_t)write_pos * (size_t)kv_dim;
-  k_dst[i] = float_to_bfloat16(k_src[i]);
+        hip_bfloat16 *k_dst = key_ptr + (size_t)write_pos * (size_t)kv_dim;
+        k_dst[i] = float_to_bfloat16(k_src[i]);
       }
     }
   };
@@ -2170,7 +2097,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 block(64);
       dim3 grid(1, p->n_attn_heads, batch);
       // Use shared memory for attention scores: use sliding window size for paged attention
-      int max_attention_length = (p->sliding_window > 0 && (l % 2 == 0)) ? p->sliding_window : p->seq_len;
+      int max_attention_length = gpu_ctx->state.kv_cache_manager
+                                   ? gpu_ctx->state.kv_cache_manager->get_layer_capacity(l)
+                                   : p->seq_len;
       // Allocate +1 element to store optional attention sink (baseline behavior) even for sliding-window layers.
       size_t shared_mem_bytes = (size_t)(max_attention_length + 1) * sizeof(float);
       
@@ -2659,6 +2588,8 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
 
   // Initialize new KV Cache Manager with paged attention support
   s->kv_cache_manager = new KVCacheManager(max_batch, p->n_layers, p->seq_len, kv_dim, p->sliding_window);
+  s->key_cache = nullptr;
+  s->value_cache = nullptr;
   
   // Removed legacy 'logits' buffer
 
