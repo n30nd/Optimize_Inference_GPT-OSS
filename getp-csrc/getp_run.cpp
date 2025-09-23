@@ -1622,7 +1622,7 @@ __device__ inline float block_reduce_sum(float val, float *shared) {
 #endif
 
 // Gợi ý lượng shared mem để set khi launch (giữ nguyên chữ ký cũ)
-static inline size_t paged_flash_attention_v2_smem_bytes(int head_dim, int BK = FA_V2_BK) {
+static inline size_t flash_attention_v2_smem_bytes(int head_dim, int BK = FA_V2_BK) {
   size_t bytes = 0;
   // q_sh: [head_dim] float
   bytes += (size_t)head_dim * sizeof(float);
@@ -1641,7 +1641,7 @@ static inline size_t paged_flash_attention_v2_smem_bytes(int head_dim, int BK = 
 #endif
 
 __global__ __launch_bounds__(64)
-void paged_flash_attention_kernel_batched_v2(
+void flash_attention_kernel_batched_v2(
     const float * __restrict__ all_q,
     KVCacheDeviceData * __restrict__ cache_data,
     const hip_bfloat16 * __restrict__ attn_sinks,
@@ -2633,7 +2633,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     launch_rope(ctx);
   }
 
-  struct PagedKVWriterV {
+  struct ContiguousKVWriterV {
     static __global__ void run(const float *qkv, KVCacheDeviceData *cache_data, int layer,
                                int batch, int q_stride, int v_offset, int v_size,
                                const int *pos_list, const int *slot_ids) {
@@ -2651,7 +2651,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     }
   };
 
-  struct PagedKVWriterK {
+  struct ContiguousKVWriterK {
     static __global__ void run(const float *qkv, KVCacheDeviceData *cache_data, int layer,
                                int batch, int q_stride, int k_offset, int k_size,
                                const int *pos_list, const int *slot_ids) {
@@ -2727,7 +2727,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       int v_size = ctx->local_kv_dim;
 
       dim3 block_v(256), grid_v((v_size + block_v.x - 1) / block_v.x, batch);
-      PagedKVWriterV::run<<<grid_v, block_v, 0, ctx->batch_stream>>>(
+      ContiguousKVWriterV::run<<<grid_v, block_v, 0, ctx->batch_stream>>>(
         ctx->state.qkv,
         ctx->state.kv_cache_manager->get_device_data(), l,
         batch, q_stride, q_size + k_size, v_size,
@@ -2744,7 +2744,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         ctx->local_kv_heads, head_dim, batch, q_stride, head_dim / 2, ctx->d_slot_ids);
 
       dim3 block_k(256), grid_k((k_size + block_k.x - 1) / block_k.x, batch);
-      PagedKVWriterK::run<<<grid_k, block_k, 0, ctx->batch_stream>>>(
+      ContiguousKVWriterK::run<<<grid_k, block_k, 0, ctx->batch_stream>>>(
         ctx->state.qkv,
         ctx->state.kv_cache_manager->get_device_data(), l,
         batch, q_stride, q_size, k_size,
@@ -2761,9 +2761,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 grid(1, ctx->local_q_heads, batch);
 
       // BK = FA_V2_BK (mặc định 64). Bạn có thể chỉnh macro ở trên.
-      size_t shared_mem_bytes = paged_flash_attention_v2_smem_bytes(/*head_dim=*/head_dim, /*BK=*/FA_V2_BK);
+      size_t shared_mem_bytes = flash_attention_v2_smem_bytes(/*head_dim=*/head_dim, /*BK=*/FA_V2_BK);
 
-      paged_flash_attention_kernel_batched_v2<<<grid, block, shared_mem_bytes, ctx->batch_stream>>>(
+      flash_attention_kernel_batched_v2<<<grid, block, shared_mem_bytes, ctx->batch_stream>>>(
           ctx->state.qkv,
           ctx->state.kv_cache_manager->get_device_data(),
           ctx->weights.attn_sinks,
