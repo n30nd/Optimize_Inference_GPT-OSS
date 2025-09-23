@@ -813,14 +813,10 @@ __global__ void flash_attention_kernel_optimized_batched(
   }
 }
 
-// Flash Decoding optimized paged attention kernel for split KV caches (sliding vs full)
-// Key optimizations:
-// - Split-K reduction for better parallelization across sequence length
-// - Online softmax computation to reduce memory usage
-// - Improved memory coalescing with tile-based processing
-// - Vectorized loads/stores for higher bandwidth utilization
-// - MFMA BF16xBF16->FP32 for Q·K^T score computation in 16-token tiles
-__global__ __launch_bounds__(128) // Increased thread count for flash decoding
+// New paged attention kernel for split KV caches (sliding vs full)
+// Optimized: use MFMA BF16xBF16->FP32 for Q·K^T score computation in 16-token tiles.
+// Each block uses 64 threads (16x4) to feed 16x16x16bf16 MFMA and reduce rows → 1x16 scores.
+__global__ __launch_bounds__(64)
 void paged_flash_attention_kernel_batched(
     const float * __restrict__ all_q,
     const hip_bfloat16 * __restrict__ key_cache_sliding,
@@ -837,12 +833,8 @@ void paged_flash_attention_kernel_batched(
     int q_stride,
     const int * __restrict__ slot_ids) {
 
-  // Flash decoding uses split-K approach: each block processes a chunk of the sequence
-  const int split_k = 4; // Number of sequence chunks per head
-  const int block_seq_id = blockIdx.x % split_k;
-  const int h = (blockIdx.x / split_k) % n_heads;   // head index
-  const int b = blockIdx.y;   // batch index
-  
+  int h = blockIdx.y;   // head index
+  int b = blockIdx.z;   // batch index
   if (h >= n_heads || b >= batch) return;
 
   int pos = pos_list[b];
@@ -899,29 +891,15 @@ void paged_flash_attention_kernel_batched(
     if (cache_base < 0) cache_base = 0;
   }
 
-  // Flash decoding: compute sequence range for this block
-  const int seq_chunk_size = (att_len + split_k - 1) / split_k;
-  const int seq_start = block_seq_id * seq_chunk_size;
-  const int seq_end = min(seq_start + seq_chunk_size, att_len);
-  const int local_seq_len = seq_end - seq_start;
-  
-  if (local_seq_len <= 0) {
-    // This block has no work to do
-    return;
-  }
+  extern __shared__ float shared_att_paged[];
+  __shared__ int s_att_len;
+  if (threadIdx.x == 0) s_att_len = att_len;
+  __syncthreads();
 
-  // Shared memory for flash decoding
-  extern __shared__ float shared_mem[];
-  float *shared_att_chunk = shared_mem; // Local attention scores
-  float *shared_output_chunk = shared_mem + local_seq_len; // Local output accumulation
-  
-  // Thread mapping for improved memory coalescing
-  const int lane_id = threadIdx.x;
-  const int warp_id = lane_id / 64;
-  const int lane_in_warp = lane_id % 64;
-  const int tx = lane_in_warp & 15;  // column within 16-token tile
-  const int ty = (lane_in_warp >> 4) & 3; // row group (4 rows per lane)
-  
+  // Phase 1: Compute attention scores using MFMA BF16×BF16→FP32 in 16-token tiles.
+  const int lane_id = threadIdx.x;         // 0..63
+  const int tx   = lane_id & 15;           // column within 16-token tile
+  const int ty   = (lane_id >> 4) & 3;     // row group (4 rows per lane)
   const float inv_sqrt_d = rsqrtf((float)head_dim);
   const int head_base = (h / kv_mul) * head_dim;
 
@@ -930,16 +908,12 @@ void paged_flash_attention_kernel_batched(
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   using short4v = __attribute__((ext_vector_type(4))) short;
-  
-  // Shared memory for MFMA computation
-  __shared__ short sQbf16[16];     // Q tile (16 bf16 packed to i16)
-  __shared__ int sColPos[16];      // cache positions for 16 tokens in this tile
-  
-  // Phase 1: Compute attention scores for this sequence chunk using MFMA
-  for (int col0 = seq_start; col0 < seq_end; col0 += 16) {
+  __shared__ short sQbf16[16];       // Q tile (16 bf16 packed to i16)
+  __shared__ int   sColPos[16];      // cache positions for 16 tokens in this tile (-1 if invalid)
+
+  for (int col0 = 0; col0 < att_len; col0 += 16) {
     const int col = col0 + tx;
-    const bool col_in_range = (col < seq_end);
-    const int local_col = col - seq_start;
+    const bool col_in_range = (col < att_len);
 
     if (ty == 0 && tx < 16) {
       if (col_in_range) {
@@ -953,11 +927,8 @@ void paged_flash_attention_kernel_batched(
     __syncthreads();
 
     float4v acc = {0.f, 0.f, 0.f, 0.f};
-    
-    // Vectorized Q·K^T computation using MFMA
     const int Ktiles = (head_dim + 15) / 16;
     for (int kk = 0; kk < Ktiles; ++kk) {
-      // Load Q tile with vectorized access
       if (ty == 0 && tx < 16) {
         const int k_row = kk * 16 + tx;
         unsigned short qbits = 0u;
@@ -972,13 +943,10 @@ void paged_flash_attention_kernel_batched(
 
       const int kbase = ty * 4;
       short4v Areg, Breg;
-      
-      // Load A register (Q) and B register (K) with improved coalescing
       #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const int kij = kbase + j;
         Areg[j] = (tx == kij) ? sQbf16[kij] : (short)0;
-        
         short kval = 0;
         const int cp = sColPos[tx];
         const int k_abs = kk * 16 + kij;
@@ -991,134 +959,98 @@ void paged_flash_attention_kernel_batched(
         Breg[j] = kval;
       }
 
-      // MFMA computation
       acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
       __syncthreads();
     }
 
-    // Reduce MFMA output
     float partial = acc.x + acc.y + acc.z + acc.w;
     partial += __shfl_xor(partial, 16, 64);
     partial += __shfl_xor(partial, 32, 64);
 
     if (ty == 0 && col_in_range) {
       float score = (sColPos[tx] >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
-      shared_att_chunk[local_col] = score;
+      shared_att_paged[col] = score;
     }
     __syncthreads();
   }
 
-  // Handle attention sink for the last block
-  int local_len = local_seq_len;
-  if (block_seq_id == split_k - 1 && threadIdx.x == 0 && (pos + 1) < seq_len) {
+  if (threadIdx.x == 0 && (pos + 1) < seq_len) {
     size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
-    if (local_len < seq_chunk_size) {
-      shared_att_chunk[local_len] = bfloat16_to_float(attn_sinks[sink_idx]);
-      local_len++;
+    if (s_att_len < layer_capacity + 1) {
+      shared_att_paged[s_att_len] = bfloat16_to_float(attn_sinks[sink_idx]);
+      s_att_len++;
     }
   }
   __syncthreads();
+  const int len = s_att_len;
 
-  // Phase 2: Online softmax computation (Flash Decoding style)
   float local_max = -INFINITY;
-  for (int i = threadIdx.x; i < local_len; i += blockDim.x) {
-    local_max = fmaxf(local_max, shared_att_chunk[i]);
+  for (int i = threadIdx.x; i < len; i += blockDim.x) {
+    local_max = fmaxf(local_max, shared_att_paged[i]);
   }
-  
-  // Efficient block-wide reduction for max
   const int W = 64;
   for (int offset = W/2; offset > 0; offset >>= 1) {
     float other = __shfl_down(local_max, offset, W);
     local_max = fmaxf(local_max, other);
   }
-  
   __shared__ float warp_max[4];
   const int lane = threadIdx.x & (W-1);
-  const int wid = threadIdx.x / W;
+  const int wid  = threadIdx.x / W;
   if (lane == 0) warp_max[wid] = local_max;
   __syncthreads();
-  
   float max_val = -INFINITY;
   if (wid == 0) {
     int warps = blockDim.x / W;
     float val = (lane < warps) ? warp_max[lane] : -INFINITY;
-    for (int offset = W/2; offset > 0; offset >>= 1) 
-      val = fmaxf(val, __shfl_down(val, offset, W));
+    for (int offset = W/2; offset > 0; offset >>= 1) val = fmaxf(val, __shfl_down(val, offset, W));
     if (lane == 0) warp_max[0] = val;
   }
   __syncthreads();
   max_val = warp_max[0];
 
-  // Compute local softmax and sum
   float local_sum = 0.0f;
-  for (int i = threadIdx.x; i < local_len; i += blockDim.x) {
-    float v = shared_att_chunk[i];
+  for (int i = threadIdx.x; i < len; i += blockDim.x) {
+    float v = shared_att_paged[i];
     v = (v == -INFINITY) ? 0.0f : expf(v - max_val);
-    shared_att_chunk[i] = v;
+    shared_att_paged[i] = v;
     local_sum += v;
   }
-  
-  // Block-wide reduction for sum
   for (int offset = W/2; offset > 0; offset >>= 1) {
     local_sum += __shfl_down(local_sum, offset, W);
   }
-  
   __shared__ float warp_sum[4];
   if (lane == 0) warp_sum[wid] = local_sum;
   __syncthreads();
-  
   float sum_val = 0.0f;
   if (wid == 0) {
     int warps = blockDim.x / W;
     float val = (lane < warps) ? warp_sum[lane] : 0.0f;
-    for (int offset = W/2; offset > 0; offset >>= 1) 
-      val += __shfl_down(val, offset, W);
+    for (int offset = W/2; offset > 0; offset >>= 1) val += __shfl_down(val, offset, W);
     if (lane == 0) warp_sum[0] = val;
   }
   __syncthreads();
   sum_val = warp_sum[0];
-
-  // Phase 3: Compute output contribution for this chunk
-  // Vectorized value computation with improved memory access patterns
-  for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-    float acc = 0.0f;
-    
-    // Vectorized loop over attention weights
-    for (int idx = 0; idx < local_len; idx++) {
-      const float p = shared_att_chunk[idx];
-      const int global_idx = seq_start + idx;
-      const bool valid_token = (global_idx < token_count);
-      
-      if (valid_token && p > 0.f) {
-        int cache_pos = cache_base + global_idx;
-        if (layer_is_sliding && cache_pos >= layer_capacity) 
-          cache_pos -= layer_capacity;
-        
-        const hip_bfloat16 *v_bf16 = value_head + (size_t)cache_pos * (size_t)kv_dim + (size_t)d;
-        acc += p * bfloat16_to_float(*v_bf16);
-      }
-    }
-    shared_output_chunk[d] = acc;
+  const float inv_sum = 1.0f / (sum_val + 1e-8f);
+  __syncthreads();
+  for (int i = threadIdx.x; i < len; i += blockDim.x) {
+    shared_att_paged[i] *= inv_sum;
   }
   __syncthreads();
 
-  // Phase 4: Global reduction across split-K blocks
-  // For now, use atomics for simplicity. Can be optimized with separate reduction kernel
-  if (block_seq_id == 0) {
-    // First block writes the initial values
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-      output[d] = shared_output_chunk[d] * sum_val;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    float acc = 0.0f;
+    for (int idx = 0; idx < len; idx++) {
+      const float p = shared_att_paged[idx];
+      const bool valid_token = (idx < token_count);
+      if (valid_token && p > 0.f) {
+        int cache_pos = cache_base + idx;
+        if (layer_is_sliding && cache_pos >= layer_capacity) cache_pos -= layer_capacity;
+        const hip_bfloat16 *v_bf16 = value_head + (size_t)cache_pos * (size_t)kv_dim;
+        acc += p * bfloat16_to_float(v_bf16[i]);
+      }
     }
-  } else {
-    // Other blocks accumulate their contributions
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-      atomicAdd(&output[d], shared_output_chunk[d] * sum_val);
-    }
+    output[i] = acc;
   }
-  
-  // Final normalization will be done by a separate kernel or host code
-  // This is a simplified version - full flash decoding would use a more sophisticated
-  // reduction scheme to avoid atomics
 }
 
 
@@ -2028,35 +1960,19 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         gpu_ctx->d_slot_ids);
     }
 
-    // Attention computation (Flash Decoding optimized, always enabled) -> tb
+    // Attention computation (FlashAttention-like, always enabled) -> tb
     {
-      // Flash decoding configuration
-      const int split_k = 4; // Number of sequence chunks per head
-      const int block_size = 128; // Increased for flash decoding
-      
-      dim3 block(block_size);
-      dim3 grid(split_k * p->n_attn_heads, batch); // Split-K approach: split_k blocks per head
-      
+      dim3 block(64);
+      dim3 grid(1, p->n_attn_heads, batch);
       const bool sliding_enabled = (gpu_ctx->state.sliding_window_tokens > 0) && (gpu_ctx->state.sliding_layers > 0);
       int max_attention_length = p->seq_len;
       if (sliding_enabled && uses_sliding_window(l)) {
         max_attention_length = std::min(p->seq_len, gpu_ctx->state.sliding_window_tokens);
       }
-      
-      // Flash decoding shared memory calculation
-      // Need space for: attention chunk + output chunk per sequence segment
-      const int seq_chunk_size = (max_attention_length + split_k - 1) / split_k;
-      size_t shared_mem_bytes = (size_t)(seq_chunk_size + head_dim) * sizeof(float);
-      
-      // Ensure we don't exceed shared memory limits
-      const size_t max_shared_mem = 65536; // 64KB typical limit
-      if (shared_mem_bytes > max_shared_mem) {
-        // Fallback to smaller chunk size if needed
-        const int reduced_chunk = max_shared_mem / (2 * sizeof(float));
-        shared_mem_bytes = (size_t)reduced_chunk * sizeof(float);
-      }
+      // Allocate +1 element to store optional attention sink (baseline behavior) even for sliding-window layers.
+      size_t shared_mem_bytes = (size_t)(max_attention_length + 1) * sizeof(float);
 
-      // Use the new flash decoding paged attention kernel
+      // Use the new paged attention kernel that handles different layer types
       paged_flash_attention_kernel_batched<<<grid, block, shared_mem_bytes, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.qkv,
         gpu_ctx->state.key_cache_sliding,
@@ -2705,7 +2621,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   hipStream_t load_stream;
   hipError_t stream_status = hipStreamCreateWithFlags(&load_stream, hipStreamNonBlocking);
   if (stream_status != hipSuccess) {
-    HIP_CHECK(hipGetLastError());
+    hipGetLastError();
     HIP_CHECK(hipStreamCreate(&load_stream));
   }
 
@@ -2740,7 +2656,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
 
     hipError_t pin_ret = maybe_pin_host(cpu_data, count, sizeof(float));
     if (pin_ret != hipSuccess && pin_ret != hipErrorInvalidValue) {
-      HIP_CHECK(hipGetLastError()); // clear sticky error state if registration failed
+      hipGetLastError(); // clear sticky error state if registration failed
     }
 
     size_t done = 0;
@@ -2781,7 +2697,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     size_t total_f32 = (size_t)layers * (size_t)M * (size_t)K;
     hipError_t pin_ret = maybe_pin_host(cpu_data, total_f32, sizeof(float));
     if (pin_ret != hipSuccess && pin_ret != hipErrorInvalidValue) {
-      HIP_CHECK(hipGetLastError());
+      hipGetLastError();
     }
 
     size_t max_rows = staging_elems / (size_t)K;
@@ -2873,7 +2789,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     size_t total_f32 = (size_t)n_layers * (size_t)n_experts * (size_t)M_mlp1 * (size_t)K_mlp1;
     hipError_t pin_ret_mlp1 = maybe_pin_host(cpu_w->w_mlp1, total_f32, sizeof(float));
     if (pin_ret_mlp1 != hipSuccess && pin_ret_mlp1 != hipErrorInvalidValue) {
-      HIP_CHECK(hipGetLastError());
+      hipGetLastError();
     }
     int layers_flat = n_layers * n_experts;
     int Mpad = round_up16(M_mlp1);
@@ -2926,7 +2842,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
     hipError_t pin_ret_mlp2 = maybe_pin_host(cpu_w->w_mlp2,
         total_f32, sizeof(float));
     if (pin_ret_mlp2 != hipSuccess && pin_ret_mlp2 != hipErrorInvalidValue) {
-      HIP_CHECK(hipGetLastError());
+      hipGetLastError();
     }
 
     int Mpad = round_up16(M_mlp2);
