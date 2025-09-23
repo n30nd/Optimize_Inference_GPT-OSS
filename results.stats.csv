@@ -1,0 +1,28 @@
+"Name","Calls","TotalDurationNs","AverageNs","Percentage"
+"<barrier packet>",106160,785452123074,7398757,59.97847623507009
+"mlp1_grouped_mfma_matvec_mxfp4_kernel(float*, hip_bfloat16 const*, unsigned char const*, unsigned char const*, hip_bfloat16 const*, int const*, int const*, int const*, int const*, int, int, int, int, int, int)",49152,211695906984,4306964,16.16546388137423
+"mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(float*, hip_bfloat16 const*, unsigned char const*, unsigned char const*, hip_bfloat16 const*, int const*, float const*, int const*, int const*, int const*, int, int, int, int, int, int, int)",49152,103339717208,2102451,7.891198700235664
+"gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(hip_bfloat16 const*, hip_bfloat16 const*, float*, hip_bfloat16 const*, int, int, int, int, int, int const*, int, int)",123904,96102922553,775624,7.3385846025943415
+"flash_attention_kernel_batched_v2(float const*, KVCacheDeviceData*, hip_bfloat16 const*, float*, int, int, int, int, int, int, int const*, int, int, int const*)",49152,90835112720,1848045,6.93632557547132
+"quantize_mxfp4_kernel(float const*, unsigned long, unsigned long, unsigned char*, unsigned char*)",3072,5241425147,1706193,0.4002442470801243
+"gather_pack_x_fp32_to_bf16_mfma_kernel(float const*, hip_bfloat16*, int, int, int, int, int const*)",123904,4835127277,39023,0.36921864230515483
+"residual_connection_kernel_float_batched(float*, float const*, int, int, int, int const*)",98304,1933157766,19665,0.14761925484762917
+"topk_softmax_batched_kernel_float(float const*, int, int, float*, int*, int, int, int const*, int)",24576,1927785317,78441,0.14720900539358284
+"rmsnorm_kernel_float_batched(float*, float const*, hip_bfloat16 const*, int, int, int, int const*)",98304,1658853826,16874,0.12667293378850833
+"swiglu_grouped_kernel_bf16(hip_bfloat16*, float const*, int, int, float)",49152,1570476464,31951,0.11992428628891301
+"apply_rotary_emb_kernel_float_batched(float*, float const*, float const*, int, int, int, int, int, int const*)",98304,1250218804,12717,0.09546886006352683
+"add_selected_kernel_float(float*, float const*, int, int, int const*)",49152,988950571,20120,0.07551796803125346
+"gather_fp32_to_bf16_slots_kernel(float const*, hip_bfloat16*, int, int, int, int const*)",49152,804497625,16367,0.06143282354803286
+"zero_selected_slots_kernel_float(float*, int, int const*, int)",49152,462874579,9417,0.035345899668227106
+"sample_argmax_kernel(float const*, int*, int, int)",1024,402293068,392864,0.03071979120018009
+"add_bias_kernel_float_batched(float*, hip_bfloat16 const*, int, int, int, int const*)",24576,258377819,10513,0.01973017504352803
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::ContiguousKVWriterV::run(float const*, KVCacheDeviceData*, int, int, int, int, int, int const*, int const*)",49152,237387758,4829,0.018127337852211965
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::ContiguousKVWriterK::run(float const*, KVCacheDeviceData*, int, int, int, int, int, int const*, int const*)",49152,234948309,4780,0.017941057327180675
+"pack_mxfp4_row_to_tile16_kernel(unsigned char const*, unsigned char*, unsigned long, unsigned long)",3072,101895632,33169,0.007780925867831232
+"gather_topk_pairs_kernel(float const*, int const*, int const*, int, int, float*, int*, int*)",24576,97317318,3959,0.007431317929449204
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::'lambda1'(GPUContext*)::operator()(GPUContext*",2048,33055174,16140,0.002524149989493783
+"convert_fp32_to_bf16_kernel(float const*, hip_bfloat16*, int)",2736,28699602,10489,0.0021915510136711353
+"rmsnorm_final_batched_kernel(float*, hip_bfloat16 const*, int, int, int const*)",1024,21812197,21300,0.001665616911542693
+"pack_mxfp4_scales_row_to_tile16_kernel(unsigned char const*, unsigned char*, unsigned long, unsigned long)",3072,16793744,5466,0.0012823992014430565
+"pack_bf16_rowmajor_to_bf16_tiles16_kernel(hip_bfloat16 const*, int, int, int, int, hip_bfloat16*, int, int)",122,12939002,106057,0.0009880444665745834
+"gpu_forward_batch_step(Transformer*, GPUContext*, int const*, int const*, int const*, int, int*)::'lambda2'(GPUContext*)::operator()(GPUContext*",2048,11978743,5848,0.0009147174362960161
