@@ -3863,13 +3863,31 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     }
   }
 
-  // Final RMSNorm + logits across TP ranks with fused greedy sampling
+  // Final RMSNorm + logits across TP ranks with fused greedy sampling (tp_size == 2 enforced)
   if (host_next_tokens_out != nullptr) {
+    if (ctxs.size() != 2) {
+      fprintf(stderr, "[GPU] Expected tensor parallel size 2, got %zu.\n", ctxs.size());
+      exit(EXIT_FAILURE);
+    }
+
+    GPUContext *tp_leader = nullptr;
+    GPUContext *tp_follower = nullptr;
+    for (GPUContext *ctx : ctxs) {
+      if (ctx->tp_rank == 0) tp_leader = ctx;
+      else if (ctx->tp_rank == 1) tp_follower = ctx;
+    }
+    if (tp_leader == nullptr || tp_follower == nullptr) {
+      fprintf(stderr, "[GPU] Missing TP ranks (0/1) for fused logits path.\n");
+      exit(EXIT_FAILURE);
+    }
+
     int vocab = p->vocab_size;
     int Bpad_logits = ((batch + 15) / 16) * 16;
     int Mpad_logits = ((vocab + 15) / 16) * 16;
     int Kpad_logits = ((hidden_dim + 15) / 16) * 16;
     int group_y = (batch + 15) / 16;
+
+    GPUContext *tp_pair[2] = {tp_leader, tp_follower};
 
     dim3 block_norm(128);
     dim3 grid_norm(1, batch);
@@ -3877,7 +3895,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     dim3 block_pack_logits(256);
     dim3 grid_pack_logits((hidden_dim + block_pack_logits.x - 1) / block_pack_logits.x, batch);
 
-    for (GPUContext *ctx : ctxs) {
+    for (GPUContext *ctx : tp_pair) {
       HIP_CHECK(hipSetDevice(ctx->device_id));
       rmsnorm_final_batched_kernel<<<grid_norm, block_norm, shared_norm, ctx->batch_stream>>>(
         ctx->state.x, ctx->weights.rms_out_w,
@@ -3894,86 +3912,60 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       }
     }
 
-    bool multi_tp = ctxs.size() > 1;
-    int tp_size = static_cast<int>(ctxs.size());
-    unsigned long long *merge_buffer = nullptr;
-
-    if (multi_tp) {
-      merge_buffer = leader->state.tp_argmax_packed;
-      if (merge_buffer != nullptr) {
-        int threads_init = 128;
-        int total = tp_size * leader->max_batch;
-        if (total > 0) {
-          int blocks_init = (total + threads_init - 1) / threads_init;
-          HIP_CHECK(hipSetDevice(leader->device_id));
-          init_argmax_packed_kernel<<<blocks_init, threads_init, 0, leader->batch_stream>>>(
-            merge_buffer, total);
+    if (batch > 0) {
+      for (GPUContext *ctx : tp_pair) {
+        HIP_CHECK(hipSetDevice(ctx->device_id));
+        if (ctx->logits_tile_count <= 0) {
+          fprintf(stderr, "[GPU] TP rank %d assigned zero logits tiles.\n", ctx->tp_rank);
+          exit(EXIT_FAILURE);
         }
-      }
-    }
-
-    for (GPUContext *ctx : ctxs) {
-      HIP_CHECK(hipSetDevice(ctx->device_id));
-      if (ctx->logits_tile_count > 0 && batch > 0) {
         const hip_bfloat16 *w_out_packed = ctx->weights.out_packed16;
         dim3 block_gemm(16, 4, 1);
         dim3 grid_gemm(ctx->logits_tile_count, group_y, 1);
-        float *dst_logits = nullptr; // fused path skips storing full logits matrix
-        int out_stride = 0;
         logits_kernel<<<grid_gemm, block_gemm, 0, ctx->batch_stream>>>(
-          w_out_packed, ctx->state.xpack_bf16, dst_logits, nullptr,
-          vocab, hidden_dim, batch, Bpad_logits, out_stride,
+          w_out_packed, ctx->state.xpack_bf16, nullptr, nullptr,
+          vocab, hidden_dim, batch, Bpad_logits, 0,
           ctx->d_batch_iota, Mpad_logits, Kpad_logits,
           ctx->logits_tile_offset, ctx->logits_row_offset,
           ctx->state.argmax_packed, vocab);
+        record_batch_event(ctx);
       }
-      record_batch_event(ctx);
+
+      HIP_CHECK(hipSetDevice(tp_leader->device_id));
+      stream_wait_on(tp_leader, tp_follower);
+
+      unsigned long long *tp_packed = tp_leader->state.tp_argmax_packed;
+      if (tp_packed == nullptr) {
+        fprintf(stderr, "[GPU] Leader TP argmax staging buffer missing.\n");
+        exit(EXIT_FAILURE);
+      }
+      size_t stride = (size_t)tp_leader->max_batch;
+      size_t bytes = (size_t)batch * sizeof(unsigned long long);
+
+      HIP_CHECK(hipMemcpyAsync(tp_packed,
+                               tp_leader->state.argmax_packed,
+                               bytes,
+                               hipMemcpyDeviceToDevice,
+                               tp_leader->batch_stream));
+      HIP_CHECK(hipMemcpyPeerAsync(tp_packed + stride, tp_leader->device_id,
+                                   tp_follower->state.argmax_packed, tp_follower->device_id,
+                                   bytes, tp_leader->batch_stream));
+
+      dim3 block_merge(128);
+      dim3 grid_merge((batch + block_merge.x - 1) / block_merge.x);
+      merge_argmax_candidates_kernel<<<grid_merge, block_merge, 0, tp_leader->batch_stream>>>(
+        tp_packed,
+        tp_leader->d_next_tokens,
+        batch,
+        2,
+        tp_leader->max_batch);
     }
 
-    if (batch > 0) {
-      HIP_CHECK(hipSetDevice(leader->device_id));
-      if (multi_tp && merge_buffer != nullptr) {
-        for (GPUContext *ctx : ctxs) {
-          stream_wait_on(leader, ctx);
-          size_t offset = (size_t)ctx->tp_rank * (size_t)leader->max_batch;
-          unsigned long long *dst = merge_buffer + offset;
-          size_t bytes = (size_t)batch * sizeof(unsigned long long);
-          if (ctx == leader) {
-            HIP_CHECK(hipMemcpyAsync(dst, ctx->state.argmax_packed,
-                                     bytes, hipMemcpyDeviceToDevice,
-                                     leader->batch_stream));
-          } else {
-            HIP_CHECK(hipMemcpyPeerAsync(dst, leader->device_id,
-                                         ctx->state.argmax_packed, ctx->device_id,
-                                         bytes, leader->batch_stream));
-          }
-        }
-
-        dim3 block_merge(128);
-        dim3 grid_merge((batch + block_merge.x - 1) / block_merge.x);
-        merge_argmax_candidates_kernel<<<grid_merge, block_merge, 0, leader->batch_stream>>>(
-          merge_buffer,
-          leader->d_next_tokens,
-          batch,
-          tp_size,
-          leader->max_batch);
-      } else {
-        dim3 block_merge(128);
-        dim3 grid_merge((batch + block_merge.x - 1) / block_merge.x);
-        merge_argmax_candidates_kernel<<<grid_merge, block_merge, 0, leader->batch_stream>>>(
-          leader->state.argmax_packed,
-          leader->d_next_tokens,
-          batch,
-          1,
-          leader->max_batch);
-      }
-    }
-
-    HIP_CHECK(hipSetDevice(leader->device_id));
-    HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, leader->d_next_tokens,
-                             batch * sizeof(int), hipMemcpyDeviceToHost, leader->batch_stream));
-    record_batch_event(leader);
-    wait_batch_event_host(leader);
+    HIP_CHECK(hipSetDevice(tp_leader->device_id));
+    HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, tp_leader->d_next_tokens,
+                             batch * sizeof(int), hipMemcpyDeviceToHost, tp_leader->batch_stream));
+    record_batch_event(tp_leader);
+    wait_batch_event_host(tp_leader);
   }
 
   // Keep follower activations aligned (optional)
