@@ -334,6 +334,11 @@ typedef struct {
   hip_bfloat16 *t_bf16;
   // FP32 outputs for sampling and host reads
   float *logits_fp32;        // final logits
+  float *logits_local_fp32;  // TP-partitioned logits shard
+  float *argmax_vals;        // per-slot local maxima (alias to tp_argmax_vals on leader)
+  int   *argmax_indices;     // per-slot local argmax indices (alias on leader)
+  float *tp_argmax_vals;     // [tp_size][max_batch] staging on leader
+  int   *tp_argmax_indices;
   // Batched MoE staging (for grouped GEMMs across slots/experts)
   int   *sel_sids;        // [max_batch * experts_per_token]
   int   *sel_eids;        // [max_batch * experts_per_token]
@@ -395,6 +400,11 @@ typedef struct {
   int local_q_dim;
   int local_kv_dim;
   int local_qkv_dim;
+  int logits_tile_offset;
+  int logits_tile_count;
+  int logits_row_offset;
+  int logits_row_padded;
+  int logits_row_actual;
   bool is_leader;
   GPUTransformerWeights weights;
   GPURunState state;
@@ -1729,19 +1739,22 @@ void logits_kernel(
     int M, int K, int B, int Bpad,
     int out_stride,
     const int* __restrict__ slot_ids,
-    int Mpad, int Kpad)
+    int Mpad, int Kpad,
+    int tile_offset,
+    int row_offset)
 {
   const int tx = threadIdx.x;     // cột trong tile (0..15) = cột batch
   const int ty = threadIdx.y;     // nhóm hàng (0..3)
   const int lane = ty * 16 + tx;  // 0..63
 
-  const int tile_m  = blockIdx.x;          // tile dọc theo M
+  const int tile_m_local  = blockIdx.x;    // tile index within assigned range
+  const int tile_global   = tile_offset + tile_m_local;
   const int b_group = blockIdx.y;          // nhóm 16 batch
   const int b_base  = b_group * 16;
   if (b_base >= B) return;
 
   const int cols_this = min(16, B - b_base);  // số cột hợp lệ trong nhóm này
-  const int base_row = tile_m * 16;           // hàng cơ sở của tile M
+  const int base_row = tile_global * 16;      // hàng cơ sở toàn cục
 
   __shared__ __align__(16) uint16_t sW[2][16 * 16];
   __shared__ __align__(16) uint16_t sX[2][16 * 16];
@@ -1778,7 +1791,7 @@ void logits_kernel(
   const size_t tiles_per_row = (size_t)((Kpad + 15) / 16);
   const size_t tile_elems = 256;
   const hip_bfloat16* w_tile_row_base =
-      W_packed + ((size_t)tile_m * tiles_per_row) * tile_elems;
+      W_packed + ((size_t)tile_global * tiles_per_row) * tile_elems;
 
   const size_t x_stride = (size_t)Bpad;
   const size_t b_base_sz = (size_t)b_base;
@@ -1896,20 +1909,28 @@ void logits_kernel(
   }
   __syncthreads();
 
-  const int r0 = base_row + ty * 4 + 0;
-  const int r1 = base_row + ty * 4 + 1;
-  const int r2 = base_row + ty * 4 + 2;
-  const int r3 = base_row + ty * 4 + 3;
+  const int r0_global = base_row + ty * 4 + 0;
+  const int r1_global = base_row + ty * 4 + 1;
+  const int r2_global = base_row + ty * 4 + 2;
+  const int r3_global = base_row + ty * 4 + 3;
+  const int r0_local = r0_global - row_offset;
+  const int r1_local = r1_global - row_offset;
+  const int r2_local = r2_global - row_offset;
+  const int r3_local = r3_global - row_offset;
 
   if (tx < cols_this) {
     const int sid = s_slot[tx];
     if (sid >= 0) {
       float* __restrict__ out = dst + (size_t)sid * (size_t)out_stride;
       const int bias_base = ty * 4;
-      if (r0 < M) out[r0] = acc[0] + s_bias_rows[bias_base + 0];
-      if (r1 < M) out[r1] = acc[1] + s_bias_rows[bias_base + 1];
-      if (r2 < M) out[r2] = acc[2] + s_bias_rows[bias_base + 2];
-      if (r3 < M) out[r3] = acc[3] + s_bias_rows[bias_base + 3];
+      if (r0_global < M && r0_local >= 0 && r0_local < out_stride)
+        out[r0_local] = acc[0] + s_bias_rows[bias_base + 0];
+      if (r1_global < M && r1_local >= 0 && r1_local < out_stride)
+        out[r1_local] = acc[1] + s_bias_rows[bias_base + 1];
+      if (r2_global < M && r2_local >= 0 && r2_local < out_stride)
+        out[r2_local] = acc[2] + s_bias_rows[bias_base + 2];
+      if (r3_global < M && r3_local >= 0 && r3_local < out_stride)
+        out[r3_local] = acc[3] + s_bias_rows[bias_base + 3];
     }
   }
 }
@@ -2471,6 +2492,94 @@ __global__ void sample_argmax_kernel(const float *logits, int *next_tokens,
     if (tid == 0) {
         next_tokens[b] = s_indices[0] >= 0 ? s_indices[0] : 0;
     }
+}
+
+__global__ void init_argmax_candidates_kernel(float *vals, int *indices, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    vals[idx] = -FLT_MAX;
+    indices[idx] = -1;
+}
+
+__global__ void sample_argmax_partial_kernel(const float *logits, float *max_vals, int *max_indices,
+                                             int batch, int vocab_local,
+                                             int vocab_offset, int vocab_limit) {
+    int b = blockIdx.x;
+    if (b >= batch) return;
+
+    const float *logit = logits + (size_t)b * (size_t)vocab_local;
+    int tid = threadIdx.x;
+
+    float max_val = -FLT_MAX;
+    int max_idx = -1;
+
+    for (int idx = tid; idx < vocab_local; idx += blockDim.x) {
+        int global_idx = vocab_offset + idx;
+        if (global_idx >= vocab_limit) continue;
+        float val = logit[idx];
+        if (val > max_val || (val == max_val && (max_idx < 0 || global_idx < max_idx))) {
+            max_val = val;
+            max_idx = global_idx;
+        }
+    }
+
+    extern __shared__ unsigned char smem[];
+    float *s_vals = reinterpret_cast<float*>(smem);
+    int *s_indices = reinterpret_cast<int*>(s_vals + blockDim.x);
+
+    s_vals[tid] = max_val;
+    s_indices[tid] = max_idx;
+    __syncthreads();
+
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            float other_val = s_vals[tid + offset];
+            int other_idx = s_indices[tid + offset];
+            if (other_idx >= 0) {
+                if (s_indices[tid] < 0 || other_val > s_vals[tid] ||
+                    (other_val == s_vals[tid] && other_idx < s_indices[tid])) {
+                    s_vals[tid] = other_val;
+                    s_indices[tid] = other_idx;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        int winner = s_indices[0];
+        if (winner < 0) {
+            max_vals[b] = -FLT_MAX;
+            max_indices[b] = -1;
+        } else {
+            max_vals[b] = s_vals[0];
+            max_indices[b] = winner;
+        }
+    }
+}
+
+__global__ void merge_argmax_candidates_kernel(const float *vals, const int *indices,
+                                               int *next_tokens, int batch,
+                                               int tp_size, int stride) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) return;
+
+    float best_val = -FLT_MAX;
+    int best_idx = 0;
+    bool found = false;
+
+    for (int tp = 0; tp < tp_size; ++tp) {
+        const float cand_val = vals[tp * stride + b];
+        const int cand_idx = indices[tp * stride + b];
+        if (cand_idx < 0) continue;
+        if (!found || cand_val > best_val || (cand_val == best_val && cand_idx < best_idx)) {
+            best_val = cand_val;
+            best_idx = cand_idx;
+            found = true;
+        }
+    }
+
+    next_tokens[b] = found ? best_idx : 0;
 }
 
 __global__ void rmsnorm_final_batched_kernel(float *x, const hip_bfloat16 *weight,
@@ -3796,43 +3905,129 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     }
   }
 
-  // Final RMSNorm + logits on leader
+  // Final RMSNorm + logits across TP ranks
   if (host_next_tokens_out != nullptr) {
-    HIP_CHECK(hipSetDevice(leader->device_id));
-    dim3 block_norm(128);
-    dim3 grid_norm(1, batch);
-    size_t shared_norm = block_norm.x * sizeof(float);
-    rmsnorm_final_batched_kernel<<<grid_norm, block_norm, shared_norm, leader->batch_stream>>>(
-      leader->state.x, leader->weights.rms_out_w,
-      hidden_dim, batch, leader->d_slot_ids);
-
     int vocab = p->vocab_size;
     int Bpad_logits = ((batch + 15) / 16) * 16;
-    dim3 block_pack_logits(256);
-    dim3 grid_pack_logits((hidden_dim + block_pack_logits.x - 1) / block_pack_logits.x, batch);
-    gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack_logits, block_pack_logits, 0, leader->batch_stream>>>(
-      leader->state.x, leader->state.xpack_bf16,
-      hidden_dim, batch, Bpad_logits, hidden_dim, leader->d_slot_ids);
-
-    const hip_bfloat16 *w_out_packed = leader->weights.out_packed16;
-    const int Mpad_logits = ((vocab + 15) / 16) * 16;
-    const int Kpad_logits = ((hidden_dim + 15) / 16) * 16;
-    const int group_y = (batch + 15) / 16;
-    dim3 block_gemm(16, 4, 1);
-    dim3 grid_gemm((Mpad_logits + 15) / 16, group_y, 1);
-    logits_kernel<<<grid_gemm, block_gemm, 0, leader->batch_stream>>>(
-      w_out_packed, leader->state.xpack_bf16, leader->state.logits_fp32, nullptr,
-      vocab, hidden_dim, batch, Bpad_logits, vocab,
-      leader->d_batch_iota, Mpad_logits, Kpad_logits);
+    int Mpad_logits = ((vocab + 15) / 16) * 16;
+    int Kpad_logits = ((hidden_dim + 15) / 16) * 16;
+    int group_y = (batch + 15) / 16;
 
     if (batch > 0) {
-      dim3 block_argmax(256);
-      dim3 grid_argmax(batch);
-      size_t shared_argmax = block_argmax.x * (sizeof(float) + sizeof(int));
-      sample_argmax_kernel<<<grid_argmax, block_argmax, shared_argmax, leader->batch_stream>>>(
-        leader->state.logits_fp32, leader->d_next_tokens, batch, p->vocab_size);
+      dim3 block_norm(128);
+      dim3 grid_norm(1, batch);
+      size_t shared_norm = block_norm.x * sizeof(float);
+      dim3 block_pack_logits(256);
+      dim3 grid_pack_logits((hidden_dim + block_pack_logits.x - 1) / block_pack_logits.x, batch);
+
+      for (GPUContext *ctx : ctxs) {
+        HIP_CHECK(hipSetDevice(ctx->device_id));
+        rmsnorm_final_batched_kernel<<<grid_norm, block_norm, shared_norm, ctx->batch_stream>>>(
+          ctx->state.x, ctx->weights.rms_out_w,
+          hidden_dim, batch, ctx->d_slot_ids);
+        gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack_logits, block_pack_logits, 0, ctx->batch_stream>>>(
+          ctx->state.x, ctx->state.xpack_bf16,
+          hidden_dim, batch, Bpad_logits, hidden_dim, ctx->d_slot_ids);
+      }
+
+      if (ctxs.size() == 1) {
+        GPUContext *ctx = leader;
+        const hip_bfloat16 *w_out_packed = ctx->weights.out_packed16;
+        dim3 block_gemm(16, 4, 1);
+        dim3 grid_gemm((Mpad_logits + 15) / 16, group_y, 1);
+        logits_kernel<<<grid_gemm, block_gemm, 0, ctx->batch_stream>>>(
+          w_out_packed, ctx->state.xpack_bf16, ctx->state.logits_fp32, nullptr,
+          vocab, hidden_dim, batch, Bpad_logits, vocab,
+          ctx->d_batch_iota, Mpad_logits, Kpad_logits,
+          0, 0);
+
+        dim3 block_argmax(256);
+        dim3 grid_argmax(batch);
+        size_t shared_argmax = block_argmax.x * (sizeof(float) + sizeof(int));
+        sample_argmax_kernel<<<grid_argmax, block_argmax, shared_argmax, ctx->batch_stream>>>(
+          ctx->state.logits_fp32, ctx->d_next_tokens, batch, vocab);
+      } else {
+        int tp_size = static_cast<int>(ctxs.size());
+        HIP_CHECK(hipSetDevice(leader->device_id));
+        int total_candidates = batch * tp_size;
+        if (total_candidates > 0) {
+          int threads_init = 128;
+          int blocks_init = (total_candidates + threads_init - 1) / threads_init;
+          init_argmax_candidates_kernel<<<blocks_init, threads_init, 0, leader->batch_stream>>>(
+            leader->state.tp_argmax_vals,
+            leader->state.tp_argmax_indices,
+            total_candidates);
+        }
+
+        for (GPUContext *ctx : ctxs) {
+          HIP_CHECK(hipSetDevice(ctx->device_id));
+          const hip_bfloat16 *w_out_packed = ctx->weights.out_packed16;
+          if (ctx->logits_tile_count > 0 && ctx->logits_row_padded > 0) {
+            dim3 block_gemm(16, 4, 1);
+            dim3 grid_gemm(ctx->logits_tile_count, group_y, 1);
+            logits_kernel<<<grid_gemm, block_gemm, 0, ctx->batch_stream>>>(
+              w_out_packed, ctx->state.xpack_bf16, ctx->state.logits_local_fp32, nullptr,
+              vocab, hidden_dim, batch, Bpad_logits, ctx->logits_row_padded,
+              ctx->d_batch_iota, Mpad_logits, Kpad_logits,
+              ctx->logits_tile_offset, ctx->logits_row_offset);
+          }
+
+          dim3 block_argmax(256);
+          dim3 grid_argmax(batch);
+          size_t shared_argmax = block_argmax.x * (sizeof(float) + sizeof(int));
+          if (ctx->logits_row_padded > 0 && ctx->state.logits_local_fp32) {
+            sample_argmax_partial_kernel<<<grid_argmax, block_argmax, shared_argmax, ctx->batch_stream>>>(
+              ctx->state.logits_local_fp32,
+              ctx->state.argmax_vals,
+              ctx->state.argmax_indices,
+              batch,
+              ctx->logits_row_padded,
+              ctx->logits_row_offset,
+              vocab);
+          } else {
+            int threads = 128;
+            int blocks = (batch + threads - 1) / threads;
+            if (blocks > 0) {
+              init_argmax_candidates_kernel<<<blocks, threads, 0, ctx->batch_stream>>>(
+                ctx->state.argmax_vals,
+                ctx->state.argmax_indices,
+                batch);
+            }
+          }
+
+          record_batch_event(ctx);
+        }
+
+        for (GPUContext *ctx : ctxs) {
+          stream_wait_on(leader, ctx);
+          if (ctx == leader) continue;
+          if (ctx->logits_row_padded <= 0 || ctx->state.argmax_vals == nullptr) continue;
+          size_t offset = (size_t)ctx->tp_rank * leader->max_batch;
+          float *dst_vals = leader->state.tp_argmax_vals + offset;
+          int *dst_idx = leader->state.tp_argmax_indices + offset;
+          size_t bytes_vals = (size_t)batch * sizeof(float);
+          size_t bytes_idx = (size_t)batch * sizeof(int);
+          HIP_CHECK(hipMemcpyPeerAsync(dst_vals, leader->device_id,
+                                       ctx->state.argmax_vals, ctx->device_id,
+                                       bytes_vals, leader->batch_stream));
+          HIP_CHECK(hipMemcpyPeerAsync(dst_idx, leader->device_id,
+                                       ctx->state.argmax_indices, ctx->device_id,
+                                       bytes_idx, leader->batch_stream));
+        }
+
+        dim3 block_merge(128);
+        dim3 grid_merge((batch + block_merge.x - 1) / block_merge.x);
+        merge_argmax_candidates_kernel<<<grid_merge, block_merge, 0, leader->batch_stream>>>(
+          leader->state.tp_argmax_vals,
+          leader->state.tp_argmax_indices,
+          leader->d_next_tokens,
+          batch,
+          tp_size,
+          leader->max_batch);
+      }
     }
 
+    HIP_CHECK(hipSetDevice(leader->device_id));
     HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, leader->d_next_tokens,
                              batch * sizeof(int), hipMemcpyDeviceToHost, leader->batch_stream));
     record_batch_event(leader);
@@ -4240,6 +4435,33 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   int intermediate_local = ctx->local_intermediate_dim;
   int mlp1_out_local = ctx->local_mlp1_out_dim;
 
+  int vocab = p->vocab_size;
+  int tp_size = std::max(1, ctx->tp_size);
+  int Mpad_logits = ((vocab + 15) / 16) * 16;
+  int total_tiles = (Mpad_logits + 15) / 16;
+  if (Mpad_logits % 16 == 0) {
+    total_tiles = Mpad_logits / 16;
+  }
+  int tiles_per_rank = (total_tiles + tp_size - 1) / tp_size;
+  int tile_start = ctx->tp_rank * tiles_per_rank;
+  int tile_end = std::min(total_tiles, tile_start + tiles_per_rank);
+  if (tile_start > total_tiles) tile_start = total_tiles;
+  if (tile_end < tile_start) tile_end = tile_start;
+  int row_offset = tile_start * 16;
+  int row_end = tile_end * 16;
+  if (row_offset > Mpad_logits) row_offset = Mpad_logits;
+  if (row_end > Mpad_logits) row_end = Mpad_logits;
+  int rows_padded = std::max(0, row_end - row_offset);
+  int row_start_actual = std::min(row_offset, vocab);
+  int row_end_actual = std::min(row_offset + rows_padded, vocab);
+  int rows_actual = std::max(0, row_end_actual - row_start_actual);
+
+  ctx->logits_tile_offset = tile_start;
+  ctx->logits_tile_count = std::max(0, tile_end - tile_start);
+  ctx->logits_row_offset = row_offset;
+  ctx->logits_row_padded = rows_padded;
+  ctx->logits_row_actual = rows_actual;
+
   HIP_CHECK(hipMalloc(&s->x,   B * (size_t)hidden_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->t,   B * (size_t)hidden_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(reinterpret_cast<void **>(&s->t_bf16), B * (size_t)hidden_dim * sizeof(hip_bfloat16)));
@@ -4266,6 +4488,27 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
     HIP_CHECK(hipMalloc(&s->logits_fp32, B * (size_t)p->vocab_size * sizeof(float)));
   } else {
     s->logits_fp32 = nullptr;
+  }
+
+  if (ctx->logits_row_padded > 0) {
+    HIP_CHECK(hipMalloc(&s->logits_local_fp32,
+                        (size_t)ctx->max_batch * (size_t)ctx->logits_row_padded * sizeof(float)));
+  } else {
+    s->logits_local_fp32 = nullptr;
+  }
+
+  size_t argmax_elems = (size_t)ctx->max_batch;
+  if (ctx->is_leader) {
+    size_t tp_slots = (size_t)tp_size * argmax_elems;
+    HIP_CHECK(hipMalloc(&s->tp_argmax_vals, tp_slots * sizeof(float)));
+    HIP_CHECK(hipMalloc(&s->tp_argmax_indices, tp_slots * sizeof(int)));
+    s->argmax_vals = s->tp_argmax_vals + (size_t)ctx->tp_rank * argmax_elems;
+    s->argmax_indices = s->tp_argmax_indices + (size_t)ctx->tp_rank * argmax_elems;
+  } else {
+    HIP_CHECK(hipMalloc(&s->argmax_vals, argmax_elems * sizeof(float)));
+    HIP_CHECK(hipMalloc(&s->argmax_indices, argmax_elems * sizeof(int)));
+    s->tp_argmax_vals = nullptr;
+    s->tp_argmax_indices = nullptr;
   }
 
   HIP_CHECK(hipMalloc(&s->cos_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
@@ -4349,6 +4592,14 @@ void gpu_free_run_state(GPUContext *ctx) {
   HIP_CHECK(hipFree(s->cos_vals));
   HIP_CHECK(hipFree(s->sin_vals));
   if (s->logits_fp32) HIP_CHECK(hipFree(s->logits_fp32));
+  if (s->logits_local_fp32) HIP_CHECK(hipFree(s->logits_local_fp32));
+  if (ctx->is_leader) {
+    if (s->tp_argmax_vals) HIP_CHECK(hipFree(s->tp_argmax_vals));
+    if (s->tp_argmax_indices) HIP_CHECK(hipFree(s->tp_argmax_indices));
+  } else {
+    if (s->argmax_vals) HIP_CHECK(hipFree(s->argmax_vals));
+    if (s->argmax_indices) HIP_CHECK(hipFree(s->argmax_indices));
+  }
   HIP_CHECK(hipFree(s->sel_sids));
   HIP_CHECK(hipFree(s->sel_eids));
   HIP_CHECK(hipFree(s->sel_w));
