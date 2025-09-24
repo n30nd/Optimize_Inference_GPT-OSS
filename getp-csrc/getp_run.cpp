@@ -1133,7 +1133,7 @@ __global__ void gather_fp32_to_bf16_slots_kernel(const float *x, hip_bfloat16 *d
 // Mỗi block xử lý: 16 hàng (tile_m) × 16 cột batch (b_group)
 // Grid.x = ceil(M/16), Grid.y = ceil(B/16)
 __global__ __launch_bounds__(64)
-void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
+void qkv_kernel(
     const hip_bfloat16* __restrict__ W_packed,    // [Mpad x Kpad] tile16 BF16
     const hip_bfloat16* __restrict__ Xpack,       // [K x Bpad] BF16 (cột = batch)
     float* __restrict__ dst,                      // scatter theo slot_ids
@@ -1326,29 +1326,586 @@ void gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel(
   }
 }
 
-// Launcher tối ưu: gom batch theo nhóm 16 cột/khối.
-// Wrapper function cho MFMA-based batched matmul
-void launch_gemm16x16_mfma_f32_batched(
-    const hip_bfloat16* W_packed,
-    const hip_bfloat16* X_packed,
-    float* output,
-    const hip_bfloat16* bias,
-    int M, int K, int batch, int Bpad,
+__global__ __launch_bounds__(64)
+void o_kernel(
+    const hip_bfloat16* __restrict__ W_packed,    // [Mpad x Kpad] tile16 BF16
+    const hip_bfloat16* __restrict__ Xpack,       // [K x Bpad] BF16 (cột = batch)
+    float* __restrict__ dst,                      // scatter theo slot_ids
+    const hip_bfloat16* __restrict__ bias,        // [M] hoặc nullptr
+    int M, int K, int B, int Bpad,
     int out_stride,
-    const int* slot_ids,
-    hipStream_t stream)
+    const int* __restrict__ slot_ids,
+    int Mpad, int Kpad)
 {
-  const int Mpad = ((M + 15) / 16) * 16;
-  const int Kpad = ((K + 15) / 16) * 16;
+  const int tx = threadIdx.x;     // cột trong tile (0..15) = cột batch
+  const int ty = threadIdx.y;     // nhóm hàng (0..3)
+  const int lane = ty * 16 + tx;  // 0..63
 
-  // Dùng kernel tối ưu: 1 block xử lý 16 cột batch
-  const int group_y = (batch + 15) / 16;
-  dim3 block(16, 4, 1);                   // 64 threads / MFMA 16x16x16bf16
-  dim3 grid((Mpad + 15) / 16, group_y, 1);
+  const int tile_m  = blockIdx.x;          // tile dọc theo M
+  const int b_group = blockIdx.y;          // nhóm 16 batch
+  const int b_base  = b_group * 16;
+  if (b_base >= B) return;
 
-  gemm16x16_mfma_f32_packedW_batched16_scatter_bias_kernel<<<grid, block, 0, stream>>>(
-      W_packed, X_packed, output, bias,
-      M, K, batch, Bpad, out_stride, slot_ids, Mpad, Kpad);
+  const int cols_this = min(16, B - b_base);  // số cột hợp lệ trong nhóm này
+  const int base_row = tile_m * 16;           // hàng cơ sở của tile M
+
+  __shared__ __align__(16) uint16_t sW[2][16 * 16];
+  __shared__ __align__(16) uint16_t sX[2][16 * 16];
+  __shared__ int s_slot[16];
+  __shared__ float s_bias_rows[16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  using short4v = __attribute__((ext_vector_type(4))) short;
+
+  const bool has_bias = (bias != nullptr);
+  const bool full_tile = (cols_this == 16);
+
+  if (ty == 0) {
+    const int col = tx;
+    const int global_col = b_base + col;
+    int slot_val = -1;
+    if (col < cols_this && global_col < B) {
+      slot_val = slot_ids[global_col];
+    }
+    s_slot[col] = slot_val;
+
+    const int row = base_row + col;
+    float bias_val = 0.0f;
+    if (has_bias && row < M) {
+      bias_val = bfloat16_to_float(bias[row]);
+    }
+    s_bias_rows[col] = bias_val;
+  }
+  __syncthreads();
+
+  float4v acc = {0.f, 0.f, 0.f, 0.f};
+
+  const int Ktiles = (Kpad + 15) / 16;
+  const size_t tiles_per_row = (size_t)((Kpad + 15) / 16);
+  const size_t tile_elems = 256;
+  const hip_bfloat16* w_tile_row_base =
+      W_packed + ((size_t)tile_m * tiles_per_row) * tile_elems;
+
+  const size_t x_stride = (size_t)Bpad;
+  const size_t b_base_sz = (size_t)b_base;
+
+  {
+    const int idx4 = lane * 4;
+    if (idx4 < 256) {
+      const hip_bfloat16* w_src = w_tile_row_base + idx4;
+      const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
+      uint32_t v0 = w_u32[0];
+      uint32_t v1 = w_u32[1];
+      uint16_t* dst_tile = &sW[0][0] + idx4;
+      dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
+      dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
+      dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
+      dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
+    }
+
+    const int row_in_tile = lane & 15;
+    const int col_group   = lane >> 4;
+    const int col_base    = col_group * 4;
+    uint16_t vals[4] = {0, 0, 0, 0};
+    const int k_row = row_in_tile;
+    if (k_row < K) {
+      const size_t row_offset = (size_t)k_row * x_stride + b_base_sz + (size_t)col_base;
+      const hip_bfloat16* x_src = Xpack + row_offset;
+      if (full_tile) {
+        const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+        uint32_t xv0 = x_u32[0];
+        uint32_t xv1 = x_u32[1];
+        vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+        vals[1] = static_cast<uint16_t>(xv0 >> 16);
+        vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+        vals[3] = static_cast<uint16_t>(xv1 >> 16);
+      } else {
+        const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+        if (col_base + 0 < cols_this) vals[0] = x_u16[0];
+        if (col_base + 1 < cols_this) vals[1] = x_u16[1];
+        if (col_base + 2 < cols_this) vals[2] = x_u16[2];
+        if (col_base + 3 < cols_this) vals[3] = x_u16[3];
+      }
+    }
+    uint16_t* dst_tile = &sX[0][row_in_tile * 16 + col_base];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      dst_tile[i] = vals[i];
+    }
+  }
+  __syncthreads();
+
+  int ping = 0;
+
+  for (int kt = 0; kt < Ktiles; ++kt) {
+    const int pong = ping ^ 1;
+
+    if (kt + 1 < Ktiles) {
+      const int idx4 = lane * 4;
+      if (idx4 < 256) {
+        const hip_bfloat16* w_src = w_tile_row_base + (size_t)(kt + 1) * tile_elems + idx4;
+        const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
+        uint32_t v0 = w_u32[0];
+        uint32_t v1 = w_u32[1];
+        uint16_t* dst_tile = &sW[pong][0] + idx4;
+        dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
+        dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
+        dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
+        dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
+      }
+
+      const int row_in_tile = lane & 15;
+      const int col_group   = lane >> 4;
+      const int col_base    = col_group * 4;
+      uint16_t vals[4] = {0, 0, 0, 0};
+      const int k_row = (kt + 1) * 16 + row_in_tile;
+      if (k_row < K) {
+        const size_t row_offset = (size_t)k_row * x_stride + b_base_sz + (size_t)col_base;
+        const hip_bfloat16* x_src = Xpack + row_offset;
+        if (full_tile) {
+          const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+          uint32_t xv0 = x_u32[0];
+          uint32_t xv1 = x_u32[1];
+          vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+          vals[1] = static_cast<uint16_t>(xv0 >> 16);
+          vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+          vals[3] = static_cast<uint16_t>(xv1 >> 16);
+        } else {
+          const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+          if (col_base + 0 < cols_this) vals[0] = x_u16[0];
+          if (col_base + 1 < cols_this) vals[1] = x_u16[1];
+          if (col_base + 2 < cols_this) vals[2] = x_u16[2];
+          if (col_base + 3 < cols_this) vals[3] = x_u16[3];
+        }
+      }
+      uint16_t* dst_tile = &sX[pong][row_in_tile * 16 + col_base];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        dst_tile[i] = vals[i];
+      }
+    }
+
+    __syncthreads();
+
+    short4v Areg;
+    short4v Breg;
+    const int kbase = ty * 4;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int kidx = kbase + j;
+      Areg[j] = static_cast<short>(sW[ping][tx * 16 + kidx]);
+      Breg[j] = static_cast<short>(sX[ping][kidx * 16 + tx]);
+    }
+    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
+
+    ping = pong;
+  }
+  __syncthreads();
+
+  const int r0 = base_row + ty * 4 + 0;
+  const int r1 = base_row + ty * 4 + 1;
+  const int r2 = base_row + ty * 4 + 2;
+  const int r3 = base_row + ty * 4 + 3;
+
+  if (tx < cols_this) {
+    const int sid = s_slot[tx];
+    if (sid >= 0) {
+      float* __restrict__ out = dst + (size_t)sid * (size_t)out_stride;
+      const int bias_base = ty * 4;
+      if (r0 < M) out[r0] = acc[0] + s_bias_rows[bias_base + 0];
+      if (r1 < M) out[r1] = acc[1] + s_bias_rows[bias_base + 1];
+      if (r2 < M) out[r2] = acc[2] + s_bias_rows[bias_base + 2];
+      if (r3 < M) out[r3] = acc[3] + s_bias_rows[bias_base + 3];
+    }
+  }
+}
+
+__global__ __launch_bounds__(64)
+void router_kernel(
+    const hip_bfloat16* __restrict__ W_packed,    // [Mpad x Kpad] tile16 BF16
+    const hip_bfloat16* __restrict__ Xpack,       // [K x Bpad] BF16 (cột = batch)
+    float* __restrict__ dst,                      // scatter theo slot_ids
+    const hip_bfloat16* __restrict__ bias,        // [M] hoặc nullptr
+    int M, int K, int B, int Bpad,
+    int out_stride,
+    const int* __restrict__ slot_ids,
+    int Mpad, int Kpad)
+{
+  const int tx = threadIdx.x;     // cột trong tile (0..15) = cột batch
+  const int ty = threadIdx.y;     // nhóm hàng (0..3)
+  const int lane = ty * 16 + tx;  // 0..63
+
+  const int tile_m  = blockIdx.x;          // tile dọc theo M
+  const int b_group = blockIdx.y;          // nhóm 16 batch
+  const int b_base  = b_group * 16;
+  if (b_base >= B) return;
+
+  const int cols_this = min(16, B - b_base);  // số cột hợp lệ trong nhóm này
+  const int base_row = tile_m * 16;           // hàng cơ sở của tile M
+
+  __shared__ __align__(16) uint16_t sW[2][16 * 16];
+  __shared__ __align__(16) uint16_t sX[2][16 * 16];
+  __shared__ int s_slot[16];
+  __shared__ float s_bias_rows[16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  using short4v = __attribute__((ext_vector_type(4))) short;
+
+  const bool has_bias = (bias != nullptr);
+  const bool full_tile = (cols_this == 16);
+
+  if (ty == 0) {
+    const int col = tx;
+    const int global_col = b_base + col;
+    int slot_val = -1;
+    if (col < cols_this && global_col < B) {
+      slot_val = slot_ids[global_col];
+    }
+    s_slot[col] = slot_val;
+
+    const int row = base_row + col;
+    float bias_val = 0.0f;
+    if (has_bias && row < M) {
+      bias_val = bfloat16_to_float(bias[row]);
+    }
+    s_bias_rows[col] = bias_val;
+  }
+  __syncthreads();
+
+  float4v acc = {0.f, 0.f, 0.f, 0.f};
+
+  const int Ktiles = (Kpad + 15) / 16;
+  const size_t tiles_per_row = (size_t)((Kpad + 15) / 16);
+  const size_t tile_elems = 256;
+  const hip_bfloat16* w_tile_row_base =
+      W_packed + ((size_t)tile_m * tiles_per_row) * tile_elems;
+
+  const size_t x_stride = (size_t)Bpad;
+  const size_t b_base_sz = (size_t)b_base;
+
+  {
+    const int idx4 = lane * 4;
+    if (idx4 < 256) {
+      const hip_bfloat16* w_src = w_tile_row_base + idx4;
+      const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
+      uint32_t v0 = w_u32[0];
+      uint32_t v1 = w_u32[1];
+      uint16_t* dst_tile = &sW[0][0] + idx4;
+      dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
+      dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
+      dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
+      dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
+    }
+
+    const int row_in_tile = lane & 15;
+    const int col_group   = lane >> 4;
+    const int col_base    = col_group * 4;
+    uint16_t vals[4] = {0, 0, 0, 0};
+    const int k_row = row_in_tile;
+    if (k_row < K) {
+      const size_t row_offset = (size_t)k_row * x_stride + b_base_sz + (size_t)col_base;
+      const hip_bfloat16* x_src = Xpack + row_offset;
+      if (full_tile) {
+        const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+        uint32_t xv0 = x_u32[0];
+        uint32_t xv1 = x_u32[1];
+        vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+        vals[1] = static_cast<uint16_t>(xv0 >> 16);
+        vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+        vals[3] = static_cast<uint16_t>(xv1 >> 16);
+      } else {
+        const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+        if (col_base + 0 < cols_this) vals[0] = x_u16[0];
+        if (col_base + 1 < cols_this) vals[1] = x_u16[1];
+        if (col_base + 2 < cols_this) vals[2] = x_u16[2];
+        if (col_base + 3 < cols_this) vals[3] = x_u16[3];
+      }
+    }
+    uint16_t* dst_tile = &sX[0][row_in_tile * 16 + col_base];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      dst_tile[i] = vals[i];
+    }
+  }
+  __syncthreads();
+
+  int ping = 0;
+
+  for (int kt = 0; kt < Ktiles; ++kt) {
+    const int pong = ping ^ 1;
+
+    if (kt + 1 < Ktiles) {
+      const int idx4 = lane * 4;
+      if (idx4 < 256) {
+        const hip_bfloat16* w_src = w_tile_row_base + (size_t)(kt + 1) * tile_elems + idx4;
+        const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
+        uint32_t v0 = w_u32[0];
+        uint32_t v1 = w_u32[1];
+        uint16_t* dst_tile = &sW[pong][0] + idx4;
+        dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
+        dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
+        dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
+        dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
+      }
+
+      const int row_in_tile = lane & 15;
+      const int col_group   = lane >> 4;
+      const int col_base    = col_group * 4;
+      uint16_t vals[4] = {0, 0, 0, 0};
+      const int k_row = (kt + 1) * 16 + row_in_tile;
+      if (k_row < K) {
+        const size_t row_offset = (size_t)k_row * x_stride + b_base_sz + (size_t)col_base;
+        const hip_bfloat16* x_src = Xpack + row_offset;
+        if (full_tile) {
+          const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+          uint32_t xv0 = x_u32[0];
+          uint32_t xv1 = x_u32[1];
+          vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+          vals[1] = static_cast<uint16_t>(xv0 >> 16);
+          vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+          vals[3] = static_cast<uint16_t>(xv1 >> 16);
+        } else {
+          const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+          if (col_base + 0 < cols_this) vals[0] = x_u16[0];
+          if (col_base + 1 < cols_this) vals[1] = x_u16[1];
+          if (col_base + 2 < cols_this) vals[2] = x_u16[2];
+          if (col_base + 3 < cols_this) vals[3] = x_u16[3];
+        }
+      }
+      uint16_t* dst_tile = &sX[pong][row_in_tile * 16 + col_base];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        dst_tile[i] = vals[i];
+      }
+    }
+
+    __syncthreads();
+
+    short4v Areg;
+    short4v Breg;
+    const int kbase = ty * 4;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int kidx = kbase + j;
+      Areg[j] = static_cast<short>(sW[ping][tx * 16 + kidx]);
+      Breg[j] = static_cast<short>(sX[ping][kidx * 16 + tx]);
+    }
+    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
+
+    ping = pong;
+  }
+  __syncthreads();
+
+  const int r0 = base_row + ty * 4 + 0;
+  const int r1 = base_row + ty * 4 + 1;
+  const int r2 = base_row + ty * 4 + 2;
+  const int r3 = base_row + ty * 4 + 3;
+
+  if (tx < cols_this) {
+    const int sid = s_slot[tx];
+    if (sid >= 0) {
+      float* __restrict__ out = dst + (size_t)sid * (size_t)out_stride;
+      const int bias_base = ty * 4;
+      if (r0 < M) out[r0] = acc[0] + s_bias_rows[bias_base + 0];
+      if (r1 < M) out[r1] = acc[1] + s_bias_rows[bias_base + 1];
+      if (r2 < M) out[r2] = acc[2] + s_bias_rows[bias_base + 2];
+      if (r3 < M) out[r3] = acc[3] + s_bias_rows[bias_base + 3];
+    }
+  }
+}
+
+__global__ __launch_bounds__(64)
+void logits_kernel(
+    const hip_bfloat16* __restrict__ W_packed,    // [Mpad x Kpad] tile16 BF16
+    const hip_bfloat16* __restrict__ Xpack,       // [K x Bpad] BF16 (cột = batch)
+    float* __restrict__ dst,                      // scatter theo slot_ids
+    const hip_bfloat16* __restrict__ bias,        // [M] hoặc nullptr
+    int M, int K, int B, int Bpad,
+    int out_stride,
+    const int* __restrict__ slot_ids,
+    int Mpad, int Kpad)
+{
+  const int tx = threadIdx.x;     // cột trong tile (0..15) = cột batch
+  const int ty = threadIdx.y;     // nhóm hàng (0..3)
+  const int lane = ty * 16 + tx;  // 0..63
+
+  const int tile_m  = blockIdx.x;          // tile dọc theo M
+  const int b_group = blockIdx.y;          // nhóm 16 batch
+  const int b_base  = b_group * 16;
+  if (b_base >= B) return;
+
+  const int cols_this = min(16, B - b_base);  // số cột hợp lệ trong nhóm này
+  const int base_row = tile_m * 16;           // hàng cơ sở của tile M
+
+  __shared__ __align__(16) uint16_t sW[2][16 * 16];
+  __shared__ __align__(16) uint16_t sX[2][16 * 16];
+  __shared__ int s_slot[16];
+  __shared__ float s_bias_rows[16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  using short4v = __attribute__((ext_vector_type(4))) short;
+
+  const bool has_bias = (bias != nullptr);
+  const bool full_tile = (cols_this == 16);
+
+  if (ty == 0) {
+    const int col = tx;
+    const int global_col = b_base + col;
+    int slot_val = -1;
+    if (col < cols_this && global_col < B) {
+      slot_val = slot_ids[global_col];
+    }
+    s_slot[col] = slot_val;
+
+    const int row = base_row + col;
+    float bias_val = 0.0f;
+    if (has_bias && row < M) {
+      bias_val = bfloat16_to_float(bias[row]);
+    }
+    s_bias_rows[col] = bias_val;
+  }
+  __syncthreads();
+
+  float4v acc = {0.f, 0.f, 0.f, 0.f};
+
+  const int Ktiles = (Kpad + 15) / 16;
+  const size_t tiles_per_row = (size_t)((Kpad + 15) / 16);
+  const size_t tile_elems = 256;
+  const hip_bfloat16* w_tile_row_base =
+      W_packed + ((size_t)tile_m * tiles_per_row) * tile_elems;
+
+  const size_t x_stride = (size_t)Bpad;
+  const size_t b_base_sz = (size_t)b_base;
+
+  {
+    const int idx4 = lane * 4;
+    if (idx4 < 256) {
+      const hip_bfloat16* w_src = w_tile_row_base + idx4;
+      const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
+      uint32_t v0 = w_u32[0];
+      uint32_t v1 = w_u32[1];
+      uint16_t* dst_tile = &sW[0][0] + idx4;
+      dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
+      dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
+      dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
+      dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
+    }
+
+    const int row_in_tile = lane & 15;
+    const int col_group   = lane >> 4;
+    const int col_base    = col_group * 4;
+    uint16_t vals[4] = {0, 0, 0, 0};
+    const int k_row = row_in_tile;
+    if (k_row < K) {
+      const size_t row_offset = (size_t)k_row * x_stride + b_base_sz + (size_t)col_base;
+      const hip_bfloat16* x_src = Xpack + row_offset;
+      if (full_tile) {
+        const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+        uint32_t xv0 = x_u32[0];
+        uint32_t xv1 = x_u32[1];
+        vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+        vals[1] = static_cast<uint16_t>(xv0 >> 16);
+        vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+        vals[3] = static_cast<uint16_t>(xv1 >> 16);
+      } else {
+        const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+        if (col_base + 0 < cols_this) vals[0] = x_u16[0];
+        if (col_base + 1 < cols_this) vals[1] = x_u16[1];
+        if (col_base + 2 < cols_this) vals[2] = x_u16[2];
+        if (col_base + 3 < cols_this) vals[3] = x_u16[3];
+      }
+    }
+    uint16_t* dst_tile = &sX[0][row_in_tile * 16 + col_base];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      dst_tile[i] = vals[i];
+    }
+  }
+  __syncthreads();
+
+  int ping = 0;
+
+  for (int kt = 0; kt < Ktiles; ++kt) {
+    const int pong = ping ^ 1;
+
+    if (kt + 1 < Ktiles) {
+      const int idx4 = lane * 4;
+      if (idx4 < 256) {
+        const hip_bfloat16* w_src = w_tile_row_base + (size_t)(kt + 1) * tile_elems + idx4;
+        const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
+        uint32_t v0 = w_u32[0];
+        uint32_t v1 = w_u32[1];
+        uint16_t* dst_tile = &sW[pong][0] + idx4;
+        dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
+        dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
+        dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
+        dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
+      }
+
+      const int row_in_tile = lane & 15;
+      const int col_group   = lane >> 4;
+      const int col_base    = col_group * 4;
+      uint16_t vals[4] = {0, 0, 0, 0};
+      const int k_row = (kt + 1) * 16 + row_in_tile;
+      if (k_row < K) {
+        const size_t row_offset = (size_t)k_row * x_stride + b_base_sz + (size_t)col_base;
+        const hip_bfloat16* x_src = Xpack + row_offset;
+        if (full_tile) {
+          const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+          uint32_t xv0 = x_u32[0];
+          uint32_t xv1 = x_u32[1];
+          vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+          vals[1] = static_cast<uint16_t>(xv0 >> 16);
+          vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+          vals[3] = static_cast<uint16_t>(xv1 >> 16);
+        } else {
+          const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+          if (col_base + 0 < cols_this) vals[0] = x_u16[0];
+          if (col_base + 1 < cols_this) vals[1] = x_u16[1];
+          if (col_base + 2 < cols_this) vals[2] = x_u16[2];
+          if (col_base + 3 < cols_this) vals[3] = x_u16[3];
+        }
+      }
+      uint16_t* dst_tile = &sX[pong][row_in_tile * 16 + col_base];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        dst_tile[i] = vals[i];
+      }
+    }
+
+    __syncthreads();
+
+    short4v Areg;
+    short4v Breg;
+    const int kbase = ty * 4;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int kidx = kbase + j;
+      Areg[j] = static_cast<short>(sW[ping][tx * 16 + kidx]);
+      Breg[j] = static_cast<short>(sX[ping][kidx * 16 + tx]);
+    }
+    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
+
+    ping = pong;
+  }
+  __syncthreads();
+
+  const int r0 = base_row + ty * 4 + 0;
+  const int r1 = base_row + ty * 4 + 1;
+  const int r2 = base_row + ty * 4 + 2;
+  const int r3 = base_row + ty * 4 + 3;
+
+  if (tx < cols_this) {
+    const int sid = s_slot[tx];
+    if (sid >= 0) {
+      float* __restrict__ out = dst + (size_t)sid * (size_t)out_stride;
+      const int bias_base = ty * 4;
+      if (r0 < M) out[r0] = acc[0] + s_bias_rows[bias_base + 0];
+      if (r1 < M) out[r1] = acc[1] + s_bias_rows[bias_base + 1];
+      if (r2 < M) out[r2] = acc[2] + s_bias_rows[bias_base + 2];
+      if (r3 < M) out[r3] = acc[3] + s_bias_rows[bias_base + 3];
+    }
+  }
 }
 
 __global__ void add_bias_kernel_float_batched(float *output, const hip_bfloat16 *bias,
@@ -2711,10 +3268,13 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       const hip_bfloat16 *w_qkv_packed = ctx->weights.w_qkv_packed16 +
                                          (size_t)l * (size_t)Mpad_qkv * (size_t)Kpad_qkv;
       const hip_bfloat16 *b_qkv = ctx->weights.b_qkv + (size_t)l * (size_t)ctx->local_qkv_dim;
-      launch_gemm16x16_mfma_f32_batched(
+      const int group_y = (batch + 15) / 16;
+      dim3 block_gemm(16, 4, 1);
+      dim3 grid_gemm((Mpad_qkv + 15) / 16, group_y, 1);
+      qkv_kernel<<<grid_gemm, block_gemm, 0, ctx->batch_stream>>>(
         w_qkv_packed, ctx->state.xpack_bf16, ctx->state.qkv, b_qkv,
         ctx->local_qkv_dim, hidden_dim, batch, Bpad, ctx->local_qkv_dim,
-        ctx->d_slot_ids, ctx->batch_stream);
+        ctx->d_slot_ids, Mpad_qkv, Kpad_qkv);
     }
 
     // Cache write + RoPE per shard
@@ -2798,10 +3358,13 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       const int Kpad_o = ((ctx->local_q_dim + 15) / 16) * 16;
       const hip_bfloat16 *w_o_packed = ctx->weights.w_o_packed16 +
                                        (size_t)l * (size_t)Mpad_o * (size_t)Kpad_o;
-      launch_gemm16x16_mfma_f32_batched(
-        w_o_packed, ctx->state.xpack_bf16, ctx->state.tb2, nullptr,  // no bias
+      const int group_y = (batch + 15) / 16;
+      dim3 block_gemm(16, 4, 1);
+      dim3 grid_gemm((Mpad_o + 15) / 16, group_y, 1);
+      o_kernel<<<grid_gemm, block_gemm, 0, ctx->batch_stream>>>(
+        w_o_packed, ctx->state.xpack_bf16, ctx->state.tb2, nullptr,
         hidden_dim, ctx->local_q_dim, batch, Bpad, hidden_dim,
-        ctx->d_slot_ids, ctx->batch_stream);
+        ctx->d_slot_ids, Mpad_o, Kpad_o);
       record_batch_event(ctx);
     }
 
@@ -2886,10 +3449,13 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       const hip_bfloat16 *w_router_packed = leader->weights.w_router_packed16 +
                                             (size_t)l * (size_t)Mpad_router * (size_t)Kpad_router;
       const hip_bfloat16 *b_router = leader->weights.b_router + (size_t)l * (size_t)p->n_experts;
-      launch_gemm16x16_mfma_f32_batched(
+      const int group_y = (batch + 15) / 16;
+      dim3 block_gemm(16, 4, 1);
+      dim3 grid_gemm((Mpad_router + 15) / 16, group_y, 1);
+      router_kernel<<<grid_gemm, block_gemm, 0, leader->batch_stream>>>(
         w_router_packed, leader->state.xpack_bf16, leader->state.router_score, b_router,
         p->n_experts, hidden_dim, batch, Bpad, p->n_experts,
-        leader->d_slot_ids, leader->batch_stream);
+        leader->d_slot_ids, Mpad_router, Kpad_router);
       
       dim3 grid_topk(batch), block_topk(128);
       size_t shared_topk = (size_t)block_topk.x * (size_t)p->experts_per_token * (sizeof(float) + sizeof(int));
@@ -3124,10 +3690,15 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       hidden_dim, batch, Bpad_logits, hidden_dim, leader->d_slot_ids);
 
     const hip_bfloat16 *w_out_packed = leader->weights.out_packed16;
-    launch_gemm16x16_mfma_f32_batched(
+    const int Mpad_logits = ((vocab + 15) / 16) * 16;
+    const int Kpad_logits = ((hidden_dim + 15) / 16) * 16;
+    const int group_y = (batch + 15) / 16;
+    dim3 block_gemm(16, 4, 1);
+    dim3 grid_gemm((Mpad_logits + 15) / 16, group_y, 1);
+    logits_kernel<<<grid_gemm, block_gemm, 0, leader->batch_stream>>>(
       w_out_packed, leader->state.xpack_bf16, leader->state.logits_fp32, nullptr,
       vocab, hidden_dim, batch, Bpad_logits, vocab,
-      leader->d_batch_iota, leader->batch_stream);
+      leader->d_batch_iota, Mpad_logits, Kpad_logits);
 
     if (batch > 0) {
       dim3 block_argmax(256);
