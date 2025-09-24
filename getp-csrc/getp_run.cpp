@@ -3796,51 +3796,132 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     }
   }
 
-  // Final RMSNorm + logits on leader
+  int final_stage_ctxs_used = 0;
+  // Final RMSNorm + logits (split batch across TP ranks when available)
   if (host_next_tokens_out != nullptr) {
-    HIP_CHECK(hipSetDevice(leader->device_id));
-    dim3 block_norm(128);
-    dim3 grid_norm(1, batch);
-    size_t shared_norm = block_norm.x * sizeof(float);
-    rmsnorm_final_batched_kernel<<<grid_norm, block_norm, shared_norm, leader->batch_stream>>>(
-      leader->state.x, leader->weights.rms_out_w,
-      hidden_dim, batch, leader->d_slot_ids);
+    const int num_ctx = static_cast<int>(ctxs.size());
+    const int base_share = (num_ctx > 0) ? (batch / num_ctx) : 0;
+    const int extra = (num_ctx > 0) ? (batch % num_ctx) : 0;
+    int offset = 0;
+    struct FinalChunk {
+      GPUContext *ctx;
+      int offset;
+      int count;
+    };
+    std::vector<GPUContext*> waited_ctxs;
+    waited_ctxs.reserve(ctxs.size());
+    std::vector<FinalChunk> chunks;
+    chunks.reserve(ctxs.size());
 
-    int vocab = p->vocab_size;
-    int Bpad_logits = ((batch + 15) / 16) * 16;
-    dim3 block_pack_logits(256);
-    dim3 grid_pack_logits((hidden_dim + block_pack_logits.x - 1) / block_pack_logits.x, batch);
-    gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack_logits, block_pack_logits, 0, leader->batch_stream>>>(
-      leader->state.x, leader->state.xpack_bf16,
-      hidden_dim, batch, Bpad_logits, hidden_dim, leader->d_slot_ids);
+    for (size_t idx = 0; idx < ctxs.size() && offset < batch; ++idx) {
+      GPUContext *ctx = ctxs[idx];
+      int share = base_share + (static_cast<int>(idx) < extra ? 1 : 0);
+      int remaining = batch - offset;
+      if (share > remaining) share = remaining;
+      if (share <= 0) continue;
 
-    const hip_bfloat16 *w_out_packed = leader->weights.out_packed16;
-    const int Mpad_logits = ((vocab + 15) / 16) * 16;
-    const int Kpad_logits = ((hidden_dim + 15) / 16) * 16;
-    const int group_y = (batch + 15) / 16;
-    dim3 block_gemm(16, 4, 1);
-    dim3 grid_gemm((Mpad_logits + 15) / 16, group_y, 1);
-    logits_kernel<<<grid_gemm, block_gemm, 0, leader->batch_stream>>>(
-      w_out_packed, leader->state.xpack_bf16, leader->state.logits_fp32, nullptr,
-      vocab, hidden_dim, batch, Bpad_logits, vocab,
-      leader->d_batch_iota, Mpad_logits, Kpad_logits);
+      HIP_CHECK(hipSetDevice(ctx->device_id));
 
-    if (batch > 0) {
+      dim3 block_norm(128);
+      dim3 grid_norm(1, share);
+      size_t shared_norm = block_norm.x * sizeof(float);
+      rmsnorm_final_batched_kernel<<<grid_norm, block_norm, shared_norm, ctx->batch_stream>>>(
+        ctx->state.x, ctx->weights.rms_out_w,
+        hidden_dim, share, ctx->d_slot_ids + offset);
+
+      int vocab = p->vocab_size;
+      int Bpad_logits = ((share + 15) / 16) * 16;
+      dim3 block_pack_logits(256);
+      dim3 grid_pack_logits((hidden_dim + block_pack_logits.x - 1) / block_pack_logits.x, share);
+      gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack_logits, block_pack_logits, 0, ctx->batch_stream>>>(
+        ctx->state.x, ctx->state.xpack_bf16,
+        hidden_dim, share, Bpad_logits, hidden_dim, ctx->d_slot_ids + offset);
+
+      const hip_bfloat16 *w_out_packed = ctx->weights.out_packed16;
+      const int Mpad_logits = ((vocab + 15) / 16) * 16;
+      const int Kpad_logits = ((hidden_dim + 15) / 16) * 16;
+      const int group_y = (share + 15) / 16;
+      dim3 block_gemm(16, 4, 1);
+      dim3 grid_gemm((Mpad_logits + 15) / 16, group_y, 1);
+      logits_kernel<<<grid_gemm, block_gemm, 0, ctx->batch_stream>>>(
+        w_out_packed, ctx->state.xpack_bf16, ctx->state.logits_fp32, nullptr,
+        vocab, hidden_dim, share, Bpad_logits, vocab,
+        ctx->d_batch_iota, Mpad_logits, Kpad_logits);
+
       dim3 block_argmax(256);
-      dim3 grid_argmax(batch);
+      dim3 grid_argmax(share);
       size_t shared_argmax = block_argmax.x * (sizeof(float) + sizeof(int));
-      sample_argmax_kernel<<<grid_argmax, block_argmax, shared_argmax, leader->batch_stream>>>(
-        leader->state.logits_fp32, leader->d_next_tokens, batch, p->vocab_size);
+      sample_argmax_kernel<<<grid_argmax, block_argmax, shared_argmax, ctx->batch_stream>>>(
+        ctx->state.logits_fp32, ctx->d_next_tokens, share, p->vocab_size);
+
+      record_batch_event(ctx);
+      waited_ctxs.push_back(ctx);
+      chunks.push_back({ctx, offset, share});
+      offset += share;
     }
 
-    HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, leader->d_next_tokens,
-                             batch * sizeof(int), hipMemcpyDeviceToHost, leader->batch_stream));
-    record_batch_event(leader);
-    wait_batch_event_host(leader);
+    // Fallback for any remaining rows (should not trigger, but keeps behavior safe)
+    if (offset < batch) {
+      int remaining = batch - offset;
+      HIP_CHECK(hipSetDevice(leader->device_id));
+      dim3 block_norm(128);
+      dim3 grid_norm(1, remaining);
+      size_t shared_norm = block_norm.x * sizeof(float);
+      rmsnorm_final_batched_kernel<<<grid_norm, block_norm, shared_norm, leader->batch_stream>>>(
+        leader->state.x, leader->weights.rms_out_w,
+        hidden_dim, remaining, leader->d_slot_ids + offset);
+
+      int vocab = p->vocab_size;
+      int Bpad_logits = ((remaining + 15) / 16) * 16;
+      dim3 block_pack_logits(256);
+      dim3 grid_pack_logits((hidden_dim + block_pack_logits.x - 1) / block_pack_logits.x, remaining);
+      gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack_logits, block_pack_logits, 0, leader->batch_stream>>>(
+        leader->state.x, leader->state.xpack_bf16,
+        hidden_dim, remaining, Bpad_logits, hidden_dim, leader->d_slot_ids + offset);
+
+      const hip_bfloat16 *w_out_packed = leader->weights.out_packed16;
+      const int Mpad_logits = ((vocab + 15) / 16) * 16;
+      const int Kpad_logits = ((hidden_dim + 15) / 16) * 16;
+      const int group_y = (remaining + 15) / 16;
+      dim3 block_gemm(16, 4, 1);
+      dim3 grid_gemm((Mpad_logits + 15) / 16, group_y, 1);
+      logits_kernel<<<grid_gemm, block_gemm, 0, leader->batch_stream>>>(
+        w_out_packed, leader->state.xpack_bf16, leader->state.logits_fp32, nullptr,
+        vocab, hidden_dim, remaining, Bpad_logits, vocab,
+        leader->d_batch_iota, Mpad_logits, Kpad_logits);
+
+      dim3 block_argmax(256);
+      dim3 grid_argmax(remaining);
+      size_t shared_argmax = block_argmax.x * (sizeof(float) + sizeof(int));
+      sample_argmax_kernel<<<grid_argmax, block_argmax, shared_argmax, leader->batch_stream>>>(
+        leader->state.logits_fp32, leader->d_next_tokens, remaining, p->vocab_size);
+
+      record_batch_event(leader);
+      waited_ctxs.push_back(leader);
+      chunks.push_back({leader, offset, remaining});
+      offset += remaining;
+    }
+
+    for (GPUContext *ctx : waited_ctxs) {
+      wait_batch_event_host(ctx);
+    }
+
+    if (!waited_ctxs.empty()) {
+      std::vector<GPUContext*> unique_ctxs = waited_ctxs;
+      std::sort(unique_ctxs.begin(), unique_ctxs.end());
+      unique_ctxs.erase(std::unique(unique_ctxs.begin(), unique_ctxs.end()), unique_ctxs.end());
+      final_stage_ctxs_used = static_cast<int>(unique_ctxs.size());
+    }
+
+    for (const FinalChunk &chunk : chunks) {
+      HIP_CHECK(hipSetDevice(chunk.ctx->device_id));
+      HIP_CHECK(hipMemcpy(host_next_tokens_out + chunk.offset, chunk.ctx->d_next_tokens,
+                          chunk.count * sizeof(int), hipMemcpyDeviceToHost));
+    }
   }
 
   // Keep follower activations aligned (optional)
-  if (ctxs.size() > 1) {
+  if (ctxs.size() > 1 && final_stage_ctxs_used <= 1) {
     size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
     for (size_t idx = 1; idx < ctxs.size(); ++idx) {
       GPUContext *peer = ctxs[idx];
@@ -4262,11 +4343,7 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
   s->kv_cache_manager = new KVCacheManager(max_batch, p->n_layers, p->seq_len,
                                            (size_t)local_kv_dim, p->sliding_window);
 
-  if (ctx->is_leader) {
-    HIP_CHECK(hipMalloc(&s->logits_fp32, B * (size_t)p->vocab_size * sizeof(float)));
-  } else {
-    s->logits_fp32 = nullptr;
-  }
+  HIP_CHECK(hipMalloc(&s->logits_fp32, B * (size_t)p->vocab_size * sizeof(float)));
 
   HIP_CHECK(hipMalloc(&s->cos_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->sin_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
