@@ -309,6 +309,11 @@ __global__ void gather_pack_x_fp32_to_bf16_kernel_Bptr(const float *x, hip_bfloa
 // ------------------------- New BF16 GEMM path (packed 16x16) -------------------------
 
 
+static constexpr int GEMM_WOUT_GROUP_COLS = 8;
+static constexpr int GEMM_WOUT_ROW_GROUPS = 4;
+static constexpr int GEMM_WOUT_TILE_COLS = GEMM_WOUT_GROUP_COLS * 16;
+
+
 
 // GEMM MFMA FP32: W_packed [Mpad x Kpad] (tile 16x16 contiguous), Xpack BF16 [K x Bpad] (row-major K, stride=Bpad)
 // Compute uses BF16×BF16→FP32 MFMA. Accumulate FP32, add BF16 bias, and scatter to per-slot outputs via slot_ids.
@@ -670,7 +675,7 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias_router(
   }
 }
 
-__global__ __launch_bounds__(64)
+__global__ __launch_bounds__(64 * GEMM_WOUT_GROUP_COLS)
 void gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout(
     const hip_bfloat16* __restrict__ W_packed,
     const hip_bfloat16* __restrict__ Xpack,
@@ -681,109 +686,176 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout(
     const int* __restrict__ slot_ids,
     int Mpad, int Kpad)
 {
-  // Thread mapping matches AMD 16x16x4f32 MFMA sample: blockDim(16,4,1)
-  const int tx = threadIdx.x;  // 0..15 -> column within tile (N)
-  const int ty = threadIdx.y;  // 0..3  -> selects k within 4-wide micro-tile and output row group
+  const int tx = threadIdx.x;
+  const int ty_global = threadIdx.y;
+  const int group = ty_global / 4;
+  const int ty = ty_global & 3;
+  if (group >= GEMM_WOUT_GROUP_COLS) return;
 
-  // Compute lane id for shared loads grouping
-  const int lane = ty * 16 + tx; // 0..63
+  const int lane = ty * 16 + tx;
 
-  const int tile_m = blockIdx.x;     // along M
-  const int tile_n = blockIdx.y;     // along B
-  const int base_row = tile_m * 16;
-  const int base_col = tile_n * 16;
+  const int tile_m_group = blockIdx.x;
+  const int tile_n_group = blockIdx.y;
+
+  const int base_col_group = tile_n_group * GEMM_WOUT_TILE_COLS;
+  const int base_col = base_col_group + group * 16;
 
   const int Ktiles = (Kpad + 15) / 16;
   const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+  const int Mtiles = (Mpad + 15) / 16;
 
-  __shared__ __align__(16) hip_bfloat16 sWb[2][16 * 16];
-  __shared__ __align__(16) hip_bfloat16 sXb[2][16 * 16];
-
-  using float4v = __attribute__((ext_vector_type(4))) float;
-  float4v dmn = {0.f, 0.f, 0.f, 0.f};
-
-  // Preload first tile into buffer 0
-  int curr = 0;
-  {
-    const int kk = 0;
-    if (lane < 32) {
-      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
-      const hip_bfloat16* w_src = W_packed + w_tile_base;
-      reinterpret_cast<u32x4*>(sWb[curr])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
-    }
-    if (lane < 32) {
-      const int r   = lane % 16;
-      const int h   = lane / 16;  // 0 or 1
-      const int c8  = h * 8;      // columns 0..7 or 8..15
-      const int k_row = kk * 16 + r;
-      const bool in_k = (k_row < K);
-      hip_bfloat16* dst = &sXb[curr][0] + r * 16 + c8;
-      if (in_k) {
-        const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
-        reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
-      } else {
-        reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
-      }
-    }
-    __syncthreads();
+  int tile_m_index[GEMM_WOUT_ROW_GROUPS];
+  int base_row_rg[GEMM_WOUT_ROW_GROUPS];
+  bool row_active[GEMM_WOUT_ROW_GROUPS];
+  #pragma unroll
+  for (int rg = 0; rg < GEMM_WOUT_ROW_GROUPS; ++rg) {
+    int tile_m = tile_m_group * GEMM_WOUT_ROW_GROUPS + rg;
+    tile_m_index[rg] = tile_m;
+    row_active[rg] = (tile_m < Mtiles);
+    base_row_rg[rg] = tile_m * 16;
   }
 
+  __shared__ __align__(16) hip_bfloat16 sWb[GEMM_WOUT_ROW_GROUPS][2][16 * 16];
+  __shared__ __align__(16) hip_bfloat16 sXb[GEMM_WOUT_GROUP_COLS][2][16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v dmn[GEMM_WOUT_ROW_GROUPS];
+  #pragma unroll
+  for (int rg = 0; rg < GEMM_WOUT_ROW_GROUPS; ++rg) {
+    dmn[rg] = float4v{0.f, 0.f, 0.f, 0.f};
+  }
+
+  const bool use_slot_ids = slot_ids != nullptr;
+
+  // Preload first W and X tiles (kk = 0).
+  if (group == 0 && lane < 32) {
+    #pragma unroll
+    for (int rg = 0; rg < GEMM_WOUT_ROW_GROUPS; ++rg) {
+      if (!row_active[rg]) continue;
+      const size_t tile_m = (size_t)tile_m_index[rg];
+      const size_t w_tile_base = (tile_m * tilesPerRow + (size_t)0) * (size_t)256;
+      const hip_bfloat16* w_src = W_packed + w_tile_base;
+      reinterpret_cast<u32x4*>(sWb[rg][0])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+    }
+  }
+  if (lane < 32) {
+    const int r   = lane % 16;
+    const int h   = lane / 16;
+    const int c8  = h * 8;
+    const int k_row = r;
+    const bool in_k = (k_row < K);
+    const int col_vec = base_col + c8;
+    const bool in_cols = (col_vec + 8) <= Bpad;
+    hip_bfloat16* dst_tile = &sXb[group][0][0] + r * 16 + c8;
+    if (in_k && in_cols) {
+      const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)col_vec;
+      reinterpret_cast<u32x4*>(dst_tile)[0] = reinterpret_cast<const u32x4*>(src)[0];
+    } else {
+      reinterpret_cast<u32x4*>(dst_tile)[0] = u32x4{0u,0u,0u,0u};
+    }
+  }
+  __syncthreads();
+
+  int curr = 0;
   for (int kk = 0; kk < Ktiles; ++kk) {
     const int next = curr ^ 1;
-    // Prefetch next tile
+
     if (kk + 1 < Ktiles) {
-      if (lane < 32) {
-        const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)(kk + 1)) * (size_t)256;
-        const hip_bfloat16* w_src = W_packed + w_tile_base;
-        reinterpret_cast<u32x4*>(sWb[next])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+      if (group == 0 && lane < 32) {
+        #pragma unroll
+        for (int rg = 0; rg < GEMM_WOUT_ROW_GROUPS; ++rg) {
+          if (!row_active[rg]) continue;
+          const size_t tile_m = (size_t)tile_m_index[rg];
+          const size_t w_tile_base = (tile_m * tilesPerRow + (size_t)(kk + 1)) * (size_t)256;
+          const hip_bfloat16* w_src = W_packed + w_tile_base;
+          reinterpret_cast<u32x4*>(sWb[rg][next])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+        }
       }
       if (lane < 32) {
         const int r   = lane % 16;
-        const int h   = lane / 16;  // 0 or 1
-        const int c8  = h * 8;      // columns 0..7 or 8..15
+        const int h   = lane / 16;
+        const int c8  = h * 8;
         const int k_row = (kk + 1) * 16 + r;
         const bool in_k = (k_row < K);
-        hip_bfloat16* dst = &sXb[next][0] + r * 16 + c8;
-        if (in_k) {
-          const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
-          reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+        const int col_vec = base_col + c8;
+        const bool in_cols = (col_vec + 8) <= Bpad;
+        hip_bfloat16* dst_tile = &sXb[group][next][0] + r * 16 + c8;
+        if (in_k && in_cols) {
+          const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)col_vec;
+          reinterpret_cast<u32x4*>(dst_tile)[0] = reinterpret_cast<const u32x4*>(src)[0];
         } else {
-          reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+          reinterpret_cast<u32x4*>(dst_tile)[0] = u32x4{0u,0u,0u,0u};
         }
       }
     }
 
-    // Compute on current tile
-    {
-      const int kbase = ty * 4;  // 4 BF16s per operand per lane
-      using short4v = __attribute__((ext_vector_type(4))) short;
-      union UB { hip_bfloat16 b; unsigned short u; } u0, u1, u2, u3;
-      short4v Areg, Breg;
-      u0.b = sWb[curr][tx * 16 + (kbase + 0)]; u1.b = sWb[curr][tx * 16 + (kbase + 1)];
-      u2.b = sWb[curr][tx * 16 + (kbase + 2)]; u3.b = sWb[curr][tx * 16 + (kbase + 3)];
-      Areg.x = (short)u0.u; Areg.y = (short)u1.u; Areg.z = (short)u2.u; Areg.w = (short)u3.u;
-      u0.b = sXb[curr][(kbase + 0) * 16 + tx]; u1.b = sXb[curr][(kbase + 1) * 16 + tx];
-      u2.b = sXb[curr][(kbase + 2) * 16 + tx]; u3.b = sXb[curr][(kbase + 3) * 16 + tx];
-      Breg.x = (short)u0.u; Breg.y = (short)u1.u; Breg.z = (short)u2.u; Breg.w = (short)u3.u;
-      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, dmn, 0, 0, 0);
+    const int kbase = ty * 4;
+    using short4v = __attribute__((ext_vector_type(4))) short;
+    union BF16U { hip_bfloat16 b; unsigned short u; } xb0, xb1, xb2, xb3;
+    hip_bfloat16* sX_curr = &sXb[group][curr][0];
+    xb0.b = sX_curr[(kbase + 0) * 16 + tx];
+    xb1.b = sX_curr[(kbase + 1) * 16 + tx];
+    xb2.b = sX_curr[(kbase + 2) * 16 + tx];
+    xb3.b = sX_curr[(kbase + 3) * 16 + tx];
+    short4v Breg;
+    Breg.x = (short)xb0.u;
+    Breg.y = (short)xb1.u;
+    Breg.z = (short)xb2.u;
+    Breg.w = (short)xb3.u;
+
+    #pragma unroll
+    for (int rg = 0; rg < GEMM_WOUT_ROW_GROUPS; ++rg) {
+      if (!row_active[rg]) continue;
+      hip_bfloat16* sW_curr = &sWb[rg][curr][0];
+      union BF16W { hip_bfloat16 b; unsigned short u; } wa0, wa1, wa2, wa3;
+      short4v Areg;
+      wa0.b = sW_curr[tx * 16 + (kbase + 0)];
+      wa1.b = sW_curr[tx * 16 + (kbase + 1)];
+      wa2.b = sW_curr[tx * 16 + (kbase + 2)];
+      wa3.b = sW_curr[tx * 16 + (kbase + 3)];
+      Areg.x = (short)wa0.u;
+      Areg.y = (short)wa1.u;
+      Areg.z = (short)wa2.u;
+      Areg.w = (short)wa3.u;
+      dmn[rg] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, dmn[rg], 0, 0, 0);
     }
 
     __syncthreads();
     curr = next;
   }
 
-  // Epilogue: add bias and scatter store
   const int col = base_col + tx;
   if (col < B) {
-    const int sid = slot_ids[col];
+    const int sid = use_slot_ids ? slot_ids[col] : col;
     float* out_s = dst + (size_t)sid * (size_t)out_stride;
-    // Each thread writes 4 rows: row = base_row + (ty*4 + i)
+
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int row = base_row + (ty * 4 + i);
-      if (row < M) {
-        const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
-        out_s[row] = dmn[i] + biasv;
+    for (int rg = 0; rg < GEMM_WOUT_ROW_GROUPS; ++rg) {
+      if (!row_active[rg]) continue;
+      const int row_base = base_row_rg[rg] + ty * 4;
+      if (row_base >= M) continue;
+
+      float vals[4] = {dmn[rg].x, dmn[rg].y, dmn[rg].z, dmn[rg].w};
+
+      if (row_base + 3 < M) {
+        if (bias) {
+          const float4 bias_vec = bfloat16_to_float4(bias + row_base);
+          vals[0] += bias_vec.x;
+          vals[1] += bias_vec.y;
+          vals[2] += bias_vec.z;
+          vals[3] += bias_vec.w;
+        }
+        float4 out_vec = {vals[0], vals[1], vals[2], vals[3]};
+        reinterpret_cast<float4*>(out_s + row_base)[0] = out_vec;
+      } else {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int row = row_base + i;
+          if (row < M) {
+            const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
+            out_s[row] = vals[i] + biasv;
+          }
+        }
       }
     }
   }
@@ -2633,11 +2705,14 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       gather_pack_x_fp32_to_bf16_kernel<<<grid, block, 0, gpu_ctx->batch_stream>>>(
         gpu_ctx->state.x, gpu_ctx->state.xpack_bf16, Kout, batch, Bpad3, hidden_dim, gpu_ctx->d_slot_ids);
       const hip_bfloat16 *w_out_packed = gpu_ctx->weights.w_out_packed16;
-      dim3 blockG(16, 4, 1), gridG((unsigned int)((Mpad3 + 15) / 16), (unsigned int)((Bpad3 + 15) / 16));
-      // Use identity mapping for output rows (b -> row b)
+      const int tile_cols = GEMM_WOUT_TILE_COLS;
+      const int tile_rows = GEMM_WOUT_ROW_GROUPS * 16;
+      dim3 blockG(16, 4 * GEMM_WOUT_GROUP_COLS, 1);
+      dim3 gridG((unsigned int)((Mpad3 + tile_rows - 1) / tile_rows),
+                 (unsigned int)((Bpad3 + tile_cols - 1) / tile_cols));
       gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
         w_out_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.logits_fp32, /*bias*/nullptr,
-        Mout, Kout, batch, Bpad3, Mout, gpu_ctx->d_batch_iota, Mpad3, Kpad3);
+        Mout, Kout, batch, Bpad3, Mout, /*slot_ids*/nullptr, Mpad3, Kpad3);
     }
 
     // Launch optimized argmax kernel: one block per batch element
