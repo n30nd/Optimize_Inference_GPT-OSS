@@ -314,7 +314,364 @@ __global__ void gather_pack_x_fp32_to_bf16_kernel_Bptr(const float *x, hip_bfloa
 // Compute uses BF16×BF16→FP32 MFMA. Accumulate FP32, add BF16 bias, and scatter to per-slot outputs via slot_ids.
 // Each block computes one 16x16 tile with 64 threads (dim3 block(16,4,1)).
 __global__ __launch_bounds__(64)
-void gemm16x16_mfma_f32_packedW_batched_scatter_bias(
+void gemm16x16_mfma_f32_packedW_batched_scatter_bias_qkv(
+    const hip_bfloat16* __restrict__ W_packed,
+    const hip_bfloat16* __restrict__ Xpack,
+    float* __restrict__ dst,
+    const hip_bfloat16* __restrict__ bias,  // nullable
+    int M, int K, int B, int Bpad,
+    int out_stride,
+    const int* __restrict__ slot_ids,
+    int Mpad, int Kpad)
+{
+  // Thread mapping matches AMD 16x16x4f32 MFMA sample: blockDim(16,4,1)
+  const int tx = threadIdx.x;  // 0..15 -> column within tile (N)
+  const int ty = threadIdx.y;  // 0..3  -> selects k within 4-wide micro-tile and output row group
+
+  // Compute lane id for shared loads grouping
+  const int lane = ty * 16 + tx; // 0..63
+
+  const int tile_m = blockIdx.x;     // along M
+  const int tile_n = blockIdx.y;     // along B
+  const int base_row = tile_m * 16;
+  const int base_col = tile_n * 16;
+
+  const int Ktiles = (Kpad + 15) / 16;
+  const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+
+  __shared__ __align__(16) hip_bfloat16 sWb[2][16 * 16];
+  __shared__ __align__(16) hip_bfloat16 sXb[2][16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v dmn = {0.f, 0.f, 0.f, 0.f};
+
+  // Preload first tile into buffer 0
+  int curr = 0;
+  {
+    const int kk = 0;
+    if (lane < 32) {
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      const hip_bfloat16* w_src = W_packed + w_tile_base;
+      reinterpret_cast<u32x4*>(sWb[curr])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+    }
+    if (lane < 32) {
+      const int r   = lane % 16;
+      const int h   = lane / 16;  // 0 or 1
+      const int c8  = h * 8;      // columns 0..7 or 8..15
+      const int k_row = kk * 16 + r;
+      const bool in_k = (k_row < K);
+      hip_bfloat16* dst = &sXb[curr][0] + r * 16 + c8;
+      if (in_k) {
+        const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
+        reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+      } else {
+        reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    const int next = curr ^ 1;
+    // Prefetch next tile
+    if (kk + 1 < Ktiles) {
+      if (lane < 32) {
+        const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)(kk + 1)) * (size_t)256;
+        const hip_bfloat16* w_src = W_packed + w_tile_base;
+        reinterpret_cast<u32x4*>(sWb[next])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+      }
+      if (lane < 32) {
+        const int r   = lane % 16;
+        const int h   = lane / 16;  // 0 or 1
+        const int c8  = h * 8;      // columns 0..7 or 8..15
+        const int k_row = (kk + 1) * 16 + r;
+        const bool in_k = (k_row < K);
+        hip_bfloat16* dst = &sXb[next][0] + r * 16 + c8;
+        if (in_k) {
+          const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
+          reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+        } else {
+          reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+        }
+      }
+    }
+
+    // Compute on current tile
+    {
+      const int kbase = ty * 4;  // 4 BF16s per operand per lane
+      using short4v = __attribute__((ext_vector_type(4))) short;
+      union UB { hip_bfloat16 b; unsigned short u; } u0, u1, u2, u3;
+      short4v Areg, Breg;
+      u0.b = sWb[curr][tx * 16 + (kbase + 0)]; u1.b = sWb[curr][tx * 16 + (kbase + 1)];
+      u2.b = sWb[curr][tx * 16 + (kbase + 2)]; u3.b = sWb[curr][tx * 16 + (kbase + 3)];
+      Areg.x = (short)u0.u; Areg.y = (short)u1.u; Areg.z = (short)u2.u; Areg.w = (short)u3.u;
+      u0.b = sXb[curr][(kbase + 0) * 16 + tx]; u1.b = sXb[curr][(kbase + 1) * 16 + tx];
+      u2.b = sXb[curr][(kbase + 2) * 16 + tx]; u3.b = sXb[curr][(kbase + 3) * 16 + tx];
+      Breg.x = (short)u0.u; Breg.y = (short)u1.u; Breg.z = (short)u2.u; Breg.w = (short)u3.u;
+      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, dmn, 0, 0, 0);
+    }
+
+    __syncthreads();
+    curr = next;
+  }
+
+  // Epilogue: add bias and scatter store
+  const int col = base_col + tx;
+  if (col < B) {
+    const int sid = slot_ids[col];
+    float* out_s = dst + (size_t)sid * (size_t)out_stride;
+    // Each thread writes 4 rows: row = base_row + (ty*4 + i)
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = base_row + (ty * 4 + i);
+      if (row < M) {
+        const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
+        out_s[row] = dmn[i] + biasv;
+      }
+    }
+  }
+}
+
+__global__ __launch_bounds__(64)
+void gemm16x16_mfma_f32_packedW_batched_scatter_bias_wo(
+    const hip_bfloat16* __restrict__ W_packed,
+    const hip_bfloat16* __restrict__ Xpack,
+    float* __restrict__ dst,
+    const hip_bfloat16* __restrict__ bias,  // nullable
+    int M, int K, int B, int Bpad,
+    int out_stride,
+    const int* __restrict__ slot_ids,
+    int Mpad, int Kpad)
+{
+  // Thread mapping matches AMD 16x16x4f32 MFMA sample: blockDim(16,4,1)
+  const int tx = threadIdx.x;  // 0..15 -> column within tile (N)
+  const int ty = threadIdx.y;  // 0..3  -> selects k within 4-wide micro-tile and output row group
+
+  // Compute lane id for shared loads grouping
+  const int lane = ty * 16 + tx; // 0..63
+
+  const int tile_m = blockIdx.x;     // along M
+  const int tile_n = blockIdx.y;     // along B
+  const int base_row = tile_m * 16;
+  const int base_col = tile_n * 16;
+
+  const int Ktiles = (Kpad + 15) / 16;
+  const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+
+  __shared__ __align__(16) hip_bfloat16 sWb[2][16 * 16];
+  __shared__ __align__(16) hip_bfloat16 sXb[2][16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v dmn = {0.f, 0.f, 0.f, 0.f};
+
+  // Preload first tile into buffer 0
+  int curr = 0;
+  {
+    const int kk = 0;
+    if (lane < 32) {
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      const hip_bfloat16* w_src = W_packed + w_tile_base;
+      reinterpret_cast<u32x4*>(sWb[curr])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+    }
+    if (lane < 32) {
+      const int r   = lane % 16;
+      const int h   = lane / 16;  // 0 or 1
+      const int c8  = h * 8;      // columns 0..7 or 8..15
+      const int k_row = kk * 16 + r;
+      const bool in_k = (k_row < K);
+      hip_bfloat16* dst = &sXb[curr][0] + r * 16 + c8;
+      if (in_k) {
+        const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
+        reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+      } else {
+        reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    const int next = curr ^ 1;
+    // Prefetch next tile
+    if (kk + 1 < Ktiles) {
+      if (lane < 32) {
+        const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)(kk + 1)) * (size_t)256;
+        const hip_bfloat16* w_src = W_packed + w_tile_base;
+        reinterpret_cast<u32x4*>(sWb[next])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+      }
+      if (lane < 32) {
+        const int r   = lane % 16;
+        const int h   = lane / 16;  // 0 or 1
+        const int c8  = h * 8;      // columns 0..7 or 8..15
+        const int k_row = (kk + 1) * 16 + r;
+        const bool in_k = (k_row < K);
+        hip_bfloat16* dst = &sXb[next][0] + r * 16 + c8;
+        if (in_k) {
+          const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
+          reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+        } else {
+          reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+        }
+      }
+    }
+
+    // Compute on current tile
+    {
+      const int kbase = ty * 4;  // 4 BF16s per operand per lane
+      using short4v = __attribute__((ext_vector_type(4))) short;
+      union UB { hip_bfloat16 b; unsigned short u; } u0, u1, u2, u3;
+      short4v Areg, Breg;
+      u0.b = sWb[curr][tx * 16 + (kbase + 0)]; u1.b = sWb[curr][tx * 16 + (kbase + 1)];
+      u2.b = sWb[curr][tx * 16 + (kbase + 2)]; u3.b = sWb[curr][tx * 16 + (kbase + 3)];
+      Areg.x = (short)u0.u; Areg.y = (short)u1.u; Areg.z = (short)u2.u; Areg.w = (short)u3.u;
+      u0.b = sXb[curr][(kbase + 0) * 16 + tx]; u1.b = sXb[curr][(kbase + 1) * 16 + tx];
+      u2.b = sXb[curr][(kbase + 2) * 16 + tx]; u3.b = sXb[curr][(kbase + 3) * 16 + tx];
+      Breg.x = (short)u0.u; Breg.y = (short)u1.u; Breg.z = (short)u2.u; Breg.w = (short)u3.u;
+      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, dmn, 0, 0, 0);
+    }
+
+    __syncthreads();
+    curr = next;
+  }
+
+  // Epilogue: add bias and scatter store
+  const int col = base_col + tx;
+  if (col < B) {
+    const int sid = slot_ids[col];
+    float* out_s = dst + (size_t)sid * (size_t)out_stride;
+    // Each thread writes 4 rows: row = base_row + (ty*4 + i)
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = base_row + (ty * 4 + i);
+      if (row < M) {
+        const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
+        out_s[row] = dmn[i] + biasv;
+      }
+    }
+  }
+}
+
+__global__ __launch_bounds__(64)
+void gemm16x16_mfma_f32_packedW_batched_scatter_bias_router(
+    const hip_bfloat16* __restrict__ W_packed,
+    const hip_bfloat16* __restrict__ Xpack,
+    float* __restrict__ dst,
+    const hip_bfloat16* __restrict__ bias,  // nullable
+    int M, int K, int B, int Bpad,
+    int out_stride,
+    const int* __restrict__ slot_ids,
+    int Mpad, int Kpad)
+{
+  // Thread mapping matches AMD 16x16x4f32 MFMA sample: blockDim(16,4,1)
+  const int tx = threadIdx.x;  // 0..15 -> column within tile (N)
+  const int ty = threadIdx.y;  // 0..3  -> selects k within 4-wide micro-tile and output row group
+
+  // Compute lane id for shared loads grouping
+  const int lane = ty * 16 + tx; // 0..63
+
+  const int tile_m = blockIdx.x;     // along M
+  const int tile_n = blockIdx.y;     // along B
+  const int base_row = tile_m * 16;
+  const int base_col = tile_n * 16;
+
+  const int Ktiles = (Kpad + 15) / 16;
+  const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
+
+  __shared__ __align__(16) hip_bfloat16 sWb[2][16 * 16];
+  __shared__ __align__(16) hip_bfloat16 sXb[2][16 * 16];
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v dmn = {0.f, 0.f, 0.f, 0.f};
+
+  // Preload first tile into buffer 0
+  int curr = 0;
+  {
+    const int kk = 0;
+    if (lane < 32) {
+      const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
+      const hip_bfloat16* w_src = W_packed + w_tile_base;
+      reinterpret_cast<u32x4*>(sWb[curr])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+    }
+    if (lane < 32) {
+      const int r   = lane % 16;
+      const int h   = lane / 16;  // 0 or 1
+      const int c8  = h * 8;      // columns 0..7 or 8..15
+      const int k_row = kk * 16 + r;
+      const bool in_k = (k_row < K);
+      hip_bfloat16* dst = &sXb[curr][0] + r * 16 + c8;
+      if (in_k) {
+        const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
+        reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+      } else {
+        reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int kk = 0; kk < Ktiles; ++kk) {
+    const int next = curr ^ 1;
+    // Prefetch next tile
+    if (kk + 1 < Ktiles) {
+      if (lane < 32) {
+        const size_t w_tile_base = ((size_t)tile_m * tilesPerRow + (size_t)(kk + 1)) * (size_t)256;
+        const hip_bfloat16* w_src = W_packed + w_tile_base;
+        reinterpret_cast<u32x4*>(sWb[next])[lane] = reinterpret_cast<const u32x4*>(w_src)[lane];
+      }
+      if (lane < 32) {
+        const int r   = lane % 16;
+        const int h   = lane / 16;  // 0 or 1
+        const int c8  = h * 8;      // columns 0..7 or 8..15
+        const int k_row = (kk + 1) * 16 + r;
+        const bool in_k = (k_row < K);
+        hip_bfloat16* dst = &sXb[next][0] + r * 16 + c8;
+        if (in_k) {
+          const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad + (size_t)base_col + (size_t)c8;
+          reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+        } else {
+          reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
+        }
+      }
+    }
+
+    // Compute on current tile
+    {
+      const int kbase = ty * 4;  // 4 BF16s per operand per lane
+      using short4v = __attribute__((ext_vector_type(4))) short;
+      union UB { hip_bfloat16 b; unsigned short u; } u0, u1, u2, u3;
+      short4v Areg, Breg;
+      u0.b = sWb[curr][tx * 16 + (kbase + 0)]; u1.b = sWb[curr][tx * 16 + (kbase + 1)];
+      u2.b = sWb[curr][tx * 16 + (kbase + 2)]; u3.b = sWb[curr][tx * 16 + (kbase + 3)];
+      Areg.x = (short)u0.u; Areg.y = (short)u1.u; Areg.z = (short)u2.u; Areg.w = (short)u3.u;
+      u0.b = sXb[curr][(kbase + 0) * 16 + tx]; u1.b = sXb[curr][(kbase + 1) * 16 + tx];
+      u2.b = sXb[curr][(kbase + 2) * 16 + tx]; u3.b = sXb[curr][(kbase + 3) * 16 + tx];
+      Breg.x = (short)u0.u; Breg.y = (short)u1.u; Breg.z = (short)u2.u; Breg.w = (short)u3.u;
+      dmn = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, dmn, 0, 0, 0);
+    }
+
+    __syncthreads();
+    curr = next;
+  }
+
+  // Epilogue: add bias and scatter store
+  const int col = base_col + tx;
+  if (col < B) {
+    const int sid = slot_ids[col];
+    float* out_s = dst + (size_t)sid * (size_t)out_stride;
+    // Each thread writes 4 rows: row = base_row + (ty*4 + i)
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int row = base_row + (ty * 4 + i);
+      if (row < M) {
+        const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
+        out_s[row] = dmn[i] + biasv;
+      }
+    }
+  }
+}
+
+__global__ __launch_bounds__(64)
+void gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout(
     const hip_bfloat16* __restrict__ W_packed,
     const hip_bfloat16* __restrict__ Xpack,
     float* __restrict__ dst,
@@ -1932,7 +2289,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       const hip_bfloat16 *w_qkv_packed = gpu_ctx->weights.w_qkv_packed16 + (size_t)l * (size_t)Mpad * (size_t)Kpad;
       dim3 grid((unsigned)(Mpad + 15) / 16, (unsigned)(Bpad + 15) / 16);
       dim3 block(16, 4, 1);
-      gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<grid, block, 0, gpu_ctx->batch_stream>>>(
+      gemm16x16_mfma_f32_packedW_batched_scatter_bias_qkv<<<grid, block, 0, gpu_ctx->batch_stream>>>(
         w_qkv_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.qkv, b_qkv,
         qkv_out_dim, Kqkv, batch, Bpad, qkv_out_dim, gpu_ctx->d_slot_ids, Mpad, Kpad);
     }
@@ -2048,7 +2405,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       const hip_bfloat16 *w_o_packed = gpu_ctx->weights.w_o_packed16 + (size_t)l * (size_t)Mpad2 * (size_t)Kpad2;
       dim3 blockG(16, 4, 1), gridG((unsigned int)((Mpad2 + 15) / 16), (unsigned int)((Bpad2 + 15) / 16));
 
-      gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+      gemm16x16_mfma_f32_packedW_batched_scatter_bias_wo<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
         w_o_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.tb2, b_o,
         Mwo, Kow, batch, Bpad2, Mwo, gpu_ctx->d_slot_ids, Mpad2, Kpad2);
     }
@@ -2080,7 +2437,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         gpu_ctx->state.t, gpu_ctx->state.xpack_bf16, Kr, batch, Bpadr, hidden_dim, gpu_ctx->d_slot_ids);
       const hip_bfloat16 *w_router_packed = gpu_ctx->weights.w_router_packed16 + (size_t)l * (size_t)Mpadr * (size_t)Kpadr;
       dim3 blockG(16, 4, 1), gridG((unsigned)(Mpadr + 15) / 16, (unsigned)(Bpadr + 15) / 16);
-      gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+      gemm16x16_mfma_f32_packedW_batched_scatter_bias_router<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
         w_router_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.router_score, b_router,
         Mr, Kr, batch, Bpadr, Mr, gpu_ctx->d_slot_ids, Mpadr, Kpadr);
     }
@@ -2278,7 +2635,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       const hip_bfloat16 *w_out_packed = gpu_ctx->weights.w_out_packed16;
       dim3 blockG(16, 4, 1), gridG((unsigned int)((Mpad3 + 15) / 16), (unsigned int)((Bpad3 + 15) / 16));
       // Use identity mapping for output rows (b -> row b)
-      gemm16x16_mfma_f32_packedW_batched_scatter_bias<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
+      gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
         w_out_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.logits_fp32, /*bias*/nullptr,
         Mout, Kout, batch, Bpad3, Mout, gpu_ctx->d_batch_iota, Mpad3, Kpad3);
     }
