@@ -341,7 +341,12 @@ typedef struct {
   float *mlp1_out_all;    // [max_batch * experts_per_token][local_mlp1_out_dim]
   hip_bfloat16 *gate_up_all;     // [max_batch * experts_per_token][local_intermediate_dim]
   float *tb2_peer;        // cross-GPU accumulation buffers (leader)
-  float *e_agg_peer;
+  float *e_agg_peer;      // ring all-reduce staging (all TP ranks)
+  float *e_agg_pack;      // contiguous staging of active slots for TP ring
+  size_t e_agg_stage_elems;
+  int    e_agg_stage_rows;
+  hipEvent_t e_agg_stage_ready[2];
+  hipEvent_t e_agg_stage_done[2];
   // MFMA packed buffers
   hip_bfloat16 *xpack_bf16; // Packed input buffer for MFMA [K_max x Bpad]
   // Grouped MoE metadata per launch
@@ -395,6 +400,7 @@ typedef struct {
   GPURunState state;
   int max_batch; // number of concurrent slots per GPU for continuous batching
   hipStream_t batch_stream;              // shared stream for batched ops
+  hipStream_t tp_comm_stream;           // async TP communication stream
   hipEvent_t batch_event;
   // Staging device buffers for batched indices and positions
   int *d_slot_ids;
@@ -1930,6 +1936,37 @@ __global__ void add_selected_kernel_float(float *dst, const float *src, int size
     int sid = slot_ids[b];
     size_t offset = (size_t)sid * (size_t)size + (size_t)i;
     dst[offset] += src[offset];
+  }
+}
+
+__global__ void pack_selected_rows_kernel_float(const float *src, float *dst,
+                                                int hidden_dim, int batch,
+                                                int stride, const int *slot_ids) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int b = blockIdx.y;
+  if (i < hidden_dim && b < batch) {
+    int sid = slot_ids[b];
+    float *dst_row = dst + (size_t)b * (size_t)hidden_dim;
+    if (sid < 0) {
+      dst_row[i] = 0.0f;
+      return;
+    }
+    const float *src_row = src + (size_t)sid * (size_t)stride;
+    dst_row[i] = src_row[i];
+  }
+}
+
+__global__ void add_rows_kernel_float(float *dst, const float *src,
+                                      int hidden_dim, int rows,
+                                      int stride, const int *slot_ids) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int r = blockIdx.y;
+  if (i < hidden_dim && r < rows) {
+    int sid = slot_ids[r];
+    if (sid < 0) return;
+    float *dst_row = dst + (size_t)sid * (size_t)stride;
+    const float *src_row = src + (size_t)r * (size_t)hidden_dim;
+    dst_row[i] += src_row[i];
   }
 }
 
@@ -3635,31 +3672,119 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         M_local, block_count,
         hidden_dim, ctx->local_intermediate_dim,
         l, ctx->local_experts, hidden_dim);
+      if (batch > 0 && ctxs.size() > 1 && ctx->state.e_agg_pack) {
+        dim3 block_pack(256);
+        dim3 grid_pack((hidden_dim + block_pack.x - 1) / block_pack.x, batch);
+        pack_selected_rows_kernel_float<<<grid_pack, block_pack, 0, ctx->batch_stream>>>(
+          ctx->state.e_agg, ctx->state.e_agg_pack,
+          hidden_dim, batch, hidden_dim, ctx->d_slot_ids);
+      }
       record_batch_event(ctx);
     }
 
-    // Sum e_agg on leader and broadcast
+    // Ring all-reduce e_agg across TP ranks
     if (ctxs.size() > 1) {
-      HIP_CHECK(hipSetDevice(leader->device_id));
-      size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
-      for (size_t idx = 1; idx < ctxs.size(); ++idx) {
-        GPUContext *peer = ctxs[idx];
-        stream_wait_on(leader, peer);
-        HIP_CHECK(hipMemcpyPeerAsync(leader->state.e_agg_peer, leader->device_id,
-                                     peer->state.e_agg, peer->device_id, bytes,
-                                     leader->batch_stream));
-        HIP_CHECK(hipSetDevice(leader->device_id));
-        dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
-        add_selected_kernel_float<<<grid, block, 0, leader->batch_stream>>>(
-          leader->state.e_agg, leader->state.e_agg_peer, hidden_dim, batch, leader->d_slot_ids);
+      std::vector<GPUContext*> tp_ordered(ctxs.size());
+      for (GPUContext *ctx : ctxs) {
+        tp_ordered[ctx->tp_rank] = ctx;
       }
-      record_batch_event(leader);
-      for (size_t idx = 1; idx < ctxs.size(); ++idx) {
-        GPUContext *peer = ctxs[idx];
-        stream_wait_on(peer, leader);
-        HIP_CHECK(hipMemcpyPeerAsync(peer->state.e_agg, peer->device_id,
-                                     leader->state.e_agg, leader->device_id, bytes,
-                                     peer->batch_stream));
+
+      if (tp_ordered.size() == 2 && tp_ordered[0] && tp_ordered[1] &&
+          tp_ordered[0]->state.e_agg_pack && tp_ordered[1]->state.e_agg_pack) {
+        GPUContext *ctx0 = tp_ordered[0];
+        GPUContext *ctx1 = tp_ordered[1];
+        size_t stage_rows = std::min((size_t)ctx0->state.e_agg_stage_rows,
+                                     (size_t)ctx1->state.e_agg_stage_rows);
+        if (stage_rows == 0) stage_rows = 1;
+        int rows_total = batch;
+        size_t hidden_elems = (size_t)hidden_dim;
+
+        size_t row_base = 0;
+        int chunk_idx = 0;
+        while (row_base < (size_t)rows_total) {
+          int rows = (int)std::min(stage_rows, (size_t)rows_total - row_base);
+          size_t elems = (size_t)rows * hidden_elems;
+          if (elems == 0) break;
+          size_t bytes = elems * sizeof(float);
+          int ping = chunk_idx & 1;
+
+          {
+            GPUContext *ctx = ctx0;
+            GPUContext *peer = ctx1;
+            HIP_CHECK(hipSetDevice(ctx->device_id));
+            HIP_CHECK(hipStreamWaitEvent(ctx->tp_comm_stream, ctx->state.e_agg_stage_done[ping], 0));
+            HIP_CHECK(hipStreamWaitEvent(ctx->tp_comm_stream, peer->batch_event, 0));
+            const float *src = peer->state.e_agg_pack + row_base * hidden_elems;
+            float *dst_stage = ctx->state.e_agg_peer + (size_t)ping * ctx->state.e_agg_stage_elems;
+            HIP_CHECK(hipMemcpyPeerAsync(dst_stage, ctx->device_id,
+                                         src, peer->device_id, bytes,
+                                         ctx->tp_comm_stream));
+            HIP_CHECK(hipEventRecord(ctx->state.e_agg_stage_ready[ping], ctx->tp_comm_stream));
+          }
+          {
+            GPUContext *ctx = ctx1;
+            GPUContext *peer = ctx0;
+            HIP_CHECK(hipSetDevice(ctx->device_id));
+            HIP_CHECK(hipStreamWaitEvent(ctx->tp_comm_stream, ctx->state.e_agg_stage_done[ping], 0));
+            HIP_CHECK(hipStreamWaitEvent(ctx->tp_comm_stream, peer->batch_event, 0));
+            const float *src = peer->state.e_agg_pack + row_base * hidden_elems;
+            float *dst_stage = ctx->state.e_agg_peer + (size_t)ping * ctx->state.e_agg_stage_elems;
+            HIP_CHECK(hipMemcpyPeerAsync(dst_stage, ctx->device_id,
+                                         src, peer->device_id, bytes,
+                                         ctx->tp_comm_stream));
+            HIP_CHECK(hipEventRecord(ctx->state.e_agg_stage_ready[ping], ctx->tp_comm_stream));
+          }
+
+          {
+            GPUContext *ctx = ctx0;
+            HIP_CHECK(hipSetDevice(ctx->device_id));
+            HIP_CHECK(hipStreamWaitEvent(ctx->batch_stream, ctx->state.e_agg_stage_ready[ping], 0));
+            float *dst = ctx->state.e_agg;
+            const float *src_stage = ctx->state.e_agg_peer + (size_t)ping * ctx->state.e_agg_stage_elems;
+            dim3 block_add(256);
+            dim3 grid_add((hidden_dim + block_add.x - 1) / block_add.x, rows);
+            add_rows_kernel_float<<<grid_add, block_add, 0, ctx->batch_stream>>>(
+              dst, src_stage, hidden_dim, rows, hidden_dim, ctx->d_slot_ids + row_base);
+            HIP_CHECK(hipEventRecord(ctx->state.e_agg_stage_done[ping], ctx->batch_stream));
+          }
+          {
+            GPUContext *ctx = ctx1;
+            HIP_CHECK(hipSetDevice(ctx->device_id));
+            HIP_CHECK(hipStreamWaitEvent(ctx->batch_stream, ctx->state.e_agg_stage_ready[ping], 0));
+            float *dst = ctx->state.e_agg;
+            const float *src_stage = ctx->state.e_agg_peer + (size_t)ping * ctx->state.e_agg_stage_elems;
+            dim3 block_add(256);
+            dim3 grid_add((hidden_dim + block_add.x - 1) / block_add.x, rows);
+            add_rows_kernel_float<<<grid_add, block_add, 0, ctx->batch_stream>>>(
+              dst, src_stage, hidden_dim, rows, hidden_dim, ctx->d_slot_ids + row_base);
+            HIP_CHECK(hipEventRecord(ctx->state.e_agg_stage_done[ping], ctx->batch_stream));
+          }
+
+          row_base += (size_t)rows;
+          ++chunk_idx;
+        }
+      } else {
+        HIP_CHECK(hipSetDevice(leader->device_id));
+        size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
+        for (size_t idx = 1; idx < ctxs.size(); ++idx) {
+          GPUContext *peer = ctxs[idx];
+          stream_wait_on(leader, peer);
+          HIP_CHECK(hipMemcpyPeerAsync(leader->state.e_agg_peer, leader->device_id,
+                                       peer->state.e_agg, peer->device_id, bytes,
+                                       leader->batch_stream));
+          HIP_CHECK(hipSetDevice(leader->device_id));
+          dim3 block(256), grid((hidden_dim + block.x - 1) / block.x, batch);
+          add_selected_kernel_float<<<grid, block, 0, leader->batch_stream>>>(
+            leader->state.e_agg, leader->state.e_agg_peer, hidden_dim, batch, leader->d_slot_ids);
+        }
+        record_batch_event(leader);
+        for (size_t idx = 1; idx < ctxs.size(); ++idx) {
+          GPUContext *peer = ctxs[idx];
+          stream_wait_on(peer, leader);
+          HIP_CHECK(hipMemcpyPeerAsync(peer->state.e_agg, peer->device_id,
+                                       leader->state.e_agg, leader->device_id, bytes,
+                                       peer->batch_stream));
+        }
       }
     }
 
@@ -3879,7 +4004,10 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     }
     gpu_malloc_run_state(&ctx, cfg, ctx.max_batch);
 
+    ctx.batch_stream = nullptr;
+    ctx.tp_comm_stream = nullptr;
     HIP_CHECK(hipStreamCreate(&ctx.batch_stream));
+    HIP_CHECK(hipStreamCreateWithFlags(&ctx.tp_comm_stream, hipStreamNonBlocking));
     HIP_CHECK(hipEventCreateWithFlags(&ctx.batch_event, hipEventDisableTiming));
     HIP_CHECK(hipMalloc(&ctx.d_slot_ids,  ctx.max_batch * sizeof(int)));
     HIP_CHECK(hipMalloc(&ctx.d_pos_list,  ctx.max_batch * sizeof(int)));
@@ -3890,6 +4018,15 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     for (int i = 0; i < ctx.max_batch; ++i) host_batch_iota[i] = i;
     HIP_CHECK(hipMemcpy(ctx.d_batch_iota, host_batch_iota.data(),
                        ctx.max_batch * sizeof(int), hipMemcpyHostToDevice));
+
+    if (parallel_layout.tp_size == 2 && ctx.state.e_agg_stage_elems > 0) {
+      HIP_CHECK(hipSetDevice(ctx.device_id));
+      for (int i = 0; i < 2; ++i) {
+        if (ctx.state.e_agg_stage_done[i]) {
+          HIP_CHECK(hipEventRecord(ctx.state.e_agg_stage_done[i], ctx.batch_stream));
+        }
+      }
+    }
 
   }
 
@@ -3926,6 +4063,8 @@ void finish(Transformer *transformer, Tokenizer *tokenizer) {
     if (gpu_ctx.batch_event) HIP_CHECK(hipEventDestroy(gpu_ctx.batch_event));
     gpu_ctx.batch_event = nullptr;
     if (gpu_ctx.batch_stream) HIP_CHECK(hipStreamDestroy(gpu_ctx.batch_stream));
+    if (gpu_ctx.tp_comm_stream) HIP_CHECK(hipStreamDestroy(gpu_ctx.tp_comm_stream));
+    gpu_ctx.tp_comm_stream = nullptr;
     if (gpu_ctx.d_slot_ids)    HIP_CHECK(hipFree(gpu_ctx.d_slot_ids));
     if (gpu_ctx.d_pos_list)    HIP_CHECK(hipFree(gpu_ctx.d_pos_list));
     if (gpu_ctx.d_token_ids)   HIP_CHECK(hipFree(gpu_ctx.d_token_ids));
@@ -4144,8 +4283,43 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
 
   s->tb2_peer = nullptr;
   s->e_agg_peer = nullptr;
+  s->e_agg_pack = nullptr;
+  s->e_agg_stage_elems = 0;
+  s->e_agg_stage_rows = 0;
+  for (int i = 0; i < 2; ++i) {
+    s->e_agg_stage_ready[i] = nullptr;
+    s->e_agg_stage_done[i] = nullptr;
+  }
   if (ctx->is_leader) {
     HIP_CHECK(hipMalloc(&s->tb2_peer, B * (size_t)hidden_dim * sizeof(float)));
+  }
+  if (parallel_layout.tp_size == 2) {
+    size_t chunk_mb = 64;
+    const char *env_chunk = getenv("GETP_EAGG_CHUNK_MB");
+    if (env_chunk) {
+      long val = strtol(env_chunk, nullptr, 10);
+      if (val > 0) chunk_mb = (size_t)val;
+    }
+    size_t chunk_bytes = chunk_mb * (size_t)1024 * (size_t)1024;
+    size_t row_bytes = (size_t)hidden_dim * sizeof(float);
+    size_t stage_rows = chunk_bytes / row_bytes;
+    if (stage_rows == 0) stage_rows = 1;
+    if (stage_rows > B) stage_rows = B;
+    size_t stage_elems = stage_rows * (size_t)hidden_dim;
+    if (stage_elems == 0) {
+      stage_rows = 1;
+      stage_elems = (size_t)hidden_dim;
+    }
+    size_t stage_bytes = stage_elems * sizeof(float);
+    HIP_CHECK(hipMalloc(&s->e_agg_peer, 2 * stage_bytes));
+    HIP_CHECK(hipMalloc(&s->e_agg_pack, B * (size_t)hidden_dim * sizeof(float)));
+    s->e_agg_stage_rows = static_cast<int>(stage_rows);
+    s->e_agg_stage_elems = stage_elems;
+    for (int i = 0; i < 2; ++i) {
+      HIP_CHECK(hipEventCreateWithFlags(&s->e_agg_stage_ready[i], hipEventDisableTiming));
+      HIP_CHECK(hipEventCreateWithFlags(&s->e_agg_stage_done[i], hipEventDisableTiming));
+    }
+  } else if (ctx->is_leader) {
     HIP_CHECK(hipMalloc(&s->e_agg_peer, B * (size_t)hidden_dim * sizeof(float)));
   }
   
@@ -4184,7 +4358,12 @@ void gpu_free_run_state(GPUContext *ctx) {
   HIP_CHECK(hipFree(s->mlp1_out_all));
   HIP_CHECK(hipFree(s->gate_up_all));
   if (s->tb2_peer) HIP_CHECK(hipFree(s->tb2_peer));
+  for (int i = 0; i < 2; ++i) {
+    if (s->e_agg_stage_ready[i]) HIP_CHECK(hipEventDestroy(s->e_agg_stage_ready[i]));
+    if (s->e_agg_stage_done[i]) HIP_CHECK(hipEventDestroy(s->e_agg_stage_done[i]));
+  }
   if (s->e_agg_peer) HIP_CHECK(hipFree(s->e_agg_peer));
+  if (s->e_agg_pack) HIP_CHECK(hipFree(s->e_agg_pack));
   HIP_CHECK(hipFree(s->xpack_bf16));
   if (s->kv_cache_manager) {
     delete s->kv_cache_manager;
