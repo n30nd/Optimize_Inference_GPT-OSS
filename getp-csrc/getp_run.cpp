@@ -669,6 +669,8 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   __shared__ __align__(16) float sBias[16];
   __shared__ __align__(16) const hip_bfloat16* sXPtrs[16];
   __shared__ __align__(16) float* sOutPtrs[16];
+  short4v* __restrict__ sWvec = reinterpret_cast<short4v*>(sWbf16);
+  short4v* __restrict__ sXvec = reinterpret_cast<short4v*>(sXbf16);
 
   if (lane < 16) {
     // Cache bias and per-selection base pointers once per block to reuse across all K tiles.
@@ -720,27 +722,25 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
       scale_code_int = __shfl(scale_code_int, lane_group, 4);
       uint8_t scale_code = static_cast<uint8_t>(scale_code_int & 0xFF);
       const uint16_t* __restrict__ lut_row = MXFP4_DEQUANT_LUT_BF16[scale_code];
+      short4v wvec = {0, 0, 0, 0};
       if (fast_w_tile) {
         #pragma unroll
         for (int t4 = 0; t4 < 4; ++t4) {
-          int ik = ik_base + t4;
           uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-          sWbf16[im * 16 + ik] = lut_row[nibble];
+          wvec[t4] = static_cast<short>(lut_row[nibble]);
         }
       } else {
         const bool row_valid = (row < out_dim);
         #pragma unroll
         for (int t4 = 0; t4 < 4; ++t4) {
-          int ik = ik_base + t4;
-          int col = col_base + t4;
-          uint16_t bits = 0;
+          const int col = col_base + t4;
           if (row_valid && col < K) {
-            uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-            bits = lut_row[nibble];
+            const uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
+            wvec[t4] = static_cast<short>(lut_row[nibble]);
           }
-          sWbf16[im * 16 + ik] = bits;
         }
       }
+      sWvec[im * 4 + (ik_base >> 2)] = wvec;
     }
 
     // Build X tile [16x16] by gathering up to 16 distinct selections
@@ -748,28 +748,24 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
       const int r   = lane % 16;        // K row within tile
       const int c4  = (lane / 16) * 4;  // column block index {0,4,8,12}
       const int k_row = kk * 16 + r;
-      uint16_t* dst = sXbf16 + r * 16 + c4;
+      short4v xvec = {0, 0, 0, 0};
       const hip_bfloat16* x0 = sXPtrs[c4 + 0];
       const hip_bfloat16* x1 = sXPtrs[c4 + 1];
       const hip_bfloat16* x2 = sXPtrs[c4 + 2];
       const hip_bfloat16* x3 = sXPtrs[c4 + 3];
-      if (fast_x_tile) {
-        dst[0] = bfloat16_to_bits(x0[k_row]);
-        dst[1] = bfloat16_to_bits(x1[k_row]);
-        dst[2] = bfloat16_to_bits(x2[k_row]);
-        dst[3] = bfloat16_to_bits(x3[k_row]);
+      if (fast_x_tile && x0 && x1 && x2 && x3) {
+        xvec[0] = static_cast<short>(bfloat16_to_bits(x0[k_row]));
+        xvec[1] = static_cast<short>(bfloat16_to_bits(x1[k_row]));
+        xvec[2] = static_cast<short>(bfloat16_to_bits(x2[k_row]));
+        xvec[3] = static_cast<short>(bfloat16_to_bits(x3[k_row]));
       } else {
         const bool row_valid = (k_row < K);
-        uint16_t v0 = 0, v1 = 0, v2 = 0, v3 = 0;
-        if (row_valid && x0) v0 = bfloat16_to_bits(x0[k_row]);
-        if (row_valid && x1) v1 = bfloat16_to_bits(x1[k_row]);
-        if (row_valid && x2) v2 = bfloat16_to_bits(x2[k_row]);
-        if (row_valid && x3) v3 = bfloat16_to_bits(x3[k_row]);
-        dst[0] = v0;
-        dst[1] = v1;
-        dst[2] = v2;
-        dst[3] = v3;
+        if (row_valid && x0) xvec[0] = static_cast<short>(bfloat16_to_bits(x0[k_row]));
+        if (row_valid && x1) xvec[1] = static_cast<short>(bfloat16_to_bits(x1[k_row]));
+        if (row_valid && x2) xvec[2] = static_cast<short>(bfloat16_to_bits(x2[k_row]));
+        if (row_valid && x3) xvec[3] = static_cast<short>(bfloat16_to_bits(x3[k_row]));
       }
+      sXvec[r * 4 + (c4 >> 2)] = xvec;
     }
 
     __syncthreads();
