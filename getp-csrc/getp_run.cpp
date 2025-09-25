@@ -661,6 +661,9 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
   const hip_bfloat16* __restrict__ B = b_mlp1 ? (b_mlp1 + mat_index * (size_t)out_dim) : nullptr;
 
+  const bool full_row_tile = (base_row + 15) < out_dim;
+  const bool all_cols_active = (valid_cols == 16) && ((col0 + 15) < selections_M);
+
   __shared__ __align__(16) uint16_t sWbf16[16 * 16];
   __shared__ __align__(16) uint16_t sXbf16[16 * 16];
   __shared__ __align__(16) float sBias[16];
@@ -696,6 +699,9 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     const size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
     const size_t tile_base_byte = tile_linear * (size_t)128;
     const size_t scale_base = tile_linear * (size_t)16;
+    const bool full_k_tile = ((kk + 1) * 16) <= K;
+    const bool fast_w_tile = full_row_tile && full_k_tile;
+    const bool fast_x_tile = all_cols_active && full_k_tile;
 
     // Fill W tile [16x16] by dequantizing from MXFP4
     int idx4 = lane * 4;
@@ -714,16 +720,26 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
       scale_code_int = __shfl(scale_code_int, lane_group, 4);
       uint8_t scale_code = static_cast<uint8_t>(scale_code_int & 0xFF);
       const uint16_t* __restrict__ lut_row = MXFP4_DEQUANT_LUT_BF16[scale_code];
-      #pragma unroll
-      for (int t4 = 0; t4 < 4; ++t4) {
-        int ik = ik_base + t4;
-        int col = col_base + t4;
-        uint16_t bits = 0;
-        if (row < out_dim && col < K) {
+      if (fast_w_tile) {
+        #pragma unroll
+        for (int t4 = 0; t4 < 4; ++t4) {
+          int ik = ik_base + t4;
           uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-          bits = lut_row[nibble];
+          sWbf16[im * 16 + ik] = lut_row[nibble];
         }
-        sWbf16[im * 16 + ik] = bits;
+      } else {
+        const bool row_valid = (row < out_dim);
+        #pragma unroll
+        for (int t4 = 0; t4 < 4; ++t4) {
+          int ik = ik_base + t4;
+          int col = col_base + t4;
+          uint16_t bits = 0;
+          if (row_valid && col < K) {
+            uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
+            bits = lut_row[nibble];
+          }
+          sWbf16[im * 16 + ik] = bits;
+        }
       }
     }
 
@@ -733,16 +749,26 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
       const int c4  = (lane / 16) * 4;  // column block index {0,4,8,12}
       const int k_row = kk * 16 + r;
       uint16_t* dst = sXbf16 + r * 16 + c4;
-      #pragma unroll
-      for (int jj = 0; jj < 4; ++jj) {
-        int col = c4 + jj;
-        uint16_t bits = 0;
-        const hip_bfloat16* x = sXPtrs[col];
-        if (x && col < valid_cols && k_row < K) {
-          hip_bfloat16 val = x[k_row];
-          bits = bfloat16_to_bits(val);
-        }
-        dst[jj] = bits;
+      const hip_bfloat16* x0 = sXPtrs[c4 + 0];
+      const hip_bfloat16* x1 = sXPtrs[c4 + 1];
+      const hip_bfloat16* x2 = sXPtrs[c4 + 2];
+      const hip_bfloat16* x3 = sXPtrs[c4 + 3];
+      if (fast_x_tile) {
+        dst[0] = bfloat16_to_bits(x0[k_row]);
+        dst[1] = bfloat16_to_bits(x1[k_row]);
+        dst[2] = bfloat16_to_bits(x2[k_row]);
+        dst[3] = bfloat16_to_bits(x3[k_row]);
+      } else {
+        const bool row_valid = (k_row < K);
+        uint16_t v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+        if (row_valid && x0) v0 = bfloat16_to_bits(x0[k_row]);
+        if (row_valid && x1) v1 = bfloat16_to_bits(x1[k_row]);
+        if (row_valid && x2) v2 = bfloat16_to_bits(x2[k_row]);
+        if (row_valid && x3) v3 = bfloat16_to_bits(x3[k_row]);
+        dst[0] = v0;
+        dst[1] = v1;
+        dst[2] = v2;
+        dst[3] = v3;
       }
     }
 
@@ -766,12 +792,17 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
 
   float* out_vec = sOutPtrs[tx];
   if (out_vec) {
+    float bias_vec[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      bias_vec[i] = sBias[ty * 4 + i];
+    }
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int rloc = ty * 4 + i;
       const int row = base_row + rloc;
-      if (row < out_dim) {
-        out_vec[row] = acc[i] + sBias[rloc];
+      if (full_row_tile || row < out_dim) {
+        out_vec[row] = acc[i] + bias_vec[i];
       }
     }
   }
