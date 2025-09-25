@@ -1770,12 +1770,14 @@ __device__ __forceinline__ void atomic_update_argmax(unsigned long long *addr,
   }
 }
 
+constexpr int kLogitsGroupsPerBlock = 2;
+
 __global__ __launch_bounds__(64)
 void logits_kernel(
-    const hip_bfloat16* __restrict__ W_packed,    // [Mpad x Kpad] tile16 BF16
-    const hip_bfloat16* __restrict__ Xpack,       // [K x Bpad] BF16 (cột = batch)
-    float* __restrict__ dst,                      // scatter theo slot_ids
-    const hip_bfloat16* __restrict__ bias,        // [M] hoặc nullptr
+    const hip_bfloat16* __restrict__ W_packed,
+    const hip_bfloat16* __restrict__ Xpack,
+    float* __restrict__ dst,
+    const hip_bfloat16* __restrict__ bias,
     int M, int K, int B, int Bpad,
     int out_stride,
     const int* __restrict__ slot_ids,
@@ -1785,22 +1787,18 @@ void logits_kernel(
     unsigned long long *max_packed,
     int vocab_limit)
 {
-  const int tx = threadIdx.x;     // cột trong tile (0..15) = cột batch
-  const int ty = threadIdx.y;     // nhóm hàng (0..3)
-  const int lane = ty * 16 + tx;  // 0..63
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+  const int lane = ty * 16 + tx;
 
-  const int tile_m_local  = blockIdx.x;    // tile index within assigned range
-  const int tile_global   = tile_offset + tile_m_local;
-  const int b_group = blockIdx.y;          // nhóm 16 batch
-  const int b_base  = b_group * 16;
-  if (b_base >= B) return;
-
-  const int cols_this = min(16, B - b_base);  // số cột hợp lệ trong nhóm này
-  const int base_row = tile_global * 16;      // hàng cơ sở toàn cục
+  const int tile_m_local = blockIdx.x;
+  const int tile_global = tile_offset + tile_m_local;
+  const int group_base = blockIdx.y * kLogitsGroupsPerBlock;
+  const int base_row = tile_global * 16;
 
   __shared__ __align__(16) uint16_t sW[2][16 * 16];
-  __shared__ __align__(16) uint16_t sX[2][16 * 16];
-  __shared__ int s_slot[16];
+  __shared__ __align__(16) uint16_t sX[2][kLogitsGroupsPerBlock][16 * 16];
+  __shared__ int s_slot[kLogitsGroupsPerBlock * 16];
   __shared__ float s_bias_rows[16];
   __shared__ float s_lane_best_val[64];
   __shared__ int s_lane_best_idx[64];
@@ -1809,16 +1807,51 @@ void logits_kernel(
   using short4v = __attribute__((ext_vector_type(4))) short;
 
   const bool has_bias = (bias != nullptr);
-  const bool full_tile = (cols_this == 16);
+
+  int b_base_arr[kLogitsGroupsPerBlock];
+  size_t b_base_sz_arr[kLogitsGroupsPerBlock];
+  int cols_this_arr[kLogitsGroupsPerBlock];
+  bool full_tile_arr[kLogitsGroupsPerBlock];
+  bool active_group[kLogitsGroupsPerBlock];
+
+  #pragma unroll
+  for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
+    const int b_group = group_base + g;
+    const int b_base = b_group * 16;
+    const bool active = (b_base < B);
+    active_group[g] = active;
+    b_base_arr[g] = b_base;
+    b_base_sz_arr[g] = static_cast<size_t>(b_base);
+    int cols = 0;
+    bool full = false;
+    if (active) {
+      cols = min(16, B - b_base);
+      full = (cols == 16);
+    }
+    cols_this_arr[g] = cols;
+    full_tile_arr[g] = full;
+  }
+
+  bool any_group_active = false;
+  #pragma unroll
+  for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
+    any_group_active |= active_group[g];
+  }
+  if (!any_group_active) return;
 
   if (ty == 0) {
     const int col = tx;
-    const int global_col = b_base + col;
-    int slot_val = -1;
-    if (col < cols_this && global_col < B) {
-      slot_val = slot_ids[global_col];
+    #pragma unroll
+    for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
+      int slot_val = -1;
+      if (active_group[g] && col < cols_this_arr[g]) {
+        const int global_col = b_base_arr[g] + col;
+        if (global_col < B) {
+          slot_val = slot_ids[global_col];
+        }
+      }
+      s_slot[g * 16 + col] = slot_val;
     }
-    s_slot[col] = slot_val;
 
     const int row = base_row + col;
     float bias_val = 0.0f;
@@ -1829,16 +1862,19 @@ void logits_kernel(
   }
   __syncthreads();
 
-  float4v acc = {0.f, 0.f, 0.f, 0.f};
+  float4v accum[kLogitsGroupsPerBlock];
+  #pragma unroll
+  for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
+    accum[g] = {0.f, 0.f, 0.f, 0.f};
+  }
 
   const int Ktiles = (Kpad + 15) / 16;
-  const size_t tiles_per_row = (size_t)((Kpad + 15) / 16);
+  const size_t tiles_per_row = static_cast<size_t>((Kpad + 15) / 16);
   const size_t tile_elems = 256;
   const hip_bfloat16* w_tile_row_base =
       W_packed + ((size_t)tile_global * tiles_per_row) * tile_elems;
 
-  const size_t x_stride = (size_t)Bpad;
-  const size_t b_base_sz = (size_t)b_base;
+  const size_t x_stride = static_cast<size_t>(Bpad);
 
   {
     const int idx4 = lane * 4;
@@ -1855,33 +1891,40 @@ void logits_kernel(
     }
 
     const int row_in_tile = lane & 15;
-    const int col_group   = lane >> 4;
-    const int col_base    = col_group * 4;
-    uint16_t vals[4] = {0, 0, 0, 0};
-    const int k_row = row_in_tile;
-    if (k_row < K) {
-      const size_t row_offset = (size_t)k_row * x_stride + b_base_sz + (size_t)col_base;
-      const hip_bfloat16* x_src = Xpack + row_offset;
-      if (full_tile) {
-        const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
-        uint32_t xv0 = x_u32[0];
-        uint32_t xv1 = x_u32[1];
-        vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
-        vals[1] = static_cast<uint16_t>(xv0 >> 16);
-        vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
-        vals[3] = static_cast<uint16_t>(xv1 >> 16);
-      } else {
-        const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
-        if (col_base + 0 < cols_this) vals[0] = x_u16[0];
-        if (col_base + 1 < cols_this) vals[1] = x_u16[1];
-        if (col_base + 2 < cols_this) vals[2] = x_u16[2];
-        if (col_base + 3 < cols_this) vals[3] = x_u16[3];
-      }
-    }
-    uint16_t* dst_tile = &sX[0][row_in_tile * 16 + col_base];
+    const int col_group = lane >> 4;
+    const int col_base = col_group * 4;
+
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      dst_tile[i] = vals[i];
+    for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
+      uint16_t vals[4] = {0, 0, 0, 0};
+      if (active_group[g]) {
+        const int k_row = row_in_tile;
+        if (k_row < K) {
+          const size_t row_offset = static_cast<size_t>(k_row) * x_stride +
+                                    b_base_sz_arr[g] + static_cast<size_t>(col_base);
+          const hip_bfloat16* x_src = Xpack + row_offset;
+          if (full_tile_arr[g]) {
+            const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+            uint32_t xv0 = x_u32[0];
+            uint32_t xv1 = x_u32[1];
+            vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+            vals[1] = static_cast<uint16_t>(xv0 >> 16);
+            vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+            vals[3] = static_cast<uint16_t>(xv1 >> 16);
+          } else {
+            const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+            if (col_base + 0 < cols_this_arr[g]) vals[0] = x_u16[0];
+            if (col_base + 1 < cols_this_arr[g]) vals[1] = x_u16[1];
+            if (col_base + 2 < cols_this_arr[g]) vals[2] = x_u16[2];
+            if (col_base + 3 < cols_this_arr[g]) vals[3] = x_u16[3];
+          }
+        }
+      }
+      uint16_t* dst_tile = &sX[0][g][row_in_tile * 16 + col_base];
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        dst_tile[i] = vals[i];
+      }
     }
   }
   __syncthreads();
@@ -1894,7 +1937,8 @@ void logits_kernel(
     if (kt + 1 < Ktiles) {
       const int idx4 = lane * 4;
       if (idx4 < 256) {
-        const hip_bfloat16* w_src = w_tile_row_base + (size_t)(kt + 1) * tile_elems + idx4;
+        const hip_bfloat16* w_src = w_tile_row_base +
+                                    (size_t)(kt + 1) * tile_elems + idx4;
         const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
         uint32_t v0 = w_u32[0];
         uint32_t v1 = w_u32[1];
@@ -1906,48 +1950,64 @@ void logits_kernel(
       }
 
       const int row_in_tile = lane & 15;
-      const int col_group   = lane >> 4;
-      const int col_base    = col_group * 4;
-      uint16_t vals[4] = {0, 0, 0, 0};
-      const int k_row = (kt + 1) * 16 + row_in_tile;
-      if (k_row < K) {
-        const size_t row_offset = (size_t)k_row * x_stride + b_base_sz + (size_t)col_base;
-        const hip_bfloat16* x_src = Xpack + row_offset;
-        if (full_tile) {
-          const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
-          uint32_t xv0 = x_u32[0];
-          uint32_t xv1 = x_u32[1];
-          vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
-          vals[1] = static_cast<uint16_t>(xv0 >> 16);
-          vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
-          vals[3] = static_cast<uint16_t>(xv1 >> 16);
-        } else {
-          const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
-          if (col_base + 0 < cols_this) vals[0] = x_u16[0];
-          if (col_base + 1 < cols_this) vals[1] = x_u16[1];
-          if (col_base + 2 < cols_this) vals[2] = x_u16[2];
-          if (col_base + 3 < cols_this) vals[3] = x_u16[3];
-        }
-      }
-      uint16_t* dst_tile = &sX[pong][row_in_tile * 16 + col_base];
+      const int col_group = lane >> 4;
+      const int col_base = col_group * 4;
+
       #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        dst_tile[i] = vals[i];
+      for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
+        uint16_t vals[4] = {0, 0, 0, 0};
+        if (active_group[g]) {
+          const int k_row = (kt + 1) * 16 + row_in_tile;
+          if (k_row < K) {
+            const size_t row_offset = static_cast<size_t>(k_row) * x_stride +
+                                      b_base_sz_arr[g] + static_cast<size_t>(col_base);
+            const hip_bfloat16* x_src = Xpack + row_offset;
+            if (full_tile_arr[g]) {
+              const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+              uint32_t xv0 = x_u32[0];
+              uint32_t xv1 = x_u32[1];
+              vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+              vals[1] = static_cast<uint16_t>(xv0 >> 16);
+              vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+              vals[3] = static_cast<uint16_t>(xv1 >> 16);
+            } else {
+              const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+              if (col_base + 0 < cols_this_arr[g]) vals[0] = x_u16[0];
+              if (col_base + 1 < cols_this_arr[g]) vals[1] = x_u16[1];
+              if (col_base + 2 < cols_this_arr[g]) vals[2] = x_u16[2];
+              if (col_base + 3 < cols_this_arr[g]) vals[3] = x_u16[3];
+            }
+          }
+        }
+        uint16_t* dst_tile = &sX[pong][g][row_in_tile * 16 + col_base];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          dst_tile[i] = vals[i];
+        }
       }
     }
 
     __syncthreads();
 
     short4v Areg;
-    short4v Breg;
     const int kbase = ty * 4;
     #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const int kidx = kbase + j;
       Areg[j] = static_cast<short>(sW[ping][tx * 16 + kidx]);
-      Breg[j] = static_cast<short>(sX[ping][kidx * 16 + tx]);
     }
-    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
+
+    #pragma unroll
+    for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
+      if (!active_group[g]) continue;
+      short4v Breg;
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int kidx = kbase + j;
+        Breg[j] = static_cast<short>(sX[ping][g][kidx * 16 + tx]);
+      }
+      accum[g] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, accum[g], 0, 0, 0);
+    }
 
     ping = pong;
   }
@@ -1963,81 +2023,90 @@ void logits_kernel(
   const int r3_local = r3_global - row_offset;
 
   const int bias_base = ty * 4;
-  const float val0 = acc[0] + s_bias_rows[bias_base + 0];
-  const float val1 = acc[1] + s_bias_rows[bias_base + 1];
-  const float val2 = acc[2] + s_bias_rows[bias_base + 2];
-  const float val3 = acc[3] + s_bias_rows[bias_base + 3];
 
-  float lane_best_val = 0.0f;
-  int lane_best_idx = -1;
-  if (r0_global >= 0 && r0_global < vocab_limit) {
-    lane_best_val = val0;
-    lane_best_idx = r0_global;
-  }
-  if (r1_global >= 0 && r1_global < vocab_limit) {
-    if (lane_best_idx < 0 || val1 > lane_best_val ||
-        (val1 == lane_best_val && r1_global < lane_best_idx)) {
-      lane_best_val = val1;
-      lane_best_idx = r1_global;
-    }
-  }
-  if (r2_global >= 0 && r2_global < vocab_limit) {
-    if (lane_best_idx < 0 || val2 > lane_best_val ||
-        (val2 == lane_best_val && r2_global < lane_best_idx)) {
-      lane_best_val = val2;
-      lane_best_idx = r2_global;
-    }
-  }
-  if (r3_global >= 0 && r3_global < vocab_limit) {
-    if (lane_best_idx < 0 || val3 > lane_best_val ||
-        (val3 == lane_best_val && r3_global < lane_best_idx)) {
-      lane_best_val = val3;
-      lane_best_idx = r3_global;
-    }
-  }
+  for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
+    const bool active = active_group[g] && cols_this_arr[g] > 0;
+    float out_vals[4] = {0.f, 0.f, 0.f, 0.f};
+    float lane_best_val = -FLT_MAX;
+    int lane_best_idx = -1;
 
-  s_lane_best_val[lane] = lane_best_val;
-  s_lane_best_idx[lane] = lane_best_idx;
-  __syncthreads();
+    if (active) {
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        out_vals[i] = accum[g][i] + s_bias_rows[bias_base + i];
+      }
 
-  if (tx < cols_this) {
-    const int sid = s_slot[tx];
-    const int global_col = b_base + tx;
-
-    if (max_packed != nullptr && global_col < B) {
-      if (ty == 0) {
-        float best_val_tile = s_lane_best_val[lane];
-        int best_idx_tile = s_lane_best_idx[lane];
-        #pragma unroll
-        for (int other_ty = 1; other_ty < 4; ++other_ty) {
-          const int peer_lane = other_ty * 16 + tx;
-          const float peer_val = s_lane_best_val[peer_lane];
-          const int peer_idx = s_lane_best_idx[peer_lane];
-          if (peer_idx < 0) continue;
-          if (best_idx_tile < 0 || peer_val > best_val_tile ||
-              (peer_val == best_val_tile && peer_idx < best_idx_tile)) {
-            best_val_tile = peer_val;
-            best_idx_tile = peer_idx;
-          }
+      if (r0_global >= 0 && r0_global < vocab_limit) {
+        lane_best_val = out_vals[0];
+        lane_best_idx = r0_global;
+      }
+      if (r1_global >= 0 && r1_global < vocab_limit) {
+        if (lane_best_idx < 0 || out_vals[1] > lane_best_val ||
+            (out_vals[1] == lane_best_val && r1_global < lane_best_idx)) {
+          lane_best_val = out_vals[1];
+          lane_best_idx = r1_global;
         }
-        if (best_idx_tile >= 0) {
-          unsigned long long *slot_max = max_packed + global_col;
-          atomic_update_argmax(slot_max, best_val_tile, best_idx_tile);
+      }
+      if (r2_global >= 0 && r2_global < vocab_limit) {
+        if (lane_best_idx < 0 || out_vals[2] > lane_best_val ||
+            (out_vals[2] == lane_best_val && r2_global < lane_best_idx)) {
+          lane_best_val = out_vals[2];
+          lane_best_idx = r2_global;
+        }
+      }
+      if (r3_global >= 0 && r3_global < vocab_limit) {
+        if (lane_best_idx < 0 || out_vals[3] > lane_best_val ||
+            (out_vals[3] == lane_best_val && r3_global < lane_best_idx)) {
+          lane_best_val = out_vals[3];
+          lane_best_idx = r3_global;
         }
       }
     }
 
-    if (dst != nullptr && sid >= 0) {
-      float* __restrict__ out = dst + (size_t)sid * (size_t)out_stride;
-      if (r0_global < M && r0_local >= 0 && r0_local < out_stride)
-        out[r0_local] = val0;
-      if (r1_global < M && r1_local >= 0 && r1_local < out_stride)
-        out[r1_local] = val1;
-      if (r2_global < M && r2_local >= 0 && r2_local < out_stride)
-        out[r2_local] = val2;
-      if (r3_global < M && r3_local >= 0 && r3_local < out_stride)
-        out[r3_local] = val3;
+    s_lane_best_val[lane] = lane_best_val;
+    s_lane_best_idx[lane] = lane_best_idx;
+    __syncthreads();
+
+    if (active && tx < cols_this_arr[g]) {
+      const int sid = s_slot[g * 16 + tx];
+      const int global_col = b_base_arr[g] + tx;
+
+      if (max_packed != nullptr && global_col < B) {
+        if (ty == 0) {
+          float best_val_tile = s_lane_best_val[lane];
+          int best_idx_tile = s_lane_best_idx[lane];
+          #pragma unroll
+          for (int other_ty = 1; other_ty < 4; ++other_ty) {
+            const int peer_lane = other_ty * 16 + tx;
+            const float peer_val = s_lane_best_val[peer_lane];
+            const int peer_idx = s_lane_best_idx[peer_lane];
+            if (peer_idx < 0) continue;
+            if (best_idx_tile < 0 || peer_val > best_val_tile ||
+                (peer_val == best_val_tile && peer_idx < best_idx_tile)) {
+              best_val_tile = peer_val;
+              best_idx_tile = peer_idx;
+            }
+          }
+          if (best_idx_tile >= 0) {
+            unsigned long long *slot_max = max_packed + global_col;
+            atomic_update_argmax(slot_max, best_val_tile, best_idx_tile);
+          }
+        }
+      }
+
+      if (dst != nullptr && sid >= 0) {
+        float* __restrict__ out = dst + (size_t)sid * (size_t)out_stride;
+        if (r0_global < M && r0_local >= 0 && r0_local < out_stride)
+          out[r0_local] = out_vals[0];
+        if (r1_global < M && r1_local >= 0 && r1_local < out_stride)
+          out[r1_local] = out_vals[1];
+        if (r2_global < M && r2_local >= 0 && r2_local < out_stride)
+          out[r2_local] = out_vals[2];
+        if (r3_global < M && r3_local >= 0 && r3_local < out_stride)
+          out[r3_local] = out_vals[3];
+      }
     }
+    __syncthreads();
   }
 }
 
@@ -3930,7 +3999,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     int Bpad_logits = ((batch + 15) / 16) * 16;
     int Mpad_logits = ((vocab + 15) / 16) * 16;
     int Kpad_logits = ((hidden_dim + 15) / 16) * 16;
-    int group_y = (batch + 15) / 16;
+    int batch_tiles = (batch + 15) / 16;
+    int grid_y = (batch_tiles + kLogitsGroupsPerBlock - 1) / kLogitsGroupsPerBlock;
 
     GPUContext *tp_pair[2] = {tp_leader, tp_follower};
 
@@ -3966,7 +4036,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         }
         const hip_bfloat16 *w_out_packed = ctx->weights.out_packed16;
         dim3 block_gemm(16, 4, 1);
-        dim3 grid_gemm(ctx->logits_tile_count, group_y, 1);
+        dim3 grid_gemm(ctx->logits_tile_count, grid_y, 1);
         logits_kernel<<<grid_gemm, block_gemm, 0, ctx->batch_stream>>>(
           w_out_packed, ctx->state.xpack_bf16, nullptr, nullptr,
           vocab, hidden_dim, batch, Bpad_logits, 0,
