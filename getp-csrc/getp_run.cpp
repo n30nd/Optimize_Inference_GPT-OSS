@@ -1806,6 +1806,8 @@ void logits_kernel(
   __shared__ __align__(16) uint16_t sX[2][16 * 16];
   __shared__ int s_slot[16];
   __shared__ float s_bias_rows[16];
+  __shared__ float s_lane_best_val[64];
+  __shared__ int s_lane_best_idx[64];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   using short4v = __attribute__((ext_vector_type(4))) short;
@@ -1970,16 +1972,63 @@ void logits_kernel(
   const float val2 = acc[2] + s_bias_rows[bias_base + 2];
   const float val3 = acc[3] + s_bias_rows[bias_base + 3];
 
+  float lane_best_val = 0.0f;
+  int lane_best_idx = -1;
+  if (r0_global >= 0 && r0_global < vocab_limit) {
+    lane_best_val = val0;
+    lane_best_idx = r0_global;
+  }
+  if (r1_global >= 0 && r1_global < vocab_limit) {
+    if (lane_best_idx < 0 || val1 > lane_best_val ||
+        (val1 == lane_best_val && r1_global < lane_best_idx)) {
+      lane_best_val = val1;
+      lane_best_idx = r1_global;
+    }
+  }
+  if (r2_global >= 0 && r2_global < vocab_limit) {
+    if (lane_best_idx < 0 || val2 > lane_best_val ||
+        (val2 == lane_best_val && r2_global < lane_best_idx)) {
+      lane_best_val = val2;
+      lane_best_idx = r2_global;
+    }
+  }
+  if (r3_global >= 0 && r3_global < vocab_limit) {
+    if (lane_best_idx < 0 || val3 > lane_best_val ||
+        (val3 == lane_best_val && r3_global < lane_best_idx)) {
+      lane_best_val = val3;
+      lane_best_idx = r3_global;
+    }
+  }
+
+  s_lane_best_val[lane] = lane_best_val;
+  s_lane_best_idx[lane] = lane_best_idx;
+  __syncthreads();
+
   if (tx < cols_this) {
     const int sid = s_slot[tx];
     const int global_col = b_base + tx;
 
     if (max_packed != nullptr && global_col < B) {
-      unsigned long long *slot_max = max_packed + global_col;
-      if (r0_global < vocab_limit) atomic_update_argmax(slot_max, val0, r0_global);
-      if (r1_global < vocab_limit) atomic_update_argmax(slot_max, val1, r1_global);
-      if (r2_global < vocab_limit) atomic_update_argmax(slot_max, val2, r2_global);
-      if (r3_global < vocab_limit) atomic_update_argmax(slot_max, val3, r3_global);
+      if (ty == 0) {
+        float best_val_tile = s_lane_best_val[lane];
+        int best_idx_tile = s_lane_best_idx[lane];
+        #pragma unroll
+        for (int other_ty = 1; other_ty < 4; ++other_ty) {
+          const int peer_lane = other_ty * 16 + tx;
+          const float peer_val = s_lane_best_val[peer_lane];
+          const int peer_idx = s_lane_best_idx[peer_lane];
+          if (peer_idx < 0) continue;
+          if (best_idx_tile < 0 || peer_val > best_val_tile ||
+              (peer_val == best_val_tile && peer_idx < best_idx_tile)) {
+            best_val_tile = peer_val;
+            best_idx_tile = peer_idx;
+          }
+        }
+        if (best_idx_tile >= 0) {
+          unsigned long long *slot_max = max_packed + global_col;
+          atomic_update_argmax(slot_max, best_val_tile, best_idx_tile);
+        }
+      }
     }
 
     if (dst != nullptr && sid >= 0) {
