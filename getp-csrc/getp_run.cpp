@@ -175,7 +175,6 @@ typedef struct {
   float *sorted_w;           // [M_pad]  trọng số top-k; 0.0f cho pad
   int   *padded_offsets;     // [n_experts + 1] prefix-sum sau khi align block
   int   *block_expert_ids;   // [M_pad / BLOCK_B] expert id cho mỗi block  (BLOCK_B=16)
-  int   *d_col_ids;          // [M_pad]  iota: 0..M_pad-1 dùng để scatter output theo cột
   
   // BF16 KV caches split by attention type
   hip_bfloat16 *key_cache_sliding;
@@ -278,24 +277,32 @@ __global__ void gather_pack_x_fp32_to_fp32_kernel(const float *x, float *xpack,
 }
 
 
-// Pack X with runtime B from device pointer: gather FP32 inputs and store to BF16 [K x Bpad]
+// Pack X with runtime B from device pointer: gather FP32 inputs and store to BF16 in block-major layout
+// Layout: for each block of `block_size` columns, we store K consecutive rows before moving to the next block.
+//         This matches the GEMM tile consumption so global loads become contiguous.
 // Blive = *total_post_pad_ptr; for b >= Blive, write zeros. slot_ids is either d_slot_ids or sorted_sids.
 __global__ void gather_pack_x_fp32_to_bf16_kernel_Bptr(const float *x, hip_bfloat16 *xpack,
-                                                       int K, int Bpad,
+                                                       int K, int Bpad, int block_size,
                                                        int in_stride, const int *slot_ids,
                                                        const int *total_post_pad_ptr) {
   size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   size_t total = (size_t)K * (size_t)Bpad;
   if (idx >= total) return;
+  if (block_size <= 0) block_size = 16;
   int k = (int)(idx / Bpad);
   int b = (int)(idx % Bpad);
   const int Blive = *total_post_pad_ptr;
+  const int block_idx = b / block_size;
+  const int lane = b - block_idx * block_size;
+  const size_t block_stride = (size_t)block_size * (size_t)K;
+  hip_bfloat16 *block_base = xpack + block_stride * (size_t)block_idx;
+  hip_bfloat16 *dst = block_base + (size_t)k * (size_t)block_size + (size_t)lane;
   if (b < Blive) {
     int sid = slot_ids[b];
     float v = x[(size_t)sid * (size_t)in_stride + (size_t)k];
-    xpack[(size_t)k * (size_t)Bpad + (size_t)b] = float_to_bfloat16(v);
+    *dst = float_to_bfloat16(v);
   } else {
-    xpack[(size_t)k * (size_t)Bpad + (size_t)b] = hip_bfloat16(0.0f);
+    *dst = hip_bfloat16(0.0f);
   }
 }
 
@@ -1766,21 +1773,19 @@ __global__ void iota_kernel(int* a, int n) {
 // Fused GEMM (W_mlp1 * Xpack) + bias + SwiGLU + scatter to gate_up_all.
 // - W_packed: BF16 packed 16x16 tiles (Mpad x Kpad), Mout = 2*I
 // - Xpack:    FP32 [K x Bpad], ta xử lý Be cột liên tiếp (đã align BLOCK_B)
-// - gate_up_out: BF16 [B_global x I] (ở đây ta scatter theo "column id" toàn cục)
-// - slot_ids: ánh xạ cột local (0..Be-1) -> column id toàn cục (d_col_ids + c0)
+// - gate_up_out: BF16 [B_global x I] scatter writes directly by global column index
 // Mỗi block: 64 threads (16x4) tính 1 tile 16x16 (M x N).
 // Grouped variant: handle all experts in a single launch by selecting the expert per 16-column block.
 // Uses block_expert_ids[blockIdx.y] to pick the expert and computes fused (GEMM + bias + SwiGLU) then scatters.
 __global__ __launch_bounds__(64)
 void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
     const hip_bfloat16* __restrict__ W_packed_all,   // [n_layers*n_experts][Mpad*Kpad]
-    const hip_bfloat16* __restrict__ Xpack,          // [K x Bpad_total] BF16, columns are globally sorted/padded
+    const hip_bfloat16* __restrict__ Xpack,          // BF16 block-major layout (per BLOCK_B columns)
     hip_bfloat16*       __restrict__ gate_up_out,    // [I x Bpad_total] BF16 row-major (row stride = Bpad_total)
     const hip_bfloat16* __restrict__ bias_all,       // [n_layers*n_experts][Mout]
     // Logical sizes
     int Mout, int K, int Btotal, int Bpad_total,
     int out_stride_cols,                              // leading dimension across columns (Bpad_total)
-    const int* __restrict__ d_col_ids,               // [Btotal] global column ids (iota)
     // Mapping from 16-col block -> expert id
     const int* __restrict__ block_expert_ids,        // [Bpad_total/BLOCK_B]
     int block_size,                                  // BLOCK_B (must be multiple of 16)
@@ -1804,10 +1809,16 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
   if (col0 >= Bpad_live) return;     // skip fully padded tiles
 
   // Determine expert for this 16-col tile via BLOCK_B mapping
+  if (block_size <= 0) block_size = 16;
   int blocks_per_b = block_size / 16; // tiles per BLOCK_B
   if (blocks_per_b < 1) blocks_per_b = 1;
   const int block_idx = tile_n / blocks_per_b;
+  const int inner_tile = tile_n - block_idx * blocks_per_b;
+  const int tile_col_in_block = inner_tile * 16;
   const int eid = block_expert_ids[block_idx];
+  const size_t block_stride_vals = (size_t)block_size * (size_t)K;
+  const hip_bfloat16* __restrict__ x_block = Xpack + block_stride_vals * (size_t)block_idx;
+  const hip_bfloat16* __restrict__ x_tile_base = x_block + (size_t)tile_col_in_block;
 
   // Resolve per-(layer,eid) bases
   const size_t per_mat_elems = (size_t)Mpad * (size_t)Kpad;
@@ -1851,7 +1862,7 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
       hip_bfloat16* dst = &sX[curr][0] + r*16 + c8;
       const bool in_k = (k_row < K);
       if (in_k) {
-        const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad_total + (size_t)col0 + (size_t)c8;
+        const hip_bfloat16* src = x_tile_base + (size_t)k_row * (size_t)block_size + (size_t)c8;
         // Copy 8 bf16 values (16B) per lane
         reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
       } else {
@@ -1878,7 +1889,7 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
         hip_bfloat16* dst = &sX[next][0] + r*16 + c8;
         const bool in_k = (k_row < K);
         if (in_k) {
-          const hip_bfloat16* src = Xpack + (size_t)k_row * (size_t)Bpad_total + (size_t)col0 + (size_t)c8;
+          const hip_bfloat16* src = x_tile_base + (size_t)k_row * (size_t)block_size + (size_t)c8;
           reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
         } else {
           reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
@@ -1910,8 +1921,6 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
   const float alpha = 1.702f;
   const int   I     = Mout >> 1;
 
-  const int col_id = d_col_ids[col];
-
   const int row_stride = out_stride_cols;
 
   #pragma unroll
@@ -1929,12 +1938,13 @@ void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
       }
       gate = fminf(swiglu_limit, gate);
       up   = fminf(swiglu_limit, fmaxf(-swiglu_limit, up));
-      gate *= (1.f / (1.f + __expf(-alpha * gate)));
+      const float inv_denom = __fdividef(1.f, 1.f + __expf(-alpha * gate));
+      gate *= inv_denom;
       const int row_half = r >> 1;
       if (row_half < I) {
         float fused = gate * (up + 1.f);
         hip_bfloat16* row_base = gate_up_out + (size_t)row_half * (size_t)row_stride;
-        row_base[col_id] = float_to_bfloat16(fused);
+        row_base[col] = float_to_bfloat16(fused);
       }
     }
   }
@@ -2589,16 +2599,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
             gpu_ctx->state.block_expert_ids);
       }
 
-      // 6'''') Chuẩn bị iota cột toàn cục: fill theo Mmax_pad (kích thước thật của d_col_ids)
-      {
-        const size_t Mmax      = (size_t)gpu_ctx->max_batch * (size_t)p->experts_per_token;
-        const size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_B - 1);
-        int threads = 256;
-        int blocks  = ((int)Mmax_pad + threads - 1) / threads;
-        iota_kernel<<<blocks, threads, 0, gpu_ctx->batch_stream>>>(
-            gpu_ctx->state.d_col_ids, (int)Mmax_pad);
-      }
-
     }
     {
         // 7') Pack X cho MLP1 theo thứ tự đã sort+pad
@@ -2616,6 +2616,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           gpu_ctx->state.xpack_bf16,   // đích:  [K x Bpad_total] BF16
           Kmlp1,
           Bpad_total,
+          BLOCK_B,
           p->hidden_dim,
           gpu_ctx->state.sorted_sids,  // cột b → sid = sorted_sids[b]
           gpu_ctx->state.padded_offsets + p->n_experts // runtime Btotal
@@ -2639,7 +2640,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
             /*bias_all*/gpu_ctx->weights.b_mlp1,
             /*sizes*/   Mout, p->hidden_dim, Bmlp1, Bpad_total,
             /*stride*/  Bpad_total,
-            /*col_ids*/ gpu_ctx->state.d_col_ids,
             /*blk→eid*/ gpu_ctx->state.block_expert_ids,
             /*BLOCK_B*/ BLOCK_B,
             /*nexp,l*/  p->n_experts, l,
@@ -3012,7 +3012,6 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->sorted_w,         Mmax_pad * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->padded_offsets,  ((size_t)p->n_experts + 1) * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->block_expert_ids, ((Mmax_pad + BLOCK_B - 1) / BLOCK_B) * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->d_col_ids,        Mmax_pad * sizeof(int)));
 
   size_t Mout = 2 * (size_t)p->intermediate_dim;
 }
@@ -3054,7 +3053,6 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->sorted_w));
   HIP_CHECK(hipFree(s->padded_offsets));
   HIP_CHECK(hipFree(s->block_expert_ids));
-  HIP_CHECK(hipFree(s->d_col_ids));
 }
 
 void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, Config *p) {
