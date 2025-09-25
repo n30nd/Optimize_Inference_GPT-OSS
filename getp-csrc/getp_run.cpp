@@ -257,26 +257,6 @@ __global__ void gather_pack_x_fp32_to_bf16_kernel(const float *x, hip_bfloat16 *
   }
 }
 
-
-// Pack X: gather FP32 inputs per-slot and pack to [K x Bpad] (FP32)
-__global__ void gather_pack_x_fp32_to_fp32_kernel(const float *x, float *xpack,
-                                                  int K, int B, int Bpad,
-                                                  int in_stride, const int *slot_ids) {
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t total = (size_t)K * (size_t)Bpad;
-  if (idx >= total) return;
-  int k = (int)(idx / Bpad);
-  int b = (int)(idx % Bpad);
-  if (b < B) {
-    int sid = slot_ids[b];
-    float v = x[(size_t)sid * (size_t)in_stride + (size_t)k];
-    xpack[(size_t)k * (size_t)Bpad + (size_t)b] = v;
-  } else {
-    xpack[(size_t)k * (size_t)Bpad + (size_t)b] = 0.0f;
-  }
-}
-
-
 // Pack X with runtime B from device pointer: gather FP32 inputs and store to BF16 in block-major layout
 // Layout: for each block of `block_size` columns, we store K consecutive rows before moving to the next block.
 //         This matches the GEMM tile consumption so global loads become contiguous.
@@ -1012,67 +992,6 @@ __global__ void zero_selected_slots_kernel_float(float *buf, int stride, const i
   }
 }
 
-// Fused TopK + Softmax for each slot in batch, serial per-slot (thread 0)
-__global__ void topk_softmax_batched_kernel_float(const float *router_scores,
-                                                  int n, int k,
-                                                  float *topv, int *topi,
-                                                  int score_stride, int topk_stride,
-                                                  const int *slot_ids, int batch) {
-  int b = blockIdx.x;
-  if (b >= batch) return;
-  if (threadIdx.x != 0) return;
-  int sid = slot_ids[b];
-  const float *scores = router_scores + (size_t)sid * (size_t)score_stride;
-  float *topv_s = topv + (size_t)sid * (size_t)topk_stride;
-  int   *topi_s = topi + (size_t)sid * (size_t)topk_stride;
-  // init
-  for (int i = 0; i < k; ++i) { topv_s[i] = -INFINITY; topi_s[i] = -1; }
-  // top-k selection
-  for (int j = 0; j < n; ++j) {
-    float v = scores[j];
-    int pos = -1;
-    for (int t = 0; t < k; ++t) { if (v > topv_s[t]) { pos = t; break; } }
-    if (pos >= 0) {
-      for (int t = k - 1; t > pos; --t) { topv_s[t] = topv_s[t - 1]; topi_s[t] = topi_s[t - 1]; }
-      topv_s[pos] = v; topi_s[pos] = j;
-    }
-  }
-  // softmax over top-k
-  float maxv = topv_s[0];
-  for (int i = 1; i < k; ++i) if (topv_s[i] > maxv) maxv = topv_s[i];
-  float sum = 0.0f;
-  for (int i = 0; i < k; ++i) { topv_s[i] = expf(topv_s[i] - maxv); sum += topv_s[i]; }
-  float inv = 1.0f / sum;
-  for (int i = 0; i < k; ++i) topv_s[i] *= inv;
-}
-
-// Gather per-slot top-k into flattened [batch*k] lists
-__global__ void gather_topk_pairs_kernel(const float *topv, const int *topi,
-                                         const int *slot_ids, int batch, int k,
-                                         float *sel_w, int *sel_eids, int *sel_sids) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int M = batch * k;
-  if (idx < M) {
-    int b = idx / k;
-    int t = idx % k;
-    int sid = slot_ids[b];
-    sel_w[idx]    = topv[(size_t)sid * (size_t)k + t];
-    sel_eids[idx] = topi[(size_t)sid * (size_t)k + t];
-    sel_sids[idx] = sid;
-  }
-}
-
-// Build histogram of expert IDs for M selections
-__global__ void histogram_eid_counts_kernel(const int *sel_eids, int M, int *eid_counts, int n_experts) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < M) {
-    int e = sel_eids[idx];
-    if (e >= 0 && e < n_experts) {
-      atomicAdd(&eid_counts[e], 1);
-    }
-  }
-}
-
 // Fused kernel: per-slot TopK + softmax + direct gather to sel_* + histogram (eid_counts)
 // One block handles one slot (only thread 0 used for simplicity; k is small)
 __global__ void router_fused_topk_gather_hist_kernel(
@@ -1162,91 +1081,6 @@ __device__ __forceinline__ float4 bfloat16_to_float4(const hip_bfloat16 *bf16_pt
   result.z = bfloat16_to_float(p1.vals[0]);
   result.w = bfloat16_to_float(p1.vals[1]);
   return result;
-}
-
-
-// Batched FlashAttention-like kernel (simplified for reliability)
-__global__ void flash_attention_kernel_optimized_batched(
-    const float *all_q,           // [B, n_heads*head_dim]
-    const float *key_cache,       // [B, layers*seq_len*kv_dim]
-    const float *value_cache,     // [B, layers*seq_len*kv_dim]
-    const hip_bfloat16 *attn_sinks, // [layers * n_heads]
-    float *all_output,            // [B, n_heads*head_dim]
-    const float *mask,            // Sliding window mask (optional)
-    int head_dim, int loff, int kv_dim, int kv_mul,
-    int n_heads, int seq_len, int layer,
-    const int *pos_list,          // [B]
-    bool can_add_sink,
-    int batch,
-    int q_stride,
-    int kv_block_size,
-    const int *slot_ids,
-    int tile_size) {
-
-  int h = blockIdx.y;   // head index
-  int b = blockIdx.z;   // batch index
-  if (h >= n_heads || b >= batch) return;
-
-  int pos = pos_list[b];
-  int sid = slot_ids[b];
-  const float *q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
-  float *output = all_output + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
-
-  const float *key_cache_base   = key_cache   + (size_t)sid * (size_t)kv_block_size;
-  const float *value_cache_base = value_cache + (size_t)sid * (size_t)kv_block_size;
-
-  // Simple shared memory for attention scores
-  extern __shared__ float shared_att_batch[];
-  
-  // Phase 1: Compute attention scores
-  for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
-    const float *k = key_cache_base + (size_t)loff + (size_t)t * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
-    float score = 0.0f;
-    for (int i = 0; i < head_dim; i++) {
-      score += q_head[i] * k[i];
-    }
-    score /= sqrtf((float)head_dim);
-    if (mask != NULL) {
-      score += mask[(size_t)pos * (size_t)seq_len + (size_t)t];
-    }
-    shared_att_batch[t] = score;
-  }
-  __syncthreads();
-
-  // Phase 2: Add attention sink
-  if (threadIdx.x == 0 && can_add_sink && (pos + 1) < seq_len) {
-    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
-    shared_att_batch[pos + 1] = bfloat16_to_float(attn_sinks[sink_idx]);
-  }
-  __syncthreads();
-
-  // Phase 3: Softmax
-  if (threadIdx.x == 0) {
-    int len = can_add_sink ? (pos + 2) : (pos + 1);
-    if (len > 0) {
-      float max_val = shared_att_batch[0];
-      for (int i = 1; i < len; i++) max_val = fmaxf(max_val, shared_att_batch[i]);
-      float sum_val = 0.0f;
-      for (int i = 0; i < len; i++) { 
-        float v = expf(shared_att_batch[i] - max_val); 
-        shared_att_batch[i] = v; 
-        sum_val += v; 
-      }
-      float inv = 1.0f / (sum_val + 1e-8f); // Add epsilon for stability
-      for (int i = 0; i < len; i++) shared_att_batch[i] *= inv;
-    }
-  }
-  __syncthreads();
-
-  // Phase 4: Weighted sum with values
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-    float sum = 0.0f;
-    for (int t = 0; t <= pos; t++) {
-      const float *v = value_cache_base + (size_t)loff + (size_t)t * (size_t)kv_dim + (size_t)(h / kv_mul) * (size_t)head_dim;
-      sum += shared_att_batch[t] * v[i];
-    }
-    output[i] = sum;
-  }
 }
 
 // New paged attention kernel for split KV caches (sliding vs full)
