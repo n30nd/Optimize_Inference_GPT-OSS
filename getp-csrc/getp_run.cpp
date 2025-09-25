@@ -359,7 +359,6 @@ typedef struct {
 
 struct ParallelLayout {
   int tp_size = 1;
-  int ep_size = 1;
   int dp_size = 1;
 };
 
@@ -384,11 +383,8 @@ typedef struct {
   int tp_size;
   int dp_rank;
   int dp_size;
-  int ep_rank;
-  int ep_size;
   int head_offset_q;
   int head_offset_kv;
-  int expert_offset;
   int local_q_heads;
   int local_kv_heads;
   int local_experts;
@@ -3659,9 +3655,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       sel_w_local.reserve(M);
       for (int m = 0; m < M; ++m) {
         int eid = host_sel_eids[m];
-        if (eid >= ctx->expert_offset && eid < ctx->expert_offset + ctx->local_experts) {
+        if (eid >= 0 && eid < ctx->local_experts) {
           sel_sids_local.push_back(host_sel_sids[m]);
-          sel_eids_local.push_back(eid - ctx->expert_offset);
+          sel_eids_local.push_back(eid);
           sel_w_local.push_back(host_sel_w[m]);
         }
       }
@@ -4063,15 +4059,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   if (desired_tp < 1) desired_tp = 1;
   if (desired_tp > device_count) desired_tp = device_count;
 
-  int desired_ep = 1;
-  const char *env_ep = getenv("GETP_EP_SIZE");
-  if (env_ep && atoi(env_ep) > 0) desired_ep = atoi(env_ep);
-  if (desired_ep != 1) {
-    fprintf(stderr, "[GPU] MoE now uses tensor parallel sharding only; set GETP_EP_SIZE=1 (got %d).\n",
-            desired_ep);
-    exit(EXIT_FAILURE);
-  }
-
   int desired_dp = std::max(1, device_count / 2);
   const char *env_dp = getenv("GETP_DP_SIZE");
   if (env_dp && atoi(env_dp) > 0) desired_dp = atoi(env_dp);
@@ -4082,7 +4069,6 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   }
 
   parallel_layout.tp_size = desired_tp;
-  parallel_layout.ep_size = desired_ep;
   parallel_layout.dp_size = desired_dp;
   int used_devices = parallel_layout.tp_size * parallel_layout.dp_size;
 
@@ -4118,11 +4104,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     ctx.tp_size = parallel_layout.tp_size;
     ctx.dp_rank = dp_rank;
     ctx.dp_size = parallel_layout.dp_size;
-    ctx.ep_rank = 0;
-    ctx.ep_size = parallel_layout.ep_size;
     ctx.head_offset_q = tp_rank * local_q_heads;
     ctx.head_offset_kv = tp_rank * local_kv_heads;
-    ctx.expert_offset = 0;
     ctx.local_q_heads = local_q_heads;
     ctx.local_kv_heads = local_kv_heads;
     ctx.local_experts = local_experts;
@@ -4225,8 +4208,8 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
     }
   }
 
-  printf("[GPU] Warm-up done on %d device(s). Layout TP=%d, DP=%d, EP=%d.\n",
-         used_devices, parallel_layout.tp_size, parallel_layout.dp_size, parallel_layout.ep_size);
+  printf("[GPU] Warm-up done on %d device(s). Layout TP=%d, DP=%d.\n",
+         used_devices, parallel_layout.tp_size, parallel_layout.dp_size);
   printf("[Attention] Using FlashAttention-like optimized kernel (always on)\n");
   
   // Log memory usage for each GPU device after warm-up
