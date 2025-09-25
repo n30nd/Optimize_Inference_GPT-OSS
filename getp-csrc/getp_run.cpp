@@ -631,7 +631,7 @@ __global__ void convert_fp32_to_bf16_kernel(const float *fp32_data, hip_bfloat16
 
 // MFMA MLP1 directly from MXFP4-packed weights (no BF16 storage).
 // Dequantizes per element on-the-fly using e8m0 scales and 4-bit levels.
-__global__ __launch_bounds__(64)
+__global__ __launch_bounds__(64, 4)
 void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     float* __restrict__ mlp1_out_all,        // [M selections][out_dim]
     const hip_bfloat16* __restrict__ t_bf16, // [B slots][hidden_dim] BF16
@@ -4017,15 +4017,15 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     wait_batch_event_host(tp_leader);
   }
 
-  // Keep follower activations aligned (optional)
-  if (ctxs.size() > 1) {
-    size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
-    for (size_t idx = 1; idx < ctxs.size(); ++idx) {
-      GPUContext *peer = ctxs[idx];
-      HIP_CHECK(hipMemcpyPeer(peer->state.x, peer->device_id,
-                              leader->state.x, leader->device_id, bytes));
-    }
-  }
+  // // Keep follower activations aligned (optional)
+  // if (ctxs.size() > 1) {
+  //   size_t bytes = (size_t)leader->max_batch * (size_t)hidden_dim * sizeof(float);
+  //   for (size_t idx = 1; idx < ctxs.size(); ++idx) {
+  //     GPUContext *peer = ctxs[idx];
+  //     HIP_CHECK(hipMemcpyPeer(peer->state.x, peer->device_id,
+  //                             leader->state.x, leader->device_id, bytes));
+  //   }
+  // }
 
 }
 
