@@ -13,7 +13,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
 #include <limits>
-#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,10 +22,6 @@
 #include <vector>
 #include <thread>
 #include <atomic>
-#include <mutex>
-#include <condition_variable>
-#include <deque>
-#include <stdexcept>
 #ifndef GETP_RUN
 #define GETP_RUN
 
@@ -146,16 +141,10 @@ typedef struct {
   float *tb;
   float *tb2;
   float *router_score;
-  float *topk_v;
-  int *topk_i;
   float *e_agg;
   float *qkv;
-  // Removed legacy 'logits' buffer; we use logits_fp32 only
-  float *mask;
   float *cos_vals;
   float *sin_vals;
-  // FP32 buffers for accumulation and precision-sensitive ops
-  float *acc_buffer;         // x in FP32 for output matvec
   float *logits_fp32;        // final logits
   // Packed input buffer for MLP1 (BF16), size: K_max x Bpad_mlp1
   hip_bfloat16 *xpack_bf16;
@@ -164,7 +153,6 @@ typedef struct {
   int   *sel_sids;        // [max_batch * experts_per_token]
   int   *sel_eids;        // [max_batch * experts_per_token]
   float *sel_w;           // [max_batch * experts_per_token]
-  float *mlp1_out_all;    // [max_batch * experts_per_token][2 * intermediate_dim]
   hip_bfloat16 *gate_up_all; // BF16 MoE activations packed row-major as [intermediate_dim][Bpad_total]
   int   *eid_counts;         // [n_experts]
   int   *eid_cursors;        // [n_experts] for scatter
@@ -1050,20 +1038,6 @@ __global__ void router_fused_topk_gather_hist_kernel(
     }
   }
 }
-
-// Exclusive prefix sum for small arrays (single-thread)
-__global__ void exclusive_prefix_sum_small_kernel(const int *counts, int *offsets, int n_experts) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    int sum = 0;
-    for (int i = 0; i < n_experts; ++i) {
-      offsets[i] = sum;
-      sum += counts[i];
-    }
-    offsets[n_experts] = sum;
-  }
-}
-
-
 // Optimized vectorized bfloat16 to float conversion
 __device__ __forceinline__ float4 bfloat16_to_float4(const hip_bfloat16 *bf16_ptr) {
   union BF16Pair {
@@ -2765,8 +2739,6 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->tb2, B * (size_t)p->hidden_dim * sizeof(float)));
 
   HIP_CHECK(hipMalloc(&s->router_score,      B * (size_t)p->n_experts * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->topk_v,            B * (size_t)p->experts_per_token * sizeof(float)));
-  HIP_CHECK(hipMalloc(&s->topk_i,            B * (size_t)p->experts_per_token * sizeof(int)));
 
   HIP_CHECK(hipMalloc(&s->e_agg,    B * (size_t)p->hidden_dim * sizeof(float)));
 
@@ -2801,14 +2773,9 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   double full_gb = (double)(2 * full_elems * sizeof(hip_bfloat16)) / GB;
   printf("KV cache allocated (BF16): sliding %.2f GB, full %.2f GB\n", sliding_gb, full_gb);
 
-  // Mask not needed for paged attention path; keep null to avoid large alloc
-  s->mask = NULL;
-
   HIP_CHECK(hipMalloc(&s->cos_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->sin_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
 
-  // Note: acc_buffer no longer needed since we use float state directly
-  s->acc_buffer = nullptr;
   HIP_CHECK(hipMalloc(&s->logits_fp32, B * (size_t)p->vocab_size * sizeof(float)));
 
   // Grouped MoE staging buffers
@@ -2833,11 +2800,6 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   });
   
   HIP_CHECK(hipMalloc(&s->xpack_bf16, Kmax_xpack * (size_t)Bpad_mlp1 * sizeof(hip_bfloat16)));
-  // HIP_CHECK(hipMalloc(&s->mlp1_out_all, Mmax * 2 * (size_t)p->intermediate_dim * sizeof(float)));
-  // HIP_CHECK(hipMalloc(&s->gate_up_all,  Mmax * (size_t)p->intermediate_dim * sizeof(hip_bfloat16)));
-
-  // mlp1_out_all is unused in fused path; skip allocation to save memory
-  s->mlp1_out_all = nullptr;
   HIP_CHECK(hipMalloc(&s->gate_up_all,  (size_t)Bpad_mlp1 * (size_t)p->intermediate_dim * sizeof(hip_bfloat16)));
 
   // --- New: block-aligned staging buffers ---
@@ -2848,7 +2810,6 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->padded_offsets,  ((size_t)p->n_experts + 1) * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->block_expert_ids, ((Mmax_pad + BLOCK_B - 1) / BLOCK_B) * sizeof(int)));
 
-  size_t Mout = 2 * (size_t)p->intermediate_dim;
 }
 
 
@@ -2858,8 +2819,6 @@ void gpu_free_run_state(GPURunState *s) {
   HIP_CHECK(hipFree(s->tb));
   HIP_CHECK(hipFree(s->tb2));
   HIP_CHECK(hipFree(s->router_score));
-  HIP_CHECK(hipFree(s->topk_v));
-  HIP_CHECK(hipFree(s->topk_i));
   HIP_CHECK(hipFree(s->e_agg));
   HIP_CHECK(hipFree(s->qkv));
 
@@ -2868,16 +2827,12 @@ void gpu_free_run_state(GPURunState *s) {
   if (s->key_cache_full) HIP_CHECK(hipFree(s->key_cache_full));
   if (s->value_cache_full) HIP_CHECK(hipFree(s->value_cache_full));
 
-  // No legacy logits or mask buffers to free
-  if (s->mask) HIP_CHECK(hipFree(s->mask));
   HIP_CHECK(hipFree(s->cos_vals));
   HIP_CHECK(hipFree(s->sin_vals));
-  if (s->acc_buffer) HIP_CHECK(hipFree(s->acc_buffer));  // acc_buffer may be nullptr
   HIP_CHECK(hipFree(s->logits_fp32));
   HIP_CHECK(hipFree(s->sel_sids));
   HIP_CHECK(hipFree(s->sel_eids));
   HIP_CHECK(hipFree(s->sel_w));
-  if (s->mlp1_out_all) HIP_CHECK(hipFree(s->mlp1_out_all));
   HIP_CHECK(hipFree(s->gate_up_all));
   HIP_CHECK(hipFree(s->eid_counts));
   HIP_CHECK(hipFree(s->eid_cursors));
