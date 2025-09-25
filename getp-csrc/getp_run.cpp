@@ -280,17 +280,16 @@ __global__ void gather_pack_x_fp32_to_fp32_kernel(const float *x, float *xpack,
 // Pack X with runtime B from device pointer: gather FP32 inputs and store to BF16 in block-major layout
 // Layout: for each block of `block_size` columns, we store K consecutive rows before moving to the next block.
 //         This matches the GEMM tile consumption so global loads become contiguous.
+// Launch expects a 2-D grid (cols × rows) so every thread handles one (k, b) pair without integer divides.
 // Blive = *total_post_pad_ptr; for b >= Blive, write zeros. slot_ids is either d_slot_ids or sorted_sids.
 __global__ void gather_pack_x_fp32_to_bf16_kernel_Bptr(const float *x, hip_bfloat16 *xpack,
                                                        int K, int Bpad, int block_size,
                                                        int in_stride, const int *slot_ids,
                                                        const int *total_post_pad_ptr) {
-  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  size_t total = (size_t)K * (size_t)Bpad;
-  if (idx >= total) return;
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  const int k = blockIdx.y * blockDim.y + threadIdx.y;
+  if (b >= Bpad || k >= K) return;
   if (block_size <= 0) block_size = 16;
-  int k = (int)(idx / Bpad);
-  int b = (int)(idx % Bpad);
   const int Blive = *total_post_pad_ptr;
   const int block_idx = b / block_size;
   const int lane = b - block_idx * block_size;
@@ -298,8 +297,8 @@ __global__ void gather_pack_x_fp32_to_bf16_kernel_Bptr(const float *x, hip_bfloa
   hip_bfloat16 *block_base = xpack + block_stride * (size_t)block_idx;
   hip_bfloat16 *dst = block_base + (size_t)k * (size_t)block_size + (size_t)lane;
   if (b < Blive) {
-    int sid = slot_ids[b];
-    float v = x[(size_t)sid * (size_t)in_stride + (size_t)k];
+    const int sid = slot_ids[b];
+    const float v = x[(size_t)sid * (size_t)in_stride + (size_t)k];
     *dst = float_to_bfloat16(v);
   } else {
     *dst = hip_bfloat16(0.0f);
@@ -2609,8 +2608,10 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     int Bpad_total = round_up16((int)Mmax_pad); // Bpad dùng khi pack (toàn cục)
     int Bmlp1 = (int)Mmax_pad;                  // số cột thực dùng cho guard và gather; phần đuôi pad điền 0
     {
-      size_t total = (size_t)Kmlp1 * (size_t)Bpad_total;
-      dim3 block(256), grid((unsigned int)((total + block.x - 1) / block.x));
+      const dim3 block(128, 2, 1);
+      const dim3 grid((unsigned int)((Bpad_total + block.x - 1) / block.x),
+                      (unsigned int)((Kmlp1 + block.y - 1) / block.y),
+                      1);
       gather_pack_x_fp32_to_bf16_kernel_Bptr<<<grid, block, 0, gpu_ctx->batch_stream>>>(
           gpu_ctx->state.t,            // nguồn: x đã RMSNorm-FFN per-slot
           gpu_ctx->state.xpack_bf16,   // đích:  [K x Bpad_total] BF16
