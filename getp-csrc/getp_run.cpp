@@ -1770,7 +1770,7 @@ __device__ __forceinline__ void atomic_update_argmax(unsigned long long *addr,
   }
 }
 
-constexpr int kLogitsGroupsPerBlock = 2;
+constexpr int kLogitsGroupsPerBlock = 4;
 
 __global__ __launch_bounds__(64)
 void logits_kernel(
@@ -1800,8 +1800,6 @@ void logits_kernel(
   __shared__ __align__(16) uint16_t sX[2][kLogitsGroupsPerBlock][16 * 16];
   __shared__ int s_slot[kLogitsGroupsPerBlock * 16];
   __shared__ float s_bias_rows[16];
-  __shared__ float s_lane_best_val[64];
-  __shared__ int s_lane_best_idx[64];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   using short4v = __attribute__((ext_vector_type(4))) short;
@@ -2026,66 +2024,86 @@ void logits_kernel(
 
   for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
     const bool active = active_group[g] && cols_this_arr[g] > 0;
-    float out_vals[4] = {0.f, 0.f, 0.f, 0.f};
     float lane_best_val = -FLT_MAX;
     int lane_best_idx = -1;
+    float4v out_vals = {0.f, 0.f, 0.f, 0.f};
 
     if (active) {
-      #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        out_vals[i] = accum[g][i] + s_bias_rows[bias_base + i];
-      }
+      float4v bias_vec;
+      bias_vec[0] = s_bias_rows[bias_base + 0];
+      bias_vec[1] = s_bias_rows[bias_base + 1];
+      bias_vec[2] = s_bias_rows[bias_base + 2];
+      bias_vec[3] = s_bias_rows[bias_base + 3];
+      out_vals = accum[g] + bias_vec;
 
       if (r0_global >= 0 && r0_global < vocab_limit) {
         lane_best_val = out_vals[0];
         lane_best_idx = r0_global;
       }
       if (r1_global >= 0 && r1_global < vocab_limit) {
-        if (lane_best_idx < 0 || out_vals[1] > lane_best_val ||
-            (out_vals[1] == lane_best_val && r1_global < lane_best_idx)) {
-          lane_best_val = out_vals[1];
-          lane_best_idx = r1_global;
+        const float cand_val = out_vals[1];
+        const int cand_idx = r1_global;
+        if (lane_best_idx < 0 || cand_val > lane_best_val ||
+            (cand_val == lane_best_val && cand_idx < lane_best_idx)) {
+          lane_best_val = cand_val;
+          lane_best_idx = cand_idx;
         }
       }
       if (r2_global >= 0 && r2_global < vocab_limit) {
-        if (lane_best_idx < 0 || out_vals[2] > lane_best_val ||
-            (out_vals[2] == lane_best_val && r2_global < lane_best_idx)) {
-          lane_best_val = out_vals[2];
-          lane_best_idx = r2_global;
+        const float cand_val = out_vals[2];
+        const int cand_idx = r2_global;
+        if (lane_best_idx < 0 || cand_val > lane_best_val ||
+            (cand_val == lane_best_val && cand_idx < lane_best_idx)) {
+          lane_best_val = cand_val;
+          lane_best_idx = cand_idx;
         }
       }
       if (r3_global >= 0 && r3_global < vocab_limit) {
-        if (lane_best_idx < 0 || out_vals[3] > lane_best_val ||
-            (out_vals[3] == lane_best_val && r3_global < lane_best_idx)) {
-          lane_best_val = out_vals[3];
-          lane_best_idx = r3_global;
+        const float cand_val = out_vals[3];
+        const int cand_idx = r3_global;
+        if (lane_best_idx < 0 || cand_val > lane_best_val ||
+            (cand_val == lane_best_val && cand_idx < lane_best_idx)) {
+          lane_best_val = cand_val;
+          lane_best_idx = cand_idx;
         }
       }
     }
-
-    s_lane_best_val[lane] = lane_best_val;
-    s_lane_best_idx[lane] = lane_best_idx;
-    __syncthreads();
 
     if (active && tx < cols_this_arr[g]) {
       const int sid = s_slot[g * 16 + tx];
       const int global_col = b_base_arr[g] + tx;
 
       if (max_packed != nullptr && global_col < B) {
+        float best_val_tile = lane_best_val;
+        int best_idx_tile = lane_best_idx;
+
+        const float peer_val16 = __shfl_down(best_val_tile, 16, 64);
+        const int peer_idx16 = __shfl_down(best_idx_tile, 16, 64);
         if (ty == 0) {
-          float best_val_tile = s_lane_best_val[lane];
-          int best_idx_tile = s_lane_best_idx[lane];
-          #pragma unroll
-          for (int other_ty = 1; other_ty < 4; ++other_ty) {
-            const int peer_lane = other_ty * 16 + tx;
-            const float peer_val = s_lane_best_val[peer_lane];
-            const int peer_idx = s_lane_best_idx[peer_lane];
-            if (peer_idx < 0) continue;
-            if (best_idx_tile < 0 || peer_val > best_val_tile ||
-                (peer_val == best_val_tile && peer_idx < best_idx_tile)) {
-              best_val_tile = peer_val;
-              best_idx_tile = peer_idx;
-            }
+          if (peer_idx16 >= 0 && (best_idx_tile < 0 || peer_val16 > best_val_tile ||
+                                  (peer_val16 == best_val_tile && peer_idx16 < best_idx_tile))) {
+            best_val_tile = peer_val16;
+            best_idx_tile = peer_idx16;
+          }
+        }
+
+        const float peer_val32 = __shfl_down(lane_best_val, 32, 64);
+        const int peer_idx32 = __shfl_down(lane_best_idx, 32, 64);
+        if (ty == 0) {
+          if (peer_idx32 >= 0 && (best_idx_tile < 0 || peer_val32 > best_val_tile ||
+                                  (peer_val32 == best_val_tile && peer_idx32 < best_idx_tile))) {
+            best_val_tile = peer_val32;
+            best_idx_tile = peer_idx32;
+          }
+        }
+
+        const float peer_val48 = __shfl_down(lane_best_val, 48, 64);
+        const int peer_idx48 = __shfl_down(lane_best_idx, 48, 64);
+        if (ty == 0) {
+          if (peer_idx48 >= 0 && (best_idx_tile < 0 || peer_val48 > best_val_tile ||
+                                  (peer_val48 == best_val_tile && peer_idx48 < best_idx_tile))) {
+            best_val_tile = peer_val48;
+            best_idx_tile = peer_idx48;
           }
           if (best_idx_tile >= 0) {
             unsigned long long *slot_max = max_packed + global_col;
@@ -2106,7 +2124,6 @@ void logits_kernel(
           out[r3_local] = out_vals[3];
       }
     }
-    __syncthreads();
   }
 }
 
