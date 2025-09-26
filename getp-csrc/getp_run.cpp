@@ -2450,38 +2450,30 @@ __device__ inline float block_reduce_sum(float val, float *shared) {
   return result;
 }
 
-// ================= Flash Decoding (1 block = 1 head × 1 slot) =================
-
+// === flash_decoding v2: giữ y trong shared, chỉ flush 1 lần ===
 #ifndef FA_DEC_BK
-#define FA_DEC_BK 64      // BK=64 là điểm ngọt cho head_dim 64..128; thử 128 nếu head_dim lớn
+#define FA_DEC_BK 64
 #endif
 #ifndef FA_DEC_VEC
-#define FA_DEC_VEC 4      // mỗi thread xử lý 4 phần tử liên tiếp theo chiều head_dim
+#define FA_DEC_VEC 4
 #endif
 
-static inline size_t flash_decoding_smem_bytes(int head_dim, int BK = FA_DEC_BK) {
+static inline size_t flash_decoding_v2_smem_bytes(int head_dim, int BK = FA_DEC_BK) {
   size_t bytes = 0;
-  // q_sh: [head_dim] float (Q đã nhân 1/sqrt(d))
-  bytes += (size_t)head_dim * sizeof(float);
-  // p_sh: [BK] float (trọng số softmax của block hiện tại)
-  bytes += (size_t)BK * sizeof(float);
-  // vptr_sh: [BK] hip_bfloat16* (con trỏ V cho từng token trong block)
-  bytes += (size_t)BK * sizeof(hip_bfloat16*);
-  // đệm căn chỉnh nhỏ
+  bytes += (size_t)head_dim * sizeof(float);            // q_sh
+  bytes += (size_t)head_dim * sizeof(float);            // y_sh  <-- mới
+  bytes += (size_t)BK * sizeof(float);                  // p_sh
+  bytes += (size_t)BK * sizeof(hip_bfloat16*);          // vptr_sh
   bytes += 64;
   return bytes;
 }
 
-#if defined(__clang__)
-#pragma clang fp contract(fast)
-#endif
-
-__global__ __launch_bounds__(64)
+__global__ __launch_bounds__(64, 4)  // gợi ý min 4 waves/CU nếu đủ register
 void flash_decoding_kernel(
-    const float * __restrict__ all_q,        // [slots, n_heads*head_dim], FP32
-    KVCacheDeviceData * __restrict__ cache,  // truy cập K/V
-    const hip_bfloat16 * __restrict__ attn_sinks, // [n_layers*n_heads] (tùy chọn ổn định)
-    float * __restrict__ all_out,            // [slots, n_heads*head_dim], FP32
+    const float * __restrict__ all_q,        // [slots, n_heads*head_dim]
+    KVCacheDeviceData * __restrict__ cache,  // KV accessors
+    const hip_bfloat16 * __restrict__ attn_sinks, // [n_layers*n_heads]
+    float * __restrict__ all_out,            // [slots, n_heads*head_dim]
     int head_dim, int /*kv_dim_unused*/, int kv_mul,
     int n_heads, int seq_len, int layer,
     const int * __restrict__ pos_list,       // [batch]
@@ -2489,11 +2481,11 @@ void flash_decoding_kernel(
     int q_stride,                            // stride theo slot
     const int * __restrict__ slot_ids)       // [batch]
 {
-  const int h = blockIdx.y;                  // head index
-  const int b = blockIdx.z;                  // batch index
+  const int h = blockIdx.y;
+  const int b = blockIdx.z;
   if (h >= n_heads || b >= batch) return;
 
-  const int lane = threadIdx.x;              // 0..63 (wave64)
+  const int lane = threadIdx.x; // 0..63 (wave64)
   const int sid  = slot_ids[b];
   int       pos  = pos_list[b];
   if (sid < 0 || pos < 0) return;
@@ -2506,15 +2498,10 @@ void flash_decoding_kernel(
   float * __restrict__ out_head =
       all_out + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
 
-  // Lấy phạm vi attention theo sliding/full của layer này
+  // Phạm vi attention (full/sliding)
   int start_pos = 0, end_pos = 0;
   cache->get_attention_range(sid, layer, pos, &start_pos, &end_pos);
   const int att_len = end_pos - start_pos + 1;
-  if (att_len <= 0) {
-    // không KV → y=0
-    for (int i = lane; i < head_dim; i += blockDim.x) out_head[i] = 0.f;
-    return;
-  }
 
   // -------------------- dynamic shared mem --------------------
   extern __shared__ unsigned char smem_raw[];
@@ -2523,40 +2510,47 @@ void flash_decoding_kernel(
   float* q_sh = reinterpret_cast<float*>(p);
   p += (size_t)head_dim * sizeof(float);
 
+  float* y_sh = reinterpret_cast<float*>(p);            // <-- mới
+  p += (size_t)head_dim * sizeof(float);
+
   float* p_sh = reinterpret_cast<float*>(p);
   p += (size_t)FA_DEC_BK * sizeof(float);
 
-  // align pointer array
   uintptr_t align = alignof(hip_bfloat16*);
   p = reinterpret_cast<unsigned char*>((reinterpret_cast<uintptr_t>(p) + align - 1) & ~(align - 1));
   hip_bfloat16** vptr_sh = reinterpret_cast<hip_bfloat16**>(p);
   // ------------------------------------------------------------
 
-  // Tiền-scale Q với 1/sqrt(d) để tiết kiệm 1 phép nhân trong score
+  // Không KV → out = 0
+  if (att_len <= 0) {
+    for (int i = lane; i < head_dim; i += blockDim.x) out_head[i] = 0.f;
+    return;
+  }
+
+  // Tiền-scale Q với 1/sqrt(d)
   const float inv_sqrt_d = rsqrtf((float)head_dim);
   for (int i = lane; i < head_dim; i += blockDim.x) {
     q_sh[i] = q_head[i] * inv_sqrt_d;
   }
+  // Khởi tạo y_sh = 0 (thay vì out_head)
+  for (int i = lane; i < head_dim; i += blockDim.x) {
+    y_sh[i] = 0.f;
+  }
   __syncthreads();
 
-  // Trạng thái online-softmax:
-  float m = -INFINITY;   // running max
-  float l = 0.f;         // running sum(exp(s - m))
+  // Trạng thái online-softmax
+  float m = -INFINITY;
+  float l = 0.f;
 
-  // Khởi tạo output = 0
-  for (int i = lane; i < head_dim; i += blockDim.x) {
-    out_head[i] = 0.f;
-  }
+  // Tham số vector hoá theo chiều i
+  constexpr int VEC = FA_DEC_VEC;
+  const int STRIDE = blockDim.x * VEC; // 64*VEC
 
-  // Số phần tử theo chiều i mỗi thread xử lý khi cập nhật output
-  constexpr int VEC = FA_DEC_VEC;            // 4 phần tử/lanethread
-  const int STRIDE = blockDim.x * VEC;       // 64*4 = 256 phần tử/đợt
-
-  // ==== Quét KV theo block BK; tính softmax + cộng V coalesced ====
+  // ==== Quét KV theo block BK; y_sh = y_sh*scale_old + Σ p_j * V_j ====
   for (int base = 0; base < att_len; base += FA_DEC_BK) {
     const int valid = min(FA_DEC_BK, att_len - base);
 
-    // 1) Tính score cho mỗi token trong block (mỗi thread ≤ 1 token)
+    // 1) Tính score s_val và lưu v_ptr cho mỗi token trong block
     float s_val = -INFINITY;
     hip_bfloat16* v_ptr_this = nullptr;
 
@@ -2570,7 +2564,7 @@ void flash_decoding_kernel(
         if (v_row) v_row += head_base;
         v_ptr_this = v_row;
 
-        // Dot(Q, K_t) — vector hóa theo 8 (2×bf16x4)
+        // Dot(Q, K_t) — vector hoá theo 8 (2×bf16x4)
         float dot = 0.f;
         int k = 0;
         for (; k + 7 < head_dim; k += 8) {
@@ -2597,7 +2591,7 @@ void flash_decoding_kernel(
     }
     blk_max = __shfl(blk_max, 0, 64);
 
-    // 3) Cập nhật online-softmax
+    // 3) Cập nhật m/l và ghi p_sh, vptr_sh
     const float m_new     = fmaxf(m, blk_max);
     const float scale_old = __expf(m - m_new);
 
@@ -2615,33 +2609,27 @@ void flash_decoding_kernel(
     }
     sum_p = __shfl(sum_p, 0, 64);
 
-    // 4) Cập nhật y với truy cập V coalesced:
-    //    duyệt i theo "đoạn" 256 phần tử (64 thread × 4 phần tử) để load/stores liên tục.
+    // 4) Cập nhật y_sh: y_sh = y_sh*scale_old + Σ_j p_j * V_j
     for (int i0 = lane * VEC; i0 < head_dim; i0 += STRIDE) {
-      // đọc y[i0..i0+VEC-1], nhân scale_old
       float4v acc = {0.f, 0.f, 0.f, 0.f};
-      // đọc hiện tại rồi scale_old
-      // (tránh spill: đọc từng phần tử)
       #pragma unroll
       for (int t = 0; t < VEC; ++t) {
         int idx = i0 + t;
-        float yi = (idx < head_dim) ? out_head[idx] : 0.f;
-        acc[t] = yi * scale_old;
+        if (idx < head_dim) {
+          acc[t] = y_sh[idx] * scale_old;   // đọc từ shared, không đụng global
+        }
       }
-
-      // cộng Σ_j p_j * V_j[i0..i0+VEC-1]
       #pragma unroll 4
       for (int j = 0; j < valid; ++j) {
         const float pw = p_sh[j];
         hip_bfloat16* vj = vptr_sh[j];
         if (pw > 0.f && vj) {
-          // vector load 4 phần tử liền nhau
           float4v v4;
           if (i0 + 3 < head_dim) {
             v4 = load_bf16x4_as_float4v(vj + i0);
           } else {
-            // biên
             v4 = {0.f, 0.f, 0.f, 0.f};
+            #pragma unroll
             for (int t = 0; t < VEC; ++t) {
               int idx = i0 + t;
               if (idx < head_dim) v4[t] = bfloat16_to_float(vj[idx]);
@@ -2653,12 +2641,10 @@ void flash_decoding_kernel(
           acc[3] = fmaf(pw, v4[3], acc[3]);
         }
       }
-
-      // ghi trả y
       #pragma unroll
       for (int t = 0; t < VEC; ++t) {
         int idx = i0 + t;
-        if (idx < head_dim) out_head[idx] = acc[t];
+        if (idx < head_dim) y_sh[idx] = acc[t];  // ghi về shared
       }
     }
 
@@ -2667,7 +2653,7 @@ void flash_decoding_kernel(
     __syncthreads();
   }
 
-  // Attention sink (tùy cấu hình): chỉ cộng vào mẫu số
+  // Attention sink: chỉ cộng mẫu số (không cộng giá trị), vẫn thao tác trên y_sh
   const int layer_cap = cache->layer_capacity(layer);
   const bool use_sink = ((pos + 1) < seq_len) && (att_len < layer_cap + 1);
   if (use_sink) {
@@ -2677,35 +2663,29 @@ void flash_decoding_kernel(
     const float m_new     = fmaxf(m, sink_val);
     const float scale_old = __expf(m - m_new);
 
-    // y *= scale_old
     for (int i0 = lane * VEC; i0 < head_dim; i0 += STRIDE) {
       #pragma unroll
       for (int t = 0; t < VEC; ++t) {
         int idx = i0 + t;
-        if (idx < head_dim) {
-          out_head[idx] *= scale_old;
-        }
+        if (idx < head_dim) y_sh[idx] *= scale_old;
       }
     }
-
     l = fmaf(l, scale_old, __expf(sink_val - m_new));
     m = m_new;
     __syncthreads();
   }
 
-  // Chuẩn hóa cuối: y /= (l + eps)
+  // Chuẩn hoá cuối & flush 1 lần ra global
   const float inv_l = 1.f / (l + 1e-8f);
   for (int i0 = lane * VEC; i0 < head_dim; i0 += STRIDE) {
     #pragma unroll
     for (int t = 0; t < VEC; ++t) {
       int idx = i0 + t;
-      if (idx < head_dim) out_head[idx] *= inv_l;
+      if (idx < head_dim) out_head[idx] = y_sh[idx] * inv_l;
     }
   }
 }
-#if defined(__clang__)
-#pragma clang fp contract(off)
-#endif
+
 
 
 // ========= FlashAttention v2 (drop-in, tối ưu vi mô) =========
@@ -4044,7 +4024,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
             ctx->local_qkv_dim,
             ctx->d_slot_ids);
       } else {
-        size_t smem = flash_decoding_smem_bytes(head_dim, FA_DEC_BK);
+        size_t smem = flash_decoding_v2_smem_bytes(head_dim, FA_DEC_BK);
         flash_decoding_kernel<<<grid, block, smem, ctx->batch_stream>>>(
             ctx->state.qkv,
             ctx->state.kv_cache_manager->get_device_data(),
