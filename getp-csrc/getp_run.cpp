@@ -33,16 +33,32 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-// Global BLOCK_B: configurable via environment variable GETP_MOE_BLOCK.
-// Falls back to 16 if not set or invalid.
-static int read_BLOCK_B_env() {
-  const char* s = getenv("GETP_MOE_BLOCK");
-  if (!s || !*s) return 16;
-  int v = atoi(s);
-  if (v <= 0) return 16;
-  return v;
+// Tunable MoE tile sizes: BLOCK_N (columns per block) replaces legacy BLOCK_B.
+// BLOCK_M controls rows per block. Both align to 16 for MFMA compatibility.
+static int read_int_env(const char* name) {
+  const char* s = getenv(name);
+  if (!s || !*s) return -1;
+  return atoi(s);
 }
-static const int BLOCK_B = read_BLOCK_B_env();
+
+static int sanitize_tile_dim(int value, int fallback) {
+  if (value <= 0) value = fallback;
+  return ((value + 15) / 16) * 16;
+}
+
+static int read_block_m_env() {
+  int v = read_int_env("GETP_MOE_BLOCK_M");
+  return sanitize_tile_dim(v, 16);
+}
+
+static int read_block_n_env() {
+  int v = read_int_env("GETP_MOE_BLOCK_N");
+  if (v <= 0) v = read_int_env("GETP_MOE_BLOCK");
+  return sanitize_tile_dim(v, 16);
+}
+
+static const int BLOCK_M = read_block_m_env();
+static const int BLOCK_N = read_block_n_env();
 
 #define HIP_CHECK(cmd) \
   do { \
@@ -164,7 +180,7 @@ typedef struct {
   int   *sorted_eids;        // [M_pad]  eid theo thứ tự đã sắp xếp + đệm
   float *sorted_w;           // [M_pad]  trọng số top-k; 0.0f cho pad
   int   *padded_offsets;     // [n_experts + 1] prefix-sum sau khi align block
-  int   *block_expert_ids;   // [M_pad / BLOCK_B] expert id cho mỗi block  (BLOCK_B=16)
+  int   *block_expert_ids;   // [M_pad / BLOCK_N] expert id cho mỗi block
   
   // BF16 KV caches split by attention type
   hip_bfloat16 *key_cache_sliding;
@@ -248,24 +264,24 @@ __global__ void gather_pack_x_fp32_to_bf16_kernel(const float *x, hip_bfloat16 *
 }
 
 // Pack X with runtime B from device pointer: gather FP32 inputs and store to BF16 in block-major layout
-// Layout: for each block of `block_size` columns, we store K consecutive rows before moving to the next block.
+// Layout: for each block of `block_cols` columns, we store K consecutive rows before moving to the next block.
 //         This matches the GEMM tile consumption so global loads become contiguous.
 // Launch expects a 2-D grid (cols × rows) so every thread handles one (k, b) pair without integer divides.
 // Blive = *total_post_pad_ptr; for b >= Blive, write zeros. slot_ids is either d_slot_ids or sorted_sids.
 __global__ void gather_pack_x_fp32_to_bf16_kernel_Bptr(const float *x, hip_bfloat16 *xpack,
-                                                       int K, int Bpad, int block_size,
+                                                       int K, int Bpad, int block_cols,
                                                        int in_stride, const int *slot_ids,
                                                        const int *total_post_pad_ptr) {
   const int b = blockIdx.x * blockDim.x + threadIdx.x;
   const int k = blockIdx.y * blockDim.y + threadIdx.y;
   if (b >= Bpad || k >= K) return;
-  if (block_size <= 0) block_size = 16;
+  if (block_cols <= 0) block_cols = 16;
   const int Blive = *total_post_pad_ptr;
-  const int block_idx = b / block_size;
-  const int lane = b - block_idx * block_size;
-  const size_t block_stride = (size_t)block_size * (size_t)K;
+  const int block_idx = b / block_cols;
+  const int lane = b - block_idx * block_cols;
+  const size_t block_stride = (size_t)block_cols * (size_t)K;
   hip_bfloat16 *block_base = xpack + block_stride * (size_t)block_idx;
-  hip_bfloat16 *dst = block_base + (size_t)k * (size_t)block_size + (size_t)lane;
+  hip_bfloat16 *dst = block_base + (size_t)k * (size_t)block_cols + (size_t)lane;
   if (b < Blive) {
     const int sid = slot_ids[b];
     const float v = x[(size_t)sid * (size_t)in_stride + (size_t)k];
@@ -1879,180 +1895,203 @@ __global__ void iota_kernel(int* a, int n) {
 }
 
 // Fused GEMM (W_mlp1 * Xpack) + bias + SwiGLU + scatter to gate_up_all.
-// - W_packed: BF16 packed 16x16 tiles (Mpad x Kpad), Mout = 2*I
-// - Xpack:    FP32 [K x Bpad], ta xử lý Be cột liên tiếp (đã align BLOCK_B)
-// - gate_up_out: BF16 [B_global x I] scatter writes directly by global column index
-// Mỗi block: 64 threads (16x4) tính 1 tile 16x16 (M x N).
-// Grouped variant: handle all experts in a single launch by selecting the expert per 16-column block.
-// Uses block_expert_ids[blockIdx.y] to pick the expert and computes fused (GEMM + bias + SwiGLU) then scatters.
+// - W_packed: BF16 packed 16x16 tiles (Mpad x Kpad), Mout = 2*I.
+// - Xpack:    BF16 block-major layout, each block stores BLOCK_N contiguous columns.
+// - gate_up_out: BF16 [I x Bpad_total], row-major with stride out_stride_cols.
+// Each 64-thread block now covers a tunable tile BM x BN composed of 16x16 MFMA tiles.
+// Grouped variant: block_expert_ids[blockIdx.y] selects the expert for the BN-column block.
 __global__ __launch_bounds__(64)
 void gemm16x16_mlp1_fused_swiglu_scatter_grouped(
     const hip_bfloat16* __restrict__ W_packed_all,   // [n_layers*n_experts][Mpad*Kpad]
-    const hip_bfloat16* __restrict__ Xpack,          // BF16 block-major layout (per BLOCK_B columns)
+    const hip_bfloat16* __restrict__ Xpack,          // BF16 block-major layout (per BLOCK_N columns)
     hip_bfloat16*       __restrict__ gate_up_out,    // [I x Bpad_total] BF16 row-major (row stride = Bpad_total)
     const hip_bfloat16* __restrict__ bias_all,       // [n_layers*n_experts][Mout]
     // Logical sizes
     int Mout, int K, int Btotal, int Bpad_total,
     int out_stride_cols,                              // leading dimension across columns (Bpad_total)
-    // Mapping from 16-col block -> expert id
-    const int* __restrict__ block_expert_ids,        // [Bpad_total/BLOCK_B]
-    int block_size,                                  // BLOCK_B (must be multiple of 16)
+    // Mapping from BN-column block -> expert id
+    const int* __restrict__ block_expert_ids,        // [Bpad_total/BLOCK_N]
+    int block_cols,                                  // BN (must be multiple of 16)
+    int tile_rows,                                   // BM (must be multiple of 16)
     int n_experts, int layer,
     int Mpad, int Kpad,
     float swiglu_limit,
     const int* __restrict__ total_post_pad_ptr)
 {
-  const int tx = threadIdx.x;   // 0..15 (N within tile)
-  const int ty = threadIdx.y;   // 0..3
-  const int lane = ty*16 + tx;  // 0..63
+  const int tx = threadIdx.x;   // 0..15 (columns within MFMA tile)
+  const int ty = threadIdx.y;   // 0..3  (row groups within MFMA tile)
+  const int lane = ty * 16 + tx;  // 0..63
 
-  const int tile_m  = blockIdx.x;     // along M (rows)
-  const int tile_n  = blockIdx.y;     // along N (cols), each tile is a 16-col block
-  const int row0    = tile_m * 16;
-  const int col0    = tile_n * 16;
+  if (block_cols <= 0) block_cols = 16;
+  if (tile_rows <= 0) tile_rows = 16;
+  (void)Btotal;
 
-  // Early cull tiles beyond live padded width computed on device
+  const int col_tiles_per_block = std::max(1, block_cols / 16);
+  const int row_tiles_per_block = std::max(1, tile_rows / 16);
+
+  const int tile_m = blockIdx.x;   // block of BM rows
+  const int tile_n = blockIdx.y;   // block of BN columns
+
+  const int total_row_tiles = (Mpad + 15) / 16;
+  const int total_col_tiles = (Bpad_total + 15) / 16;
+
+  const int row_tile_offset = tile_m * row_tiles_per_block;
+  const int col_tile_offset = tile_n * col_tiles_per_block;
+
+  const int remaining_row_tiles = total_row_tiles - row_tile_offset;
+  if (remaining_row_tiles <= 0) return;
+  const int remaining_col_tiles = total_col_tiles - col_tile_offset;
+  if (remaining_col_tiles <= 0) return;
+
+  const int row_tiles_this_block = std::min(row_tiles_per_block, remaining_row_tiles);
+  const int col_tiles_this_block = std::min(col_tiles_per_block, remaining_col_tiles);
+
+  const int row_block0 = row_tile_offset * 16;
+  const int col_block0 = col_tile_offset * 16;
+
   const int Btotal_live = *total_post_pad_ptr;
-  const int Bpad_live   = ((Btotal_live + 15) / 16) * 16;
-  if (col0 >= Bpad_live) return;     // skip fully padded tiles
+  const int Bpad_live   = ((Btotal_live + block_cols - 1) / block_cols) * block_cols;
+  if (col_block0 >= Bpad_live) return;
 
-  // Determine expert for this 16-col tile via BLOCK_B mapping
-  if (block_size <= 0) block_size = 16;
-  int blocks_per_b = block_size / 16; // tiles per BLOCK_B
-  if (blocks_per_b < 1) blocks_per_b = 1;
-  const int block_idx = tile_n / blocks_per_b;
-  const int inner_tile = tile_n - block_idx * blocks_per_b;
-  const int tile_col_in_block = inner_tile * 16;
+  const int blocks_total = (Bpad_total + block_cols - 1) / block_cols;
+  if (tile_n >= blocks_total) return;
+  const int block_idx = tile_n;
   const int eid = block_expert_ids[block_idx];
-  const size_t block_stride_vals = (size_t)block_size * (size_t)K;
-  const hip_bfloat16* __restrict__ x_block = Xpack + block_stride_vals * (size_t)block_idx;
-  const hip_bfloat16* __restrict__ x_tile_base = x_block + (size_t)tile_col_in_block;
 
-  // Resolve per-(layer,eid) bases
+  const size_t block_stride_vals = (size_t)block_cols * (size_t)K;
+  const hip_bfloat16* __restrict__ x_block = Xpack + block_stride_vals * (size_t)block_idx;
+
   const size_t per_mat_elems = (size_t)Mpad * (size_t)Kpad;
   const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
   const hip_bfloat16* __restrict__ W_packed = W_packed_all + mat_index * per_mat_elems;
   const hip_bfloat16* __restrict__ B = bias_all ? (bias_all + mat_index * (size_t)Mout) : nullptr;
 
-  // Double-buffered LDS tiles (ping-pong) to reduce synchronization overhead
-  __shared__ __align__(16) hip_bfloat16 sWb[2][16*16];
-  __shared__ __align__(16) hip_bfloat16 sX [2][16*16];
-  __shared__ __align__(16) float        sBias[16];  // cache bias for this 16-row tile
+  __shared__ __align__(16) hip_bfloat16 sWb[2][16 * 16];
+  __shared__ __align__(16) hip_bfloat16 sX [2][16 * 16];
+  __shared__ __align__(16) float        sBias[16];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
-  float4v acc = {0.f,0.f,0.f,0.f};
 
-  const int Ktiles = (Kpad + 15)/16;
+  const int Ktiles = (Kpad + 15) / 16;
   const size_t tilesPerRow = (size_t)((Kpad + 15) / 16);
-  // Cache bias for this tile once if present
-  if (B) {
-    if (lane < 16) {
-      const int r = row0 + lane;
-      sBias[lane] = (r < Mout) ? bfloat16_to_float(B[r]) : 0.f;
-    }
-    __syncthreads();
-  }
-
-  // Preload first K tile into buffer 0
-  int curr = 0;
-  {
-    const int kk = 0;
-    if (lane < 32) {
-      const size_t w_tile = ((size_t)tile_m * tilesPerRow + (size_t)kk) * (size_t)256;
-      const hip_bfloat16* src = W_packed + w_tile;
-      reinterpret_cast<u32x4*>(sWb[curr])[lane] = reinterpret_cast<const u32x4*>(src)[lane];
-    }
-    if (lane < 32) {
-      const int r   = lane % 16;
-      const int h   = lane / 16;   // 0 or 1
-      const int c8  = h * 8;       // columns 0..7 or 8..15
-      const int k_row = kk*16 + r;
-      hip_bfloat16* dst = &sX[curr][0] + r*16 + c8;
-      const bool in_k = (k_row < K);
-      if (in_k) {
-        const hip_bfloat16* src = x_tile_base + (size_t)k_row * (size_t)block_size + (size_t)c8;
-        // Copy 8 bf16 values (16B) per lane
-        reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
-      } else {
-        reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
-      }
-    }
-    __syncthreads();
-  }
-
-  for (int kk = 0; kk < Ktiles; ++kk) {
-    // Prefetch next into alternate buffer (if any)
-    int next = curr ^ 1;
-    if (kk + 1 < Ktiles) {
-      if (lane < 32) {
-        const size_t w_tile = ((size_t)tile_m * tilesPerRow + (size_t)(kk + 1)) * (size_t)256;
-        const hip_bfloat16* src = W_packed + w_tile;
-        reinterpret_cast<u32x4*>(sWb[next])[lane] = reinterpret_cast<const u32x4*>(src)[lane];
-      }
-      if (lane < 32) {
-        const int r   = lane % 16;
-        const int h   = lane / 16;   // 0 or 1
-        const int c8  = h * 8;       // columns 0..7 or 8..15
-        const int k_row = (kk + 1)*16 + r;
-        hip_bfloat16* dst = &sX[next][0] + r*16 + c8;
-        const bool in_k = (k_row < K);
-        if (in_k) {
-          const hip_bfloat16* src = x_tile_base + (size_t)k_row * (size_t)block_size + (size_t)c8;
-          reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
-        } else {
-          reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u,0u,0u,0u};
-        }
-      }
-    }
-
-    // Compute on current tile
-    const int kbase = ty * 4;  // 4 BF16s per operand per lane
-    using short4v = __attribute__((ext_vector_type(4))) short;
-    union UB { hip_bfloat16 b; unsigned short u; } u0, u1, u2, u3;
-    short4v Areg, Breg;
-    u0.b = sWb[curr][tx*16 + kbase + 0]; u1.b = sWb[curr][tx*16 + kbase + 1];
-    u2.b = sWb[curr][tx*16 + kbase + 2]; u3.b = sWb[curr][tx*16 + kbase + 3];
-    Areg.x = (short)u0.u; Areg.y = (short)u1.u; Areg.z = (short)u2.u; Areg.w = (short)u3.u;
-    u0.b = sX[curr][(kbase + 0)*16 + tx]; u1.b = sX[curr][(kbase + 1)*16 + tx];
-    u2.b = sX[curr][(kbase + 2)*16 + tx]; u3.b = sX[curr][(kbase + 3)*16 + tx];
-    Breg.x = (short)u0.u; Breg.y = (short)u1.u; Breg.z = (short)u2.u; Breg.w = (short)u3.u;
-    acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
-
-    __syncthreads();
-    curr = next;
-  }
-
-  // Epilogue fused: (2I) → I (SwiGLU) and scatter by global column id; guard with Btotal
-  const int col = col0 + tx;
-  if (col >= Btotal_live) return;
 
   const float alpha = 1.702f;
   const int   I     = Mout >> 1;
-
   const int row_stride = out_stride_cols;
 
-  #pragma unroll
-  for (int iter = 0; iter < 2; ++iter) {     // even/odd pairs within this thread
-    const int i  = iter * 2;
-    const int r  = row0 + (ty*4 + i);
-    const int rp = r + 1;
-    if (r < Mout && rp < Mout) {
-      float gate = (iter == 0) ? acc.x : acc.z;
-      float up   = (iter == 0) ? acc.y : acc.w;
-      if (B) {
-        const int rloc = (ty*4 + i);
-        gate += sBias[rloc];
-        up   += sBias[rloc + 1];
+  for (int rm = 0; rm < row_tiles_this_block; ++rm) {
+    const int row_tile_index = row_tile_offset + rm;
+    const int row0 = row_block0 + rm * 16;
+
+    if (B) {
+      if (lane < 16) {
+        const int r = row0 + lane;
+        sBias[lane] = (r < Mout) ? bfloat16_to_float(B[r]) : 0.f;
       }
-      gate = fminf(swiglu_limit, gate);
-      up   = fminf(swiglu_limit, fmaxf(-swiglu_limit, up));
-      const float inv_denom = __fdividef(1.f, 1.f + __expf(-alpha * gate));
-      gate *= inv_denom;
-      const int row_half = r >> 1;
-      if (row_half < I) {
-        float fused = gate * (up + 1.f);
-        hip_bfloat16* row_base = gate_up_out + (size_t)row_half * (size_t)row_stride;
-        row_base[col] = float_to_bfloat16(fused);
+      __syncthreads();
+    }
+
+    for (int cn = 0; cn < col_tiles_this_block; ++cn) {
+      const int col0 = col_block0 + cn * 16;
+      if (col0 >= Bpad_live) continue;
+
+      float4v acc = {0.f, 0.f, 0.f, 0.f};
+      int curr = 0;
+      const int col_offset = cn * 16;
+
+      if (Ktiles > 0) {
+        const int kk = 0;
+        if (lane < 32) {
+          const size_t w_tile = ((size_t)row_tile_index * tilesPerRow + (size_t)kk) * (size_t)256;
+          const hip_bfloat16* src = W_packed + w_tile;
+          reinterpret_cast<u32x4*>(sWb[curr])[lane] = reinterpret_cast<const u32x4*>(src)[lane];
+        }
+        if (lane < 32) {
+          const int r   = lane & 15;
+          const int h   = lane >> 4;
+          const int c8  = h * 8;
+          const int k_row = kk * 16 + r;
+          hip_bfloat16* dst = &sX[curr][r * 16 + c8];
+          if (k_row < K) {
+            const hip_bfloat16* src = x_block + (size_t)k_row * (size_t)block_cols + (size_t)(col_offset + c8);
+            reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+          } else {
+            reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u, 0u, 0u, 0u};
+          }
+        }
+        __syncthreads();
+      }
+
+      for (int kk = 0; kk < Ktiles; ++kk) {
+        const int next = curr ^ 1;
+        if (kk + 1 < Ktiles) {
+          if (lane < 32) {
+            const size_t w_tile = ((size_t)row_tile_index * tilesPerRow + (size_t)(kk + 1)) * (size_t)256;
+            const hip_bfloat16* src = W_packed + w_tile;
+            reinterpret_cast<u32x4*>(sWb[next])[lane] = reinterpret_cast<const u32x4*>(src)[lane];
+          }
+          if (lane < 32) {
+            const int r   = lane & 15;
+            const int h   = lane >> 4;
+            const int c8  = h * 8;
+            const int k_row = (kk + 1) * 16 + r;
+            hip_bfloat16* dst = &sX[next][r * 16 + c8];
+            if (k_row < K) {
+              const hip_bfloat16* src = x_block + (size_t)k_row * (size_t)block_cols + (size_t)(col_offset + c8);
+              reinterpret_cast<u32x4*>(dst)[0] = reinterpret_cast<const u32x4*>(src)[0];
+            } else {
+              reinterpret_cast<u32x4*>(dst)[0] = u32x4{0u, 0u, 0u, 0u};
+            }
+          }
+        }
+
+        const int kbase = ty * 4;
+        using short4v = __attribute__((ext_vector_type(4))) short;
+        union UB { hip_bfloat16 b; unsigned short u; } u0, u1, u2, u3;
+        short4v Areg, Breg;
+        u0.b = sWb[curr][tx * 16 + kbase + 0];
+        u1.b = sWb[curr][tx * 16 + kbase + 1];
+        u2.b = sWb[curr][tx * 16 + kbase + 2];
+        u3.b = sWb[curr][tx * 16 + kbase + 3];
+        Areg.x = (short)u0.u; Areg.y = (short)u1.u; Areg.z = (short)u2.u; Areg.w = (short)u3.u;
+        u0.b = sX[curr][(kbase + 0) * 16 + tx];
+        u1.b = sX[curr][(kbase + 1) * 16 + tx];
+        u2.b = sX[curr][(kbase + 2) * 16 + tx];
+        u3.b = sX[curr][(kbase + 3) * 16 + tx];
+        Breg.x = (short)u0.u; Breg.y = (short)u1.u; Breg.z = (short)u2.u; Breg.w = (short)u3.u;
+        acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
+
+        __syncthreads();
+        curr = next;
+      }
+
+      const int col = col0 + tx;
+      if (col >= Btotal_live) continue;
+
+      #pragma unroll
+      for (int iter = 0; iter < 2; ++iter) {
+        const int i  = iter * 2;
+        const int r  = row0 + (ty * 4 + i);
+        const int rp = r + 1;
+        if (r >= Mout || rp >= Mout) continue;
+
+        float gate = (iter == 0) ? acc.x : acc.z;
+        float up   = (iter == 0) ? acc.y : acc.w;
+        if (B) {
+          const int rloc = (ty * 4 + i);
+          gate += sBias[rloc];
+          up   += sBias[rloc + 1];
+        }
+        gate = fminf(swiglu_limit, gate);
+        up   = fminf(swiglu_limit, fmaxf(-swiglu_limit, up));
+        const float inv_denom = __fdividef(1.f, 1.f + __expf(-alpha * gate));
+        gate *= inv_denom;
+        const int row_half = r >> 1;
+        if (row_half < I) {
+          float fused = gate * (up + 1.f);
+          hip_bfloat16* row_base = gate_up_out + (size_t)row_half * (size_t)row_stride;
+          row_base[col] = float_to_bfloat16(fused);
+        }
       }
     }
   }
@@ -2684,11 +2723,11 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     {
       // Zero cursors only (counts were built by fused kernel)
       HIP_CHECK(hipMemsetAsync(gpu_ctx->state.eid_cursors, 0, (size_t)p->n_experts * sizeof(int), gpu_ctx->batch_stream));
-      // 6') Xây prefix-sum đã đệm theo BLOCK_B (global)
+      // 6') Xây prefix-sum đã đệm theo BLOCK_N (global)
       build_padded_offsets_kernel<<<1,1,0,gpu_ctx->batch_stream>>>(
           gpu_ctx->state.eid_counts,
           gpu_ctx->state.padded_offsets,
-          p->n_experts, BLOCK_B);
+          p->n_experts, BLOCK_N);
 
       // Bỏ đồng bộ D2H cho total_post_pad: không cần đọc về host nữa.
       // Thay vào đó, mọi launch phía sau sẽ dùng upper bound theo Mmax_pad.
@@ -2722,7 +2761,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         fill_padding_and_blocks_kernel<<<blocks, threads, 0, gpu_ctx->batch_stream>>>(
             gpu_ctx->state.eid_counts,
             gpu_ctx->state.padded_offsets,
-            p->n_experts, BLOCK_B,
+            p->n_experts, BLOCK_N,
             gpu_ctx->state.sorted_indices,
             gpu_ctx->state.sorted_sids,
             gpu_ctx->state.sorted_eids,
@@ -2736,7 +2775,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     int Kmlp1 = p->hidden_dim;
     // Dùng upper bound cố định theo worst-case đã alloc
     const size_t Mmax      = (size_t)gpu_ctx->max_batch * (size_t)p->experts_per_token;
-    const size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_B - 1);
+    const size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_N - 1);
     int Bpad_total = round_up16((int)Mmax_pad); // Bpad dùng khi pack (toàn cục)
     int Bmlp1 = (int)Mmax_pad;                  // số cột thực dùng cho guard và gather; phần đuôi pad điền 0
     {
@@ -2749,7 +2788,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           gpu_ctx->state.xpack_bf16,   // đích:  [K x Bpad_total] BF16
           Kmlp1,
           Bpad_total,
-          BLOCK_B,
+          BLOCK_N,
           p->hidden_dim,
           gpu_ctx->state.sorted_sids,  // cột b → sid = sorted_sids[b]
           gpu_ctx->state.padded_offsets + p->n_experts // runtime Btotal
@@ -2765,7 +2804,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       // Launch a single grouped kernel across all experts/columns using block→expert mapping.
       {
         dim3 blockG(16, 4, 1);
-        dim3 gridG((unsigned)((Mpad_mlp1 + 15) / 16), (unsigned)((Bpad_total + 15) / 16));
+        const unsigned tiles_m = std::max(1u, (unsigned)((Mpad_mlp1 + BLOCK_M - 1) / BLOCK_M));
+        const unsigned tiles_n = std::max(1u, (unsigned)((Bpad_total + BLOCK_N - 1) / BLOCK_N));
+        dim3 gridG(tiles_m, tiles_n);
         gemm16x16_mlp1_fused_swiglu_scatter_grouped<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
             /*W_all*/   gpu_ctx->weights.w_mlp1_packed16,
             /*Xpack*/   gpu_ctx->state.xpack_bf16,
@@ -2774,7 +2815,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
             /*sizes*/   Mout, p->hidden_dim, Bmlp1, Bpad_total,
             /*stride*/  Bpad_total,
             /*blk→eid*/ gpu_ctx->state.block_expert_ids,
-            /*BLOCK_B*/ BLOCK_B,
+            /*BLOCK_N*/ BLOCK_N,
+            /*BLOCK_M*/ BLOCK_M,
             /*nexp,l*/  p->n_experts, l,
             /*pads*/    Mpad_mlp1, Kpad_mlp1,
             /*limit*/   p->swiglu_limit,
@@ -2791,7 +2833,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 blockG2(16, 4, 1);
       // Dùng upper bound cho lưới; guard nội bộ với Btotal = Mmax_pad
       const size_t Mmax      = (size_t)gpu_ctx->max_batch * (size_t)p->experts_per_token;
-      const size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_B - 1);
+      const size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_N - 1);
       const int Bpad_total   = round_up16((int)Mmax_pad);
       int Btotal = (int)Mmax_pad;
       // Launch one block per 16 contiguous selections (grouped by expert)
@@ -3114,7 +3156,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
 
   
   // size_t Mmax      = (size_t)max_batch * (size_t)p->experts_per_token;               // B tối đa của selections
-  size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_B - 1);            // trừ hao pad tối đa
+  size_t Mmax_pad  = Mmax + (size_t)p->n_experts * (size_t)(BLOCK_N - 1);            // trừ hao pad tối đa
   int Bpad_mlp1    = (int)round_up16((int)Mmax_pad);                                  // cho pack MLP1
 
     size_t Kmax_xpack = std::max({
@@ -3132,7 +3174,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->sorted_eids,      Mmax_pad * sizeof(int)));
   HIP_CHECK(hipMalloc(&s->sorted_w,         Mmax_pad * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->padded_offsets,  ((size_t)p->n_experts + 1) * sizeof(int)));
-  HIP_CHECK(hipMalloc(&s->block_expert_ids, ((Mmax_pad + BLOCK_B - 1) / BLOCK_B) * sizeof(int)));
+  HIP_CHECK(hipMalloc(&s->block_expert_ids, ((Mmax_pad + BLOCK_N - 1) / BLOCK_N) * sizeof(int)));
 
 }
 
