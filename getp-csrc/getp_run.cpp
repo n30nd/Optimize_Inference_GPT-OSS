@@ -2475,7 +2475,7 @@ static inline size_t flash_attention_v2_smem_bytes(int head_dim, int BK = FA_V2_
 #endif
 
 __global__ __launch_bounds__(64)
-void flash_attention_even(
+void flash_attention_sliding(
     const float * __restrict__ all_q,
     KVCacheDeviceData * __restrict__ cache_data,
     const hip_bfloat16 * __restrict__ attn_sinks,
@@ -2659,7 +2659,7 @@ void flash_attention_even(
 
 
 __global__ __launch_bounds__(64)
-void flash_attention_odd(
+void flash_attention_full(
     const float * __restrict__ all_q,
     KVCacheDeviceData * __restrict__ cache_data,
     const hip_bfloat16 * __restrict__ attn_sinks,
@@ -3770,7 +3770,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       size_t shared_mem_bytes = flash_attention_v2_smem_bytes(/*head_dim=*/head_dim, /*BK=*/FA_V2_BK);
 
       if ((l & 1) == 0) {
-        flash_attention_even<<<grid, block, shared_mem_bytes, ctx->batch_stream>>>(
+        flash_attention_sliding<<<grid, block, shared_mem_bytes, ctx->batch_stream>>>(
             ctx->state.qkv,
             ctx->state.kv_cache_manager->get_device_data(),
             ctx->weights.attn_sinks,
@@ -3786,7 +3786,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
             ctx->local_qkv_dim,
             ctx->d_slot_ids);
       } else {
-        flash_attention_odd<<<grid, block, shared_mem_bytes, ctx->batch_stream>>>(
+        flash_attention_full<<<grid, block, shared_mem_bytes, ctx->batch_stream>>>(
             ctx->state.qkv,
             ctx->state.kv_cache_manager->get_device_data(),
             ctx->weights.attn_sinks,
