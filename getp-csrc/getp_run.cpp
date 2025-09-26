@@ -13,7 +13,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
 #include <limits>
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -69,7 +68,7 @@ static const int BLOCK_N = read_block_n_env();
     } \
   } while(0)
 
-// Removed expert stream support; batch_stream only is used for inference
+
 
 
 // 128-bit alias cho load/stor 16B
@@ -131,15 +130,10 @@ typedef struct {
   hip_bfloat16 *rms_attn_w;
   hip_bfloat16 *rms_ffn_w;
   hip_bfloat16 *rms_out_w;
-  hip_bfloat16 *w_qkv;
   hip_bfloat16 *b_qkv;
-  hip_bfloat16 *w_o;
   hip_bfloat16 *b_o;
   hip_bfloat16 *attn_sinks;
-  hip_bfloat16 *w_router;
   hip_bfloat16 *b_router;
-  hip_bfloat16 *w_mlp1;
-  hip_bfloat16 *w_mlp2;
   hip_bfloat16 *b_mlp1;
   hip_bfloat16 *b_mlp2;
   // Packed (16x16 tiling) BF16 weights for GEMM core (convert to FP32 per tile in shared memory)
@@ -159,7 +153,7 @@ typedef struct {
   float *router_score;
   float *e_agg;
   hip_bfloat16 *qkv;
-  // Removed legacy 'logits' buffer; we use logits_fp32 only
+
   float *mask;
   float *cos_vals;
   float *sin_vals;
@@ -235,7 +229,7 @@ static_assert(sizeof(hip_bfloat16) == 2, "hip_bfloat16 is expected to be 2 bytes
 __device__ __forceinline__ float4 bfloat16_to_float4(const hip_bfloat16 *bf16_ptr);
 __host__ __device__ __forceinline__ int round_up16(int x) { return ((x + 15) / 16) * 16; }
 
-// (removed) pack_bf16x2 helper no longer needed after switching to short4 MFMA operands
+
 
 // ------------------------- Kernels -------------------------
 
@@ -3108,7 +3102,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
 
   HIP_CHECK(hipMalloc(&s->e_agg,    B * (size_t)p->hidden_dim * sizeof(float)));
 
-  // (commented out unused separate q/k/v buffers; fused qkv used only)
+
   HIP_CHECK(hipMalloc(&s->qkv, B * (size_t)p->head_dim * (size_t)(p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(hip_bfloat16)));
 
   const bool enable_sliding = (p->sliding_window > 0);
@@ -3222,11 +3216,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
   int n_attn_heads  = p->n_attn_heads;
   int n_kv_heads    = p->n_kv_heads;
 
-  // Ensure unused un-packed pointers are null (we use packed versions for these)
-  gpu_w->w_qkv = nullptr;
-  gpu_w->w_o = nullptr;
-  gpu_w->w_router = nullptr;
-  gpu_w->w_mlp1 = nullptr; // we will use packed storage for mlp1
+  // Use packed versions for weights (w_qkv_packed16, w_o_packed16, etc.)
 
   // Shared staging resources for weight loads (reused across helpers)
   constexpr size_t STAGING_BYTES_TARGET = (size_t)512 * 1024 * 1024; // 512 MB
@@ -3506,8 +3496,7 @@ void gpu_copy_weights(GPUTransformerWeights *gpu_w, TransformerWeights *cpu_w, C
       HIP_CHECK(hipHostUnregister(const_cast<float*>(cpu_w->w_mlp2)));
     }
 
-    // (tùy chọn) bỏ con trỏ w_mlp2 cũ, vì không còn dùng đường dot-product:
-    gpu_w->w_mlp2 = nullptr;
+
   }
 
   size_t mlp2_b_count = (size_t)n_layers * (size_t)n_experts * (size_t)hidden_dim;
@@ -3525,17 +3514,12 @@ void gpu_free_weights(GPUTransformerWeights *gpu_w) {
   if (gpu_w->rms_attn_w)            HIP_CHECK(hipFree(gpu_w->rms_attn_w));
   if (gpu_w->rms_ffn_w)             HIP_CHECK(hipFree(gpu_w->rms_ffn_w));
   if (gpu_w->rms_out_w)             HIP_CHECK(hipFree(gpu_w->rms_out_w));
-  if (gpu_w->w_qkv)                 HIP_CHECK(hipFree(gpu_w->w_qkv));
   if (gpu_w->b_qkv)                 HIP_CHECK(hipFree(gpu_w->b_qkv));
-  if (gpu_w->w_o)                   HIP_CHECK(hipFree(gpu_w->w_o));
   if (gpu_w->b_o)                   HIP_CHECK(hipFree(gpu_w->b_o));
   if (gpu_w->attn_sinks)            HIP_CHECK(hipFree(gpu_w->attn_sinks));
-  if (gpu_w->w_router)              HIP_CHECK(hipFree(gpu_w->w_router));
   if (gpu_w->b_router)              HIP_CHECK(hipFree(gpu_w->b_router));
-  if (gpu_w->w_mlp1)                HIP_CHECK(hipFree(gpu_w->w_mlp1));
   if (gpu_w->w_mlp1_packed16)       HIP_CHECK(hipFree(gpu_w->w_mlp1_packed16));
   if (gpu_w->b_mlp1)                HIP_CHECK(hipFree(gpu_w->b_mlp1));
-  if (gpu_w->w_mlp2)                HIP_CHECK(hipFree(gpu_w->w_mlp2));
   if (gpu_w->w_mlp2_packed16)       HIP_CHECK(hipFree(gpu_w->w_mlp2_packed16));
   if (gpu_w->b_mlp2)                HIP_CHECK(hipFree(gpu_w->b_mlp2));
   if (gpu_w->w_qkv_packed16)        HIP_CHECK(hipFree(gpu_w->w_qkv_packed16));
