@@ -52,6 +52,22 @@ static_assert(GROUPED_MLP_TILE_M >= 16 && GROUPED_MLP_TILE_M % 16 == 0,
 static_assert(GROUPED_MLP_TILE_N >= 16 && GROUPED_MLP_TILE_N % 16 == 0,
               "GROUPED_MLP_TILE_N must be a multiple of 16 and at least 16");
 
+constexpr int kGroupedMlpTileDim = 16;
+constexpr int kGroupedMlpRowSubtilesPerBlock = GROUPED_MLP_TILE_M / kGroupedMlpTileDim;
+constexpr int kGroupedMlpColSubtilesPerBlock = GROUPED_MLP_TILE_N / kGroupedMlpTileDim;
+constexpr int kGroupedMlpWavefrontsPerBlock =
+    kGroupedMlpRowSubtilesPerBlock * kGroupedMlpColSubtilesPerBlock;
+constexpr int kGroupedMlpWavefrontSize = 64;
+constexpr int kGroupedMlpThreadsPerBlock =
+    kGroupedMlpWavefrontsPerBlock * kGroupedMlpWavefrontSize;
+
+static_assert(kGroupedMlpRowSubtilesPerBlock >= 1,
+              "GROUPED_MLP_TILE_M must produce at least one 16x16 subtile per block");
+static_assert(kGroupedMlpColSubtilesPerBlock >= 1,
+              "GROUPED_MLP_TILE_N must produce at least one 16x16 subtile per block");
+static_assert(kGroupedMlpThreadsPerBlock <= 1024,
+              "Grouped MLP block configuration exceeds 1024 threads; reduce tile sizes");
+
 #define HIP_CHECK(cmd) \
   do { \
     hipError_t error = cmd; \
@@ -640,7 +656,7 @@ __global__ void convert_fp32_to_bf16_kernel(const float *fp32_data, hip_bfloat16
 // MFMA MLP1 directly from MXFP4-packed weights (no BF16 storage).
 // Dequantizes per element on-the-fly using e8m0 scales and 4-bit levels.
 // Each block walks GROUPED_MLP_TILE_M rows × GROUPED_MLP_TILE_N selections using 16×16 MFMA sub-tiles.
-__global__ __launch_bounds__(64)
+__global__ __launch_bounds__(kGroupedMlpThreadsPerBlock)
 void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     float* __restrict__ mlp1_out_all,        // [M selections][out_dim]
     const hip_bfloat16* __restrict__ t_bf16, // [B slots][hidden_dim] BF16
@@ -656,15 +672,19 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     int hidden_dim, int out_dim,
     int layer, int n_experts)
 {
-  constexpr int kTileDim = 16;   // MFMA tile granularity in rows/cols
-  const int row_tiles_per_block = GROUPED_MLP_TILE_M / kTileDim;
+  constexpr int kTileDim = kGroupedMlpTileDim;
+  constexpr int kRowTilesPerBlock = kGroupedMlpRowSubtilesPerBlock;
+  constexpr int kColTilesPerBlock = kGroupedMlpColSubtilesPerBlock;
+  constexpr int kWavefrontsPerBlock = kGroupedMlpWavefrontsPerBlock;
+  constexpr int kWaveTileElems = kTileDim * kTileDim;
 
-  const int tx = threadIdx.x;  // column lane within tile
-  const int ty = threadIdx.y;  // row-group lane (4 rows)
-  const int lane = ty * kTileDim + tx; // 0..63
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+  const int wave = threadIdx.z;
+  const int lane = ty * kTileDim + tx;
 
-  const int tile_m_group = blockIdx.x;      // group of consecutive 16-row tiles
-  const int block_id = blockIdx.y;          // selection block for one expert
+  const int tile_m_group = blockIdx.x;
+  const int block_id = blockIdx.y;
   if (block_id >= total_blocks) return;
 
   const int col0 = sel_block_cols[block_id];
@@ -674,179 +694,225 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
 
   const int eid = sel_block_eids[block_id];
 
-  const int tile_m_start = tile_m_group * row_tiles_per_block;
-  const int block_row_base = tile_m_start * kTileDim;
-  if (block_row_base >= out_dim) return;
-
+  const int tile_m_start = tile_m_group * kRowTilesPerBlock;
   const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
-  const hip_bfloat16* __restrict__ B = b_mlp1 ? (b_mlp1 + mat_index * (size_t)out_dim) : nullptr;
+  const hip_bfloat16* __restrict__ B =
+      b_mlp1 ? (b_mlp1 + mat_index * (size_t)out_dim) : nullptr;
 
-  __shared__ __align__(16) uint16_t sWbf16[kTileDim * kTileDim];
-  __shared__ __align__(16) uint16_t sXbf16[kTileDim * kTileDim];
-  __shared__ __align__(16) float sBias[kTileDim];
-  __shared__ __align__(16) const hip_bfloat16* sXPtrs[kTileDim];
-  __shared__ __align__(16) float* sOutPtrs[kTileDim];
-  short4v* __restrict__ sWvec = reinterpret_cast<short4v*>(sWbf16);
-  short4v* __restrict__ sXvec = reinterpret_cast<short4v*>(sXbf16);
+  const int tiles_m_total = (out_dim + kTileDim - 1) / kTileDim;
+  if (tile_m_start >= tiles_m_total) return;
 
   const int K = hidden_dim;
-  const int tiles_m_total = (out_dim + kTileDim - 1) / kTileDim;
   const int tiles_k = (K + kTileDim - 1) / kTileDim;
-  const size_t packed_mat_bytes = (size_t)tiles_m_total * (size_t)tiles_k * (size_t)128;
+  const size_t packed_mat_bytes =
+      (size_t)tiles_m_total * (size_t)tiles_k * (size_t)128;
   const uint8_t* __restrict__ Wpack = w_data + mat_index * packed_mat_bytes;
   const size_t tiles_per_row = (size_t)tiles_k;
-  const size_t scales_per_mat = (size_t)tiles_m_total * (size_t)tiles_k * (size_t)kTileDim;
+  const size_t scales_per_mat =
+      (size_t)tiles_m_total * (size_t)tiles_k * (size_t)kTileDim;
   const uint8_t* __restrict__ Wscale = w_scales + mat_index * scales_per_mat;
 
-  const int max_col_tiles = (valid_cols + kTileDim - 1) / kTileDim;
+  __shared__ __align__(16) uint16_t sWbf16[kWavefrontsPerBlock * kWaveTileElems];
+  __shared__ __align__(16) uint16_t sXbf16[kWavefrontsPerBlock * kWaveTileElems];
+  __shared__ __align__(16) float sBias[kWavefrontsPerBlock * kTileDim];
+  __shared__ __align__(16) const hip_bfloat16* sXPtrs[kWavefrontsPerBlock * kTileDim];
+  __shared__ __align__(16) float* sOutPtrs[kWavefrontsPerBlock * kTileDim];
 
-  for (int col_tile = 0; col_tile < max_col_tiles; ++col_tile) {
-    const int col_base_in_block = col_tile * kTileDim;
-    int cols_in_tile = valid_cols - col_base_in_block;
-    if (cols_in_tile <= 0) break;
-    if (cols_in_tile > kTileDim) cols_in_tile = kTileDim;
-    const int base_col = col0 + col_base_in_block;
-    const bool all_cols_active = (cols_in_tile == kTileDim) && ((base_col + kTileDim - 1) < selections_M);
+  uint16_t* __restrict__ sWbf16_wave = sWbf16 + wave * kWaveTileElems;
+  uint16_t* __restrict__ sXbf16_wave = sXbf16 + wave * kWaveTileElems;
+  float* __restrict__ sBias_wave = sBias + wave * kTileDim;
+  const hip_bfloat16** __restrict__ sXPtrs_wave = sXPtrs + wave * kTileDim;
+  float** __restrict__ sOutPtrs_wave = sOutPtrs + wave * kTileDim;
+  short4v* __restrict__ sWvec_wave = reinterpret_cast<short4v*>(sWbf16_wave);
+  short4v* __restrict__ sXvec_wave = reinterpret_cast<short4v*>(sXbf16_wave);
 
-    if (lane < kTileDim) {
+  const int row_tile_local = wave / kColTilesPerBlock;
+  const int col_tile_local = wave % kColTilesPerBlock;
+
+  const int tile_m = tile_m_start + row_tile_local;
+  const int base_row = tile_m * kTileDim;
+
+  bool tile_active = (tile_m < tiles_m_total) && (base_row < out_dim);
+  int rows_in_tile = 0;
+  if (tile_active) {
+    rows_in_tile = out_dim - base_row;
+    if (rows_in_tile > kTileDim) rows_in_tile = kTileDim;
+    if (rows_in_tile <= 0) tile_active = false;
+  }
+  const bool full_row_tile = tile_active && (rows_in_tile == kTileDim);
+
+  const int col_base_in_block = col_tile_local * kTileDim;
+  int cols_in_tile = 0;
+  const int base_col = col0 + col_base_in_block;
+  if (tile_active) {
+    if (col_base_in_block >= valid_cols) {
+      tile_active = false;
+    } else {
+      cols_in_tile = valid_cols - col_base_in_block;
+      if (cols_in_tile > kTileDim) cols_in_tile = kTileDim;
+      if (cols_in_tile <= 0) tile_active = false;
+    }
+  }
+
+  const bool all_cols_active =
+      tile_active && (cols_in_tile == kTileDim) &&
+      ((base_col + kTileDim - 1) < selections_M);
+
+  if (lane < kTileDim) {
+    if (tile_active) {
       const int local_col = lane;
       const int global_col = base_col + local_col;
-      const bool active = (local_col < cols_in_tile) && (global_col < selections_M);
-      const hip_bfloat16* x_ptr = active ? (t_bf16 + (size_t)sel_sids[global_col] * (size_t)hidden_dim) : nullptr;
-      float* out_ptr = active ? (mlp1_out_all + (size_t)global_col * (size_t)out_dim) : nullptr;
-      sXPtrs[local_col] = x_ptr;
-      sOutPtrs[local_col] = out_ptr;
+      const bool active_col =
+          (local_col < cols_in_tile) && (global_col < selections_M);
+      const hip_bfloat16* x_ptr =
+          active_col ? (t_bf16 + (size_t)sel_sids[global_col] * (size_t)hidden_dim)
+                     : nullptr;
+      float* out_ptr =
+          active_col ? (mlp1_out_all + (size_t)global_col * (size_t)out_dim)
+                     : nullptr;
+      sXPtrs_wave[local_col] = x_ptr;
+      sOutPtrs_wave[local_col] = out_ptr;
+    } else {
+      sXPtrs_wave[lane] = nullptr;
+      sOutPtrs_wave[lane] = nullptr;
+    }
+  }
+  __syncthreads();
+
+  if (lane < kTileDim) {
+    if (tile_active && B) {
+      const int row_local = lane;
+      const int row_global = base_row + row_local;
+      const bool active_row =
+          (row_local < rows_in_tile) && (row_global < out_dim);
+      sBias_wave[row_local] = active_row ? bfloat16_to_float(B[row_global]) : 0.f;
+    } else {
+      sBias_wave[lane] = 0.f;
+    }
+  }
+  __syncthreads();
+
+  using float4v = __attribute__((ext_vector_type(4))) float;
+  float4v acc = {0.f, 0.f, 0.f, 0.f};
+
+  for (int kk = 0; kk < tiles_k; ++kk) {
+    if (tile_active) {
+      const size_t tile_linear =
+          (size_t)tile_m * tiles_per_row + (size_t)kk;
+      const size_t tile_base_byte = tile_linear * (size_t)128;
+      const size_t scale_base = tile_linear * (size_t)kTileDim;
+      const bool full_k_tile = ((kk + 1) * kTileDim) <= K;
+      const bool fast_w_tile = full_row_tile && full_k_tile;
+      const bool fast_x_tile = all_cols_active && full_k_tile;
+
+      const int idx4 = lane * 4;
+      if (idx4 < kTileDim * kTileDim) {
+        const int im = idx4 >> 4;
+        const int ik_base = idx4 & 0xF;
+        const int row = base_row + im;
+        const int col_base_k = kk * kTileDim + ik_base;
+        const int byte_off = tile_base_byte + (idx4 >> 1);
+        const uint16_t packed16 =
+            *reinterpret_cast<const uint16_t*>(Wpack + byte_off);
+        const int lane_group = lane & ~3;
+        int scale_code_int = 0x7F;
+        if ((lane & 3) == 0 && row < out_dim) {
+          scale_code_int = static_cast<int>(Wscale[scale_base + im]);
+        }
+        scale_code_int = __shfl(scale_code_int, lane_group, 4);
+        const uint8_t scale_code =
+            static_cast<uint8_t>(scale_code_int & 0xFF);
+        const uint16_t* __restrict__ lut_row =
+            MXFP4_DEQUANT_LUT_BF16[scale_code];
+        short4v wvec = {0, 0, 0, 0};
+        if (fast_w_tile) {
+#pragma unroll
+          for (int t4 = 0; t4 < 4; ++t4) {
+            const uint8_t nibble =
+                static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
+            wvec[t4] = static_cast<short>(lut_row[nibble]);
+          }
+        } else {
+          const bool row_valid = (row < out_dim) && (im < rows_in_tile);
+#pragma unroll
+          for (int t4 = 0; t4 < 4; ++t4) {
+            const int col = col_base_k + t4;
+            if (row_valid && col < K) {
+              const uint8_t nibble =
+                  static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
+              wvec[t4] = static_cast<short>(lut_row[nibble]);
+            }
+          }
+        }
+        sWvec_wave[im * 4 + (ik_base >> 2)] = wvec;
+      }
+
+      if (lane < kGroupedMlpWavefrontSize) {
+        const int r = lane % kTileDim;
+        const int c4 = (lane / kTileDim) * 4;
+        const int k_row = kk * kTileDim + r;
+        short4v xvec = {0, 0, 0, 0};
+        const hip_bfloat16* x0 = sXPtrs_wave[c4 + 0];
+        const hip_bfloat16* x1 = sXPtrs_wave[c4 + 1];
+        const hip_bfloat16* x2 = sXPtrs_wave[c4 + 2];
+        const hip_bfloat16* x3 = sXPtrs_wave[c4 + 3];
+        if (fast_x_tile && x0 && x1 && x2 && x3) {
+          xvec[0] = static_cast<short>(bfloat16_to_bits(x0[k_row]));
+          xvec[1] = static_cast<short>(bfloat16_to_bits(x1[k_row]));
+          xvec[2] = static_cast<short>(bfloat16_to_bits(x2[k_row]));
+          xvec[3] = static_cast<short>(bfloat16_to_bits(x3[k_row]));
+        } else {
+          const bool row_valid = (k_row < K);
+          if (row_valid && x0 && (c4 + 0) < cols_in_tile)
+            xvec[0] = static_cast<short>(bfloat16_to_bits(x0[k_row]));
+          if (row_valid && x1 && (c4 + 1) < cols_in_tile)
+            xvec[1] = static_cast<short>(bfloat16_to_bits(x1[k_row]));
+          if (row_valid && x2 && (c4 + 2) < cols_in_tile)
+            xvec[2] = static_cast<short>(bfloat16_to_bits(x2[k_row]));
+          if (row_valid && x3 && (c4 + 3) < cols_in_tile)
+            xvec[3] = static_cast<short>(bfloat16_to_bits(x3[k_row]));
+        }
+        sXvec_wave[r * 4 + (c4 >> 2)] = xvec;
+      }
     }
     __syncthreads();
 
-    for (int row_tile = 0; row_tile < row_tiles_per_block; ++row_tile) {
-      const int tile_m = tile_m_start + row_tile;
-      if (tile_m >= tiles_m_total) break;
-      const int base_row = tile_m * kTileDim;
-      if (base_row >= out_dim) break;
-
-      int rows_in_tile = out_dim - base_row;
-      if (rows_in_tile > kTileDim) rows_in_tile = kTileDim;
-      const bool full_row_tile = (rows_in_tile == kTileDim);
-
-      if (lane < kTileDim) {
-        const int row_local = lane;
-        const int row_global = base_row + row_local;
-        const bool active_row = (row_local < rows_in_tile) && (row_global < out_dim);
-        sBias[row_local] = (B && active_row) ? bfloat16_to_float(B[row_global]) : 0.f;
+    if (tile_active) {
+      short4v Areg;
+      short4v Breg;
+      const int kbase = ty * 4;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int kidx = kbase + j;
+        const uint16_t a_bits = sWbf16_wave[tx * kTileDim + kidx];
+        const uint16_t b_bits = sXbf16_wave[kidx * kTileDim + tx];
+        Areg[j] = static_cast<short>(a_bits);
+        Breg[j] = static_cast<short>(b_bits);
       }
-      __syncthreads();
-
-      using float4v = __attribute__((ext_vector_type(4))) float;
-      float4v acc = {0.f, 0.f, 0.f, 0.f};
-
-      for (int kk = 0; kk < tiles_k; ++kk) {
-        const size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
-        const size_t tile_base_byte = tile_linear * (size_t)128;
-        const size_t scale_base = tile_linear * (size_t)kTileDim;
-        const bool full_k_tile = ((kk + 1) * kTileDim) <= K;
-        const bool fast_w_tile = full_row_tile && full_k_tile;
-        const bool fast_x_tile = all_cols_active && full_k_tile;
-
-        const int idx4 = lane * 4;
-        if (idx4 < kTileDim * kTileDim) {
-          const int im = idx4 >> 4;
-          const int ik_base = idx4 & 0xF;
-          const int row = base_row + im;
-          const int col_base_k = kk * kTileDim + ik_base;
-          const int byte_off = tile_base_byte + (idx4 >> 1);
-          const uint16_t packed16 = *reinterpret_cast<const uint16_t*>(Wpack + byte_off);
-          const int lane_group = lane & ~3;
-          int scale_code_int = 0x7F;
-          if ((lane & 3) == 0 && row < out_dim) {
-            scale_code_int = static_cast<int>(Wscale[scale_base + im]);
-          }
-          scale_code_int = __shfl(scale_code_int, lane_group, 4);
-          const uint8_t scale_code = static_cast<uint8_t>(scale_code_int & 0xFF);
-          const uint16_t* __restrict__ lut_row = MXFP4_DEQUANT_LUT_BF16[scale_code];
-          short4v wvec = {0, 0, 0, 0};
-          if (fast_w_tile) {
-            #pragma unroll
-            for (int t4 = 0; t4 < 4; ++t4) {
-              const uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-              wvec[t4] = static_cast<short>(lut_row[nibble]);
-            }
-          } else {
-            const bool row_valid = (row < out_dim) && (im < rows_in_tile);
-            #pragma unroll
-            for (int t4 = 0; t4 < 4; ++t4) {
-              const int col = col_base_k + t4;
-              if (row_valid && col < K) {
-                const uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-                wvec[t4] = static_cast<short>(lut_row[nibble]);
-              }
-            }
-          }
-          sWvec[im * 4 + (ik_base >> 2)] = wvec;
-        }
-
-        if (lane < 64) {
-          const int r = lane % kTileDim;
-          const int c4 = (lane / kTileDim) * 4;
-          const int k_row = kk * kTileDim + r;
-          short4v xvec = {0, 0, 0, 0};
-          const hip_bfloat16* x0 = sXPtrs[c4 + 0];
-          const hip_bfloat16* x1 = sXPtrs[c4 + 1];
-          const hip_bfloat16* x2 = sXPtrs[c4 + 2];
-          const hip_bfloat16* x3 = sXPtrs[c4 + 3];
-          if (fast_x_tile && x0 && x1 && x2 && x3) {
-            xvec[0] = static_cast<short>(bfloat16_to_bits(x0[k_row]));
-            xvec[1] = static_cast<short>(bfloat16_to_bits(x1[k_row]));
-            xvec[2] = static_cast<short>(bfloat16_to_bits(x2[k_row]));
-            xvec[3] = static_cast<short>(bfloat16_to_bits(x3[k_row]));
-          } else {
-            const bool row_valid = (k_row < K);
-            if (row_valid && x0 && (c4 + 0) < cols_in_tile) xvec[0] = static_cast<short>(bfloat16_to_bits(x0[k_row]));
-            if (row_valid && x1 && (c4 + 1) < cols_in_tile) xvec[1] = static_cast<short>(bfloat16_to_bits(x1[k_row]));
-            if (row_valid && x2 && (c4 + 2) < cols_in_tile) xvec[2] = static_cast<short>(bfloat16_to_bits(x2[k_row]));
-            if (row_valid && x3 && (c4 + 3) < cols_in_tile) xvec[3] = static_cast<short>(bfloat16_to_bits(x3[k_row]));
-          }
-          sXvec[r * 4 + (c4 >> 2)] = xvec;
-        }
-
-        __syncthreads();
-
-        short4v Areg;
-        short4v Breg;
-        const int kbase = ty * 4;
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          const int kidx = kbase + j;
-          const uint16_t a_bits = sWbf16[tx * kTileDim + kidx];
-          const uint16_t b_bits = sXbf16[kidx * kTileDim + tx];
-          Areg[j] = static_cast<short>(a_bits);
-          Breg[j] = static_cast<short>(b_bits);
-        }
-        acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
-
-        __syncthreads();
-      }
-
-      float* out_vec = sOutPtrs[tx];
-      if (out_vec) {
-        float bias_vec[4];
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          bias_vec[i] = sBias[ty * 4 + i];
-        }
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const int row_local = ty * 4 + i;
-          const int row_global = base_row + row_local;
-          if (row_local < rows_in_tile && row_global < out_dim) {
-            out_vec[row_global] = acc[i] + bias_vec[i];
-          }
-        }
-      }
-      __syncthreads();
+      acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
     }
     __syncthreads();
   }
+
+  if (tile_active) {
+    float* out_vec = sOutPtrs_wave[tx];
+    if (out_vec) {
+      float bias_vec[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        bias_vec[i] = sBias_wave[ty * 4 + i];
+      }
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int row_local = ty * 4 + i;
+        const int row_global = base_row + row_local;
+        if (row_local < rows_in_tile && row_global < out_dim) {
+          out_vec[row_global] = acc[i] + bias_vec[i];
+        }
+      }
+    }
+  }
+  __syncthreads();
 }
 
 __global__ void quantize_mxfp4_kernel(const float *tile, size_t tile_elems, size_t global_elem_offset,
@@ -4179,9 +4245,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       // Launch MFMA matvec over 16-row tiles in output dimension
       const int out_dim = ctx->local_mlp1_out_dim;
       const int tiles_m1 = (out_dim + 15) / 16;
-      const int row_tiles_per_block = GROUPED_MLP_TILE_M / 16;
+      const int row_tiles_per_block = kGroupedMlpRowSubtilesPerBlock;
       const int grid1_x = row_tiles_per_block > 0 ? (tiles_m1 + row_tiles_per_block - 1) / row_tiles_per_block : 0;
-      dim3 block1(16,4,1); // 64 threads per block for MFMA
+      dim3 block1(16, 4, kGroupedMlpWavefrontsPerBlock); // wavefronts cover all 16x16 sub-tiles
       dim3 grid1(grid1_x, block_count, 1);
       mlp1_grouped_mfma_matvec_mxfp4_kernel<<<grid1, block1, 0, ctx->batch_stream>>>(
         ctx->state.mlp1_out_all, ctx->state.t_bf16,
