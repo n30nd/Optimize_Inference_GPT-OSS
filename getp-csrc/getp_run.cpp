@@ -1797,9 +1797,17 @@ __device__ __forceinline__ void atomic_update_argmax(unsigned long long *addr,
   }
 }
 
-constexpr int kLogitsGroupsPerBlock = 4;
+constexpr int kMfmaTileSize = 16;
+constexpr int kLogitsTileM = 64;  // Tunable block height (multiple of 16)
+constexpr int kLogitsTileN = 64;  // Tunable block width (multiple of 16)
+static_assert(kLogitsTileM % kMfmaTileSize == 0, "kLogitsTileM must be divisible by 16");
+static_assert(kLogitsTileN % kMfmaTileSize == 0, "kLogitsTileN must be divisible by 16");
+constexpr int kLogitsRowTilesPerBlock = kLogitsTileM / kMfmaTileSize;
+constexpr int kLogitsGroupsPerBlock = kLogitsTileN / kMfmaTileSize;
+constexpr int kLogitsThreadsPerBlock = 64 * kLogitsRowTilesPerBlock;
+static_assert(kLogitsRowTilesPerBlock > 0, "kLogitsTileM must be positive");
 
-__global__ __launch_bounds__(64)
+__global__ __launch_bounds__(kLogitsThreadsPerBlock)
 void logits_kernel(
     const hip_bfloat16* __restrict__ W_packed,
     const hip_bfloat16* __restrict__ Xpack,
@@ -1810,23 +1818,29 @@ void logits_kernel(
     const int* __restrict__ slot_ids,
     int Mpad, int Kpad,
     int tile_offset,
+    int tile_count,
     int row_offset,
     unsigned long long *max_packed,
     int vocab_limit)
 {
   const int tx = threadIdx.x;
   const int ty = threadIdx.y;
+  const int wave_idx = threadIdx.z;
   const int lane = ty * 16 + tx;
 
-  const int tile_m_local = blockIdx.x;
-  const int tile_global = tile_offset + tile_m_local;
+  const int tile_local_base = blockIdx.x * kLogitsRowTilesPerBlock;
+  const int tile_global_base = tile_offset + tile_local_base;
+  const int tile_limit = tile_offset + tile_count;
+  const int tile_global = tile_global_base + wave_idx;
+  const bool tile_active = (tile_global < tile_limit);
   const int group_base = blockIdx.y * kLogitsGroupsPerBlock;
   const int base_row = tile_global * 16;
+  const int row_tile_offset = wave_idx * 16;
 
-  __shared__ __align__(16) uint16_t sW[2][16 * 16];
+  __shared__ __align__(16) uint16_t sW[2][kLogitsRowTilesPerBlock][16 * 16];
   __shared__ __align__(16) uint16_t sX[2][kLogitsGroupsPerBlock][16 * 16];
   __shared__ int s_slot[kLogitsGroupsPerBlock * 16];
-  __shared__ float s_bias_rows[16];
+  __shared__ float s_bias_rows[kLogitsTileM];
 
   using float4v = __attribute__((ext_vector_type(4))) float;
   using short4v = __attribute__((ext_vector_type(4))) short;
@@ -1864,7 +1878,7 @@ void logits_kernel(
   }
   if (!any_group_active) return;
 
-  if (ty == 0) {
+  if (wave_idx == 0 && ty == 0) {
     const int col = tx;
     #pragma unroll
     for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
@@ -1877,13 +1891,15 @@ void logits_kernel(
       }
       s_slot[g * 16 + col] = slot_val;
     }
+  }
 
-    const int row = base_row + col;
+  if (ty == 0 && tile_active) {
+    const int row = base_row + tx;
     float bias_val = 0.0f;
     if (has_bias && row < M) {
       bias_val = bfloat16_to_float(bias[row]);
     }
-    s_bias_rows[col] = bias_val;
+    s_bias_rows[row_tile_offset + tx] = bias_val;
   }
   __syncthreads();
 
@@ -1896,84 +1912,27 @@ void logits_kernel(
   const int Ktiles = (Kpad + 15) / 16;
   const size_t tiles_per_row = static_cast<size_t>((Kpad + 15) / 16);
   const size_t tile_elems = 256;
+  const size_t tile_stride = tiles_per_row * tile_elems;
   const hip_bfloat16* w_tile_row_base =
-      W_packed + ((size_t)tile_global * tiles_per_row) * tile_elems;
+      tile_active ? W_packed + (size_t)tile_global * tile_stride : nullptr;
 
   const size_t x_stride = static_cast<size_t>(Bpad);
 
   {
     const int idx4 = lane * 4;
-    if (idx4 < 256) {
+    if (tile_active && idx4 < static_cast<int>(tile_elems)) {
       const hip_bfloat16* w_src = w_tile_row_base + idx4;
       const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
       uint32_t v0 = w_u32[0];
       uint32_t v1 = w_u32[1];
-      uint16_t* dst_tile = &sW[0][0] + idx4;
+      uint16_t* dst_tile = &sW[0][wave_idx][0] + idx4;
       dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
       dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
       dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
       dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
     }
 
-    const int row_in_tile = lane & 15;
-    const int col_group = lane >> 4;
-    const int col_base = col_group * 4;
-
-    #pragma unroll
-    for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
-      uint16_t vals[4] = {0, 0, 0, 0};
-      if (active_group[g]) {
-        const int k_row = row_in_tile;
-        if (k_row < K) {
-          const size_t row_offset = static_cast<size_t>(k_row) * x_stride +
-                                    b_base_sz_arr[g] + static_cast<size_t>(col_base);
-          const hip_bfloat16* x_src = Xpack + row_offset;
-          if (full_tile_arr[g]) {
-            const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
-            uint32_t xv0 = x_u32[0];
-            uint32_t xv1 = x_u32[1];
-            vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
-            vals[1] = static_cast<uint16_t>(xv0 >> 16);
-            vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
-            vals[3] = static_cast<uint16_t>(xv1 >> 16);
-          } else {
-            const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
-            if (col_base + 0 < cols_this_arr[g]) vals[0] = x_u16[0];
-            if (col_base + 1 < cols_this_arr[g]) vals[1] = x_u16[1];
-            if (col_base + 2 < cols_this_arr[g]) vals[2] = x_u16[2];
-            if (col_base + 3 < cols_this_arr[g]) vals[3] = x_u16[3];
-          }
-        }
-      }
-      uint16_t* dst_tile = &sX[0][g][row_in_tile * 16 + col_base];
-      #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        dst_tile[i] = vals[i];
-      }
-    }
-  }
-  __syncthreads();
-
-  int ping = 0;
-
-  for (int kt = 0; kt < Ktiles; ++kt) {
-    const int pong = ping ^ 1;
-
-    if (kt + 1 < Ktiles) {
-      const int idx4 = lane * 4;
-      if (idx4 < 256) {
-        const hip_bfloat16* w_src = w_tile_row_base +
-                                    (size_t)(kt + 1) * tile_elems + idx4;
-        const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
-        uint32_t v0 = w_u32[0];
-        uint32_t v1 = w_u32[1];
-        uint16_t* dst_tile = &sW[pong][0] + idx4;
-        dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
-        dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
-        dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
-        dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
-      }
-
+    if (wave_idx == 0) {
       const int row_in_tile = lane & 15;
       const int col_group = lane >> 4;
       const int col_base = col_group * 4;
@@ -1982,7 +1941,7 @@ void logits_kernel(
       for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
         uint16_t vals[4] = {0, 0, 0, 0};
         if (active_group[g]) {
-          const int k_row = (kt + 1) * 16 + row_in_tile;
+          const int k_row = row_in_tile;
           if (k_row < K) {
             const size_t row_offset = static_cast<size_t>(k_row) * x_stride +
                                       b_base_sz_arr[g] + static_cast<size_t>(col_base);
@@ -2004,34 +1963,98 @@ void logits_kernel(
             }
           }
         }
-        uint16_t* dst_tile = &sX[pong][g][row_in_tile * 16 + col_base];
+        uint16_t* dst_tile = &sX[0][g][row_in_tile * 16 + col_base];
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
           dst_tile[i] = vals[i];
         }
       }
     }
+  }
+  __syncthreads();
+
+  int ping = 0;
+
+  for (int kt = 0; kt < Ktiles; ++kt) {
+    const int pong = ping ^ 1;
+
+    if (kt + 1 < Ktiles) {
+      const int idx4 = lane * 4;
+      if (tile_active && idx4 < static_cast<int>(tile_elems)) {
+        const hip_bfloat16* w_src = w_tile_row_base +
+                                    (size_t)(kt + 1) * tile_elems + idx4;
+        const uint32_t* w_u32 = reinterpret_cast<const uint32_t*>(w_src);
+        uint32_t v0 = w_u32[0];
+        uint32_t v1 = w_u32[1];
+        uint16_t* dst_tile = &sW[pong][wave_idx][0] + idx4;
+        dst_tile[0] = static_cast<uint16_t>(v0 & 0xFFFFu);
+        dst_tile[1] = static_cast<uint16_t>(v0 >> 16);
+        dst_tile[2] = static_cast<uint16_t>(v1 & 0xFFFFu);
+        dst_tile[3] = static_cast<uint16_t>(v1 >> 16);
+      }
+
+      if (wave_idx == 0) {
+        const int row_in_tile = lane & 15;
+        const int col_group = lane >> 4;
+        const int col_base = col_group * 4;
+
+        #pragma unroll
+        for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
+          uint16_t vals[4] = {0, 0, 0, 0};
+          if (active_group[g]) {
+            const int k_row = (kt + 1) * 16 + row_in_tile;
+            if (k_row < K) {
+              const size_t row_offset = static_cast<size_t>(k_row) * x_stride +
+                                        b_base_sz_arr[g] + static_cast<size_t>(col_base);
+              const hip_bfloat16* x_src = Xpack + row_offset;
+              if (full_tile_arr[g]) {
+                const uint32_t* x_u32 = reinterpret_cast<const uint32_t*>(x_src);
+                uint32_t xv0 = x_u32[0];
+                uint32_t xv1 = x_u32[1];
+                vals[0] = static_cast<uint16_t>(xv0 & 0xFFFFu);
+                vals[1] = static_cast<uint16_t>(xv0 >> 16);
+                vals[2] = static_cast<uint16_t>(xv1 & 0xFFFFu);
+                vals[3] = static_cast<uint16_t>(xv1 >> 16);
+              } else {
+                const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x_src);
+                if (col_base + 0 < cols_this_arr[g]) vals[0] = x_u16[0];
+                if (col_base + 1 < cols_this_arr[g]) vals[1] = x_u16[1];
+                if (col_base + 2 < cols_this_arr[g]) vals[2] = x_u16[2];
+                if (col_base + 3 < cols_this_arr[g]) vals[3] = x_u16[3];
+              }
+            }
+          }
+          uint16_t* dst_tile = &sX[pong][g][row_in_tile * 16 + col_base];
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            dst_tile[i] = vals[i];
+          }
+        }
+      }
+    }
 
     __syncthreads();
 
-    short4v Areg;
-    const int kbase = ty * 4;
-    #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const int kidx = kbase + j;
-      Areg[j] = static_cast<short>(sW[ping][tx * 16 + kidx]);
-    }
-
-    #pragma unroll
-    for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
-      if (!active_group[g]) continue;
-      short4v Breg;
+    if (tile_active && any_group_active) {
+      short4v Areg;
+      const int kbase = ty * 4;
       #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const int kidx = kbase + j;
-        Breg[j] = static_cast<short>(sX[ping][g][kidx * 16 + tx]);
+        Areg[j] = static_cast<short>(sW[ping][wave_idx][tx * 16 + kidx]);
       }
-      accum[g] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, accum[g], 0, 0, 0);
+
+      #pragma unroll
+      for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
+        if (!active_group[g]) continue;
+        short4v Breg;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int kidx = kbase + j;
+          Breg[j] = static_cast<short>(sX[ping][g][kidx * 16 + tx]);
+        }
+        accum[g] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, accum[g], 0, 0, 0);
+      }
     }
 
     ping = pong;
@@ -2047,10 +2070,10 @@ void logits_kernel(
   const int r2_local = r2_global - row_offset;
   const int r3_local = r3_global - row_offset;
 
-  const int bias_base = ty * 4;
+  const int bias_base = row_tile_offset + ty * 4;
 
   for (int g = 0; g < kLogitsGroupsPerBlock; ++g) {
-    const bool active = active_group[g] && cols_this_arr[g] > 0;
+    const bool active = tile_active && active_group[g] && cols_this_arr[g] > 0;
     float lane_best_val = -FLT_MAX;
     int lane_best_idx = -1;
     float4v out_vals = {0.f, 0.f, 0.f, 0.f};
@@ -4281,13 +4304,14 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           exit(EXIT_FAILURE);
         }
         const hip_bfloat16 *w_out_packed = ctx->weights.out_packed16;
-        dim3 block_gemm(16, 4, 1);
-        dim3 grid_gemm(ctx->logits_tile_count, grid_y, 1);
+        dim3 block_gemm(16, 4, kLogitsRowTilesPerBlock);
+        int grid_x = (ctx->logits_tile_count + kLogitsRowTilesPerBlock - 1) / kLogitsRowTilesPerBlock;
+        dim3 grid_gemm(grid_x, grid_y, 1);
         logits_kernel<<<grid_gemm, block_gemm, 0, ctx->batch_stream>>>(
           w_out_packed, ctx->state.xpack_bf16, nullptr, nullptr,
           vocab, hidden_dim, batch, Bpad_logits, 0,
           ctx->d_batch_iota, Mpad_logits, Kpad_logits,
-          ctx->logits_tile_offset, ctx->logits_row_offset,
+          ctx->logits_tile_offset, ctx->logits_tile_count, ctx->logits_row_offset,
           ctx->state.argmax_packed, vocab);
         record_batch_event(ctx);
       }
