@@ -1042,7 +1042,23 @@ __global__ void pack_mxfp4_scales_row_to_tile32x8_kernel(
 
 // Grouped MLP2 matvec using MFMA and tile-packed MXFP4 weights.
 // For each selection m: y = W[layer,eid] @ g[m] + b[layer,eid]; then atomicAdd into e_agg[sid] with weight sel_w[m].
-__global__ __launch_bounds__(64)
+
+#ifndef GETP_MLP2_BLOCK_ROWS
+#define GETP_MLP2_BLOCK_ROWS 64
+#endif
+
+constexpr int MLP2_ROWS_PER_TILE = 32;
+constexpr int MLP2_BLOCK_ROWS = GETP_MLP2_BLOCK_ROWS;
+static_assert(MLP2_BLOCK_ROWS % MLP2_ROWS_PER_TILE == 0, "MLP2 block rows must be a multiple of 32.");
+constexpr int MLP2_WAVES_PER_BLOCK = MLP2_BLOCK_ROWS / MLP2_ROWS_PER_TILE;
+static_assert(MLP2_WAVES_PER_BLOCK >= 1, "MLP2 requires at least one wave per block.");
+static_assert(MLP2_WAVES_PER_BLOCK <= 16, "MLP2 waves per block exceeds practical limits.");
+constexpr int MLP2_BLOCK_THREADS = 64 * MLP2_WAVES_PER_BLOCK;
+static_assert(MLP2_BLOCK_THREADS <= 1024, "MLP2 block thread count exceeds HIP limit.");
+constexpr int MLP2_BLOCK_DIM_X = 32;
+constexpr int MLP2_BLOCK_DIM_Y = 2 * MLP2_WAVES_PER_BLOCK;
+
+__global__ __launch_bounds__(MLP2_BLOCK_THREADS, 4)
 void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
     float* __restrict__ e_agg,                // [slots, hidden_dim]
     const hip_bfloat16* __restrict__ gate_up_all, // [M, intermediate_dim] BF16
@@ -1060,14 +1076,15 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
     int layer, int n_experts,
     int eagg_stride) {
 
-  const int tx = threadIdx.x;                 // 0..31 (columns)
-  const int ty = threadIdx.y;                 // 0..1  (K slice group)
-  const int lane = ty * blockDim.x + tx;      // 0..63
-  const int lane_col = lane & 31;
-  const int lane_wave = lane >> 5;
+  const int tx = threadIdx.x;
+  const int ty = threadIdx.y;
+  const int wave_id = ty >> 1;
+  const int lane_in_wave = ((ty & 1) << 5) + tx;
+  const int lane_col = lane_in_wave & 31;
+  const int lane_wave = lane_in_wave >> 5;
 
-  const int tile_m  = blockIdx.x;             // along output rows (hidden_dim)
-  const int block_id = blockIdx.y;            // block covering up to 32 selections for one expert
+  const int tile_group = blockIdx.x;
+  const int block_id = blockIdx.y;
   if (block_id >= total_blocks) return;
 
   const int col0 = sel_block_cols[block_id];
@@ -1075,34 +1092,51 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
   const int eid = sel_block_eids[block_id];
   if (valid_cols <= 0) return;
 
-  const int base_row = tile_m * 32;
-
   const int Mout = hidden_dim;
   const int Kdim = intermediate_dim;
   const size_t mat_index = (size_t)layer * (size_t)n_experts + (size_t)eid;
   const hip_bfloat16* __restrict__ B = b_mlp2 ? (b_mlp2 + mat_index * (size_t)hidden_dim) : nullptr;
 
-  const bool full_row_tile = (base_row + 31) < Mout;
+  const int base_row_group = tile_group * MLP2_BLOCK_ROWS;
+  if (base_row_group >= Mout) return;
+
   const bool all_cols_active = (valid_cols == 32) && ((col0 + 31) < selections_M);
 
-  __shared__ __align__(16) uint16_t sWbf16[32 * 8];
+  __shared__ __align__(16) uint16_t sWbf16[MLP2_WAVES_PER_BLOCK * 32 * 8];
   __shared__ __align__(16) uint16_t sXbf16[8 * 32];
-  __shared__ __align__(16) float sBias[32];
+  __shared__ __align__(16) float sBias[MLP2_WAVES_PER_BLOCK * 32];
   __shared__ __align__(16) const hip_bfloat16* sGatePtrs[32];
   __shared__ __align__(16) int sSid[32];
   __shared__ __align__(16) float sSelW[32];
-  __shared__ __align__(16) uint8_t sScaleCodes[32];
-  short4v* __restrict__ sWvec = reinterpret_cast<short4v*>(sWbf16);
+  __shared__ __align__(16) uint8_t sScaleCodes[MLP2_WAVES_PER_BLOCK * 32];
   short4v* __restrict__ sXvec = reinterpret_cast<short4v*>(sXbf16);
 
-  if (lane < 32) {
-    const int row = base_row + lane;
-    sBias[lane] = (B && row < Mout) ? bfloat16_to_float(B[row]) : 0.f;
-    const int msel = col0 + lane;
-    const bool active = (lane < valid_cols) && (msel < selections_M);
-    sGatePtrs[lane] = active ? (gate_up_all + (size_t)msel * (size_t)intermediate_dim) : nullptr;
-    sSid[lane] = active ? sel_sids[msel] : -1;
-    sSelW[lane] = active ? sel_w[msel] : 0.f;
+  const int rows_remaining = Mout - base_row_group;
+  if (rows_remaining <= 0) return;
+  const int row_tiles_available = (rows_remaining + 31) / 32;
+  const int row_tiles = row_tiles_available < MLP2_WAVES_PER_BLOCK ? row_tiles_available : MLP2_WAVES_PER_BLOCK;
+  const bool tile_active = wave_id < row_tiles;
+
+  const int tile_m_global = tile_group * MLP2_WAVES_PER_BLOCK + wave_id;
+  const int base_row = base_row_group + wave_id * 32;
+  const bool full_row_tile = tile_active && ((base_row + 31) < Mout);
+
+  uint16_t* __restrict__ sWbf16_tile = sWbf16 + wave_id * 32 * 8;
+  uint8_t* __restrict__ sScaleCodes_tile = sScaleCodes + wave_id * 32;
+  float* __restrict__ sBias_tile = sBias + wave_id * 32;
+  short4v* __restrict__ sWvec_tile = reinterpret_cast<short4v*>(sWbf16_tile);
+
+  if (wave_id == 0 && lane_in_wave < 32) {
+    const int msel = col0 + lane_in_wave;
+    const bool active = (lane_in_wave < valid_cols) && (msel < selections_M);
+    sGatePtrs[lane_in_wave] = active ? (gate_up_all + (size_t)msel * (size_t)intermediate_dim) : nullptr;
+    sSid[lane_in_wave] = active ? sel_sids[msel] : -1;
+    sSelW[lane_in_wave] = active ? sel_w[msel] : 0.0f;
+  }
+
+  if (tile_active && lane_in_wave < 32) {
+    const int row = base_row + lane_in_wave;
+    sBias_tile[lane_in_wave] = (B && row < Mout) ? bfloat16_to_float(B[row]) : 0.f;
   }
   __syncthreads();
 
@@ -1117,57 +1151,61 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
   const uint8_t* __restrict__ Wscale = w_scales + mat_index * scales_per_mat;
 
   for (int kk = 0; kk < tiles_k; ++kk) {
-    const size_t tile_linear = (size_t)tile_m * tiles_per_row + (size_t)kk;
-    const size_t tile_base_byte = tile_linear * (size_t)128;
-    const size_t scale_base = tile_linear * (size_t)32;
     const bool full_k_tile = ((kk + 1) * 8) <= Kdim;
     const bool fast_w_tile = full_row_tile && full_k_tile;
     const bool fast_x_tile = all_cols_active && full_k_tile;
 
-    if (lane < 32) {
-      const int row = base_row + lane;
+    if (tile_active && lane_in_wave < 32) {
+      const size_t tile_linear = (size_t)tile_m_global * tiles_per_row + (size_t)kk;
+      const size_t scale_base = tile_linear * (size_t)32;
+      const int row = base_row + lane_in_wave;
       uint8_t scale_code = static_cast<uint8_t>(0x7F);
       if (row < Mout) {
-        scale_code = Wscale[scale_base + lane];
+        scale_code = Wscale[scale_base + lane_in_wave];
       }
-      sScaleCodes[lane] = scale_code;
+      sScaleCodes_tile[lane_in_wave] = scale_code;
     }
     __syncthreads();
 
-    int idx4 = lane * 4;
-    if (idx4 < 256) {
-      const int im = idx4 >> 3;
-      const int ik_base = idx4 & 0x7;
-      const int row = base_row + im;
-      const int col_base = kk * 8 + ik_base;
-      const int byte_off = tile_base_byte + (idx4 >> 1);
-      const uint16_t packed16 = *reinterpret_cast<const uint16_t*>(Wpack + byte_off);
-      const uint8_t scale_code = sScaleCodes[im];
-      const uint16_t* __restrict__ lut_row = MXFP4_DEQUANT_LUT_BF16[scale_code];
-      short4v wvec = {0, 0, 0, 0};
-      if (fast_w_tile) {
-        #pragma unroll
-        for (int t4 = 0; t4 < 4; ++t4) {
-          const uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
-          wvec[t4] = static_cast<short>(lut_row[nibble]);
-        }
-      } else {
-        const bool row_valid = (row < Mout);
-        #pragma unroll
-        for (int t4 = 0; t4 < 4; ++t4) {
-          const int col = col_base + t4;
-          if (row_valid && col < Kdim) {
+    if (tile_active) {
+      const size_t tile_linear = (size_t)tile_m_global * tiles_per_row + (size_t)kk;
+      const size_t tile_base_byte = tile_linear * (size_t)128;
+
+      int idx4 = lane_in_wave * 4;
+      if (idx4 < 256) {
+        const int im = idx4 >> 3;
+        const int ik_base = idx4 & 0x7;
+        const int row = base_row + im;
+        const int col_base = kk * 8 + ik_base;
+        const int byte_off = (int)(tile_base_byte + (size_t)(idx4 >> 1));
+        const uint16_t packed16 = *reinterpret_cast<const uint16_t*>(Wpack + byte_off);
+        const uint8_t scale_code = sScaleCodes_tile[im];
+        const uint16_t* __restrict__ lut_row = MXFP4_DEQUANT_LUT_BF16[scale_code];
+        short4v wvec = {0, 0, 0, 0};
+        if (fast_w_tile) {
+          #pragma unroll
+          for (int t4 = 0; t4 < 4; ++t4) {
             const uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
             wvec[t4] = static_cast<short>(lut_row[nibble]);
           }
+        } else {
+          const bool row_valid = (row < Mout);
+          #pragma unroll
+          for (int t4 = 0; t4 < 4; ++t4) {
+            const int col = col_base + t4;
+            if (row_valid && col < Kdim) {
+              const uint8_t nibble = static_cast<uint8_t>((packed16 >> (t4 * 4)) & 0xF);
+              wvec[t4] = static_cast<short>(lut_row[nibble]);
+            }
+          }
         }
+        sWvec_tile[im * 2 + (ik_base >> 2)] = wvec;
       }
-      sWvec[im * 2 + (ik_base >> 2)] = wvec;
     }
 
-    if (lane < 64) {
-      const int r = lane % 8;
-      const int c4 = (lane / 8) * 4;
+    if (wave_id == 0) {
+      const int r = lane_in_wave % 8;
+      const int c4 = (lane_in_wave / 8) * 4;
       const int k_row = kk * 8 + r;
       short4v xvec = {0, 0, 0, 0};
       const hip_bfloat16* x0 = sGatePtrs[c4 + 0];
@@ -1191,23 +1229,25 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
 
     __syncthreads();
 
-    const int kbase = ty * 4;
-    short4v Areg;
-    short4v Breg;
-    #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const int kidx = kbase + j;
-      const uint16_t a_bits = sWbf16[(lane_col) * 8 + kidx];
-      const uint16_t b_bits = sXbf16[kidx * 32 + lane_col];
-      Areg[j] = static_cast<short>(a_bits);
-      Breg[j] = static_cast<short>(b_bits);
+    if (tile_active) {
+      const int kbase = lane_wave * 4;
+      short4v Areg;
+      short4v Breg;
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int kidx = kbase + j;
+        const uint16_t a_bits = sWbf16_tile[(lane_col) * 8 + kidx];
+        const uint16_t b_bits = sXbf16[kidx * 32 + lane_col];
+        Areg[j] = static_cast<short>(a_bits);
+        Breg[j] = static_cast<short>(b_bits);
+      }
+      acc = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(Areg, Breg, acc, 0, 0, 0);
     }
-    acc = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(Areg, Breg, acc, 0, 0, 0);
 
     __syncthreads();
   }
 
-  if (lane_col < valid_cols) {
+  if (tile_active && lane_col < valid_cols) {
     const int sid = sSid[lane_col];
     if (sid >= 0) {
       const float ew = sSelW[lane_col];
@@ -1218,8 +1258,8 @@ void mlp2_accum_grouped_mfma_matvec_mxfp4_kernel(
         const int g_mod = g & 3;
         const int row_in_tile = ((group << 3) & 31) + lane_wave * 4 + g_mod;
         const int row = base_row + row_in_tile;
-        if (!full_row_tile && row >= Mout) continue;
-        float value = acc[g] + sBias[row_in_tile];
+        if (row >= Mout) continue;
+        float value = acc[g] + sBias_tile[row_in_tile];
         atomicAdd(&out_slot[row], ew * value);
       }
     }
@@ -4269,9 +4309,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         ctx->state.gate_up_all, ctx->state.mlp1_out_all,
         M_local, ctx->local_intermediate_dim, p->swiglu_limit);
 
-      // Launch MFMA MLP2 accumulation over 32-row tiles in hidden_dim
-      dim3 block3(32,2,1);
-      dim3 grid3((hidden_dim + 31) / 32, block_count, 1);
+      // Launch MFMA MLP2 accumulation over configurable BM rows per block (MLP2_BLOCK_ROWS)
+      dim3 block3(MLP2_BLOCK_DIM_X, MLP2_BLOCK_DIM_Y, 1);
+      dim3 grid3((hidden_dim + MLP2_BLOCK_ROWS - 1) / MLP2_BLOCK_ROWS, block_count, 1);
       mlp2_accum_grouped_mfma_matvec_mxfp4_kernel<<<grid3, block3, 0, ctx->batch_stream>>>(
         ctx->state.e_agg, ctx->state.gate_up_all,
         ctx->weights.w_mlp2_data, ctx->weights.w_mlp2_scales,
