@@ -4510,23 +4510,15 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     }
   }
 
-  // Final RMSNorm + logits across TP ranks with fused greedy sampling (tp_size == 2 enforced)
+  // Final RMSNorm + logits on a single GPU with greedy sampling
   if (host_next_tokens_out != nullptr) {
-    if (ctxs.size() != 2) {
-      fprintf(stderr, "[GPU] Expected tensor parallel size 2, got %zu.\n", ctxs.size());
+    if (ctxs.size() != 1) {
+      fprintf(stderr, "[GPU] Single-GPU path expected 1 context, got %zu.\n", ctxs.size());
       exit(EXIT_FAILURE);
     }
 
-    GPUContext *tp_leader = nullptr;
-    GPUContext *tp_follower = nullptr;
-    for (GPUContext *ctx : ctxs) {
-      if (ctx->tp_rank == 0) tp_leader = ctx;
-      else if (ctx->tp_rank == 1) tp_follower = ctx;
-    }
-    if (tp_leader == nullptr || tp_follower == nullptr) {
-      fprintf(stderr, "[GPU] Missing TP ranks (0/1) for fused logits path.\n");
-      exit(EXIT_FAILURE);
-    }
+    GPUContext *ctx = ctxs[0];
+    HIP_CHECK(hipSetDevice(ctx->device_id));
 
     int vocab = p->vocab_size;
     int Bpad_logits = ((batch + 15) / 16) * 16;
@@ -4535,86 +4527,68 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
     int batch_tiles = (batch + 15) / 16;
     int grid_y = (batch_tiles + kLogitsGroupsPerBlock - 1) / kLogitsGroupsPerBlock;
 
-    GPUContext *tp_pair[2] = {tp_leader, tp_follower};
-
     dim3 block_norm(128);
     dim3 grid_norm(1, batch);
     size_t shared_norm = block_norm.x * sizeof(float);
     dim3 block_pack_logits(256);
     dim3 grid_pack_logits((hidden_dim + block_pack_logits.x - 1) / block_pack_logits.x, batch);
 
-    for (GPUContext *ctx : tp_pair) {
-      HIP_CHECK(hipSetDevice(ctx->device_id));
-      rmsnorm_final_batched_kernel<<<grid_norm, block_norm, shared_norm, ctx->batch_stream>>>(
-        ctx->state.x, ctx->weights.rms_out_w,
-        hidden_dim, batch, ctx->d_slot_ids);
-      gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack_logits, block_pack_logits, 0, ctx->batch_stream>>>(
-        ctx->state.x, ctx->state.xpack_bf16,
-        hidden_dim, batch, Bpad_logits, hidden_dim, ctx->d_slot_ids);
+    rmsnorm_final_batched_kernel<<<grid_norm, block_norm, shared_norm, ctx->batch_stream>>>(
+      ctx->state.x, ctx->weights.rms_out_w,
+      hidden_dim, batch, ctx->d_slot_ids);
+    gather_pack_x_fp32_to_bf16_mfma_kernel<<<grid_pack_logits, block_pack_logits, 0, ctx->batch_stream>>>(
+      ctx->state.x, ctx->state.xpack_bf16,
+      hidden_dim, batch, Bpad_logits, hidden_dim, ctx->d_slot_ids);
 
-      if (batch > 0) {
-        int threads_init = 128;
-        int blocks_init = (batch + threads_init - 1) / threads_init;
-        init_argmax_packed_kernel<<<blocks_init, threads_init, 0, ctx->batch_stream>>>(
-          ctx->state.argmax_packed, batch);
-      }
+    if (batch > 0) {
+      int threads_init = 128;
+      int blocks_init = (batch + threads_init - 1) / threads_init;
+      init_argmax_packed_kernel<<<blocks_init, threads_init, 0, ctx->batch_stream>>>(
+        ctx->state.argmax_packed, batch);
     }
 
     if (batch > 0) {
-      for (GPUContext *ctx : tp_pair) {
-        HIP_CHECK(hipSetDevice(ctx->device_id));
-        if (ctx->logits_tile_count <= 0) {
-          fprintf(stderr, "[GPU] TP rank %d assigned zero logits tiles.\n", ctx->tp_rank);
-          exit(EXIT_FAILURE);
-        }
-        const hip_bfloat16 *w_out_packed = ctx->weights.out_packed16;
-        dim3 block_gemm(16, 4, kLogitsRowTilesPerBlock);
-        int grid_x = (ctx->logits_tile_count + kLogitsRowTilesPerBlock - 1) / kLogitsRowTilesPerBlock;
-        dim3 grid_gemm(grid_x, grid_y, 1);
-        logits_kernel<<<grid_gemm, block_gemm, 0, ctx->batch_stream>>>(
-          w_out_packed, ctx->state.xpack_bf16, nullptr, nullptr,
-          vocab, hidden_dim, batch, Bpad_logits, 0,
-          ctx->d_batch_iota, Mpad_logits, Kpad_logits,
-          ctx->logits_tile_offset, ctx->logits_tile_count, ctx->logits_row_offset,
-          ctx->state.argmax_packed, vocab);
-        record_batch_event(ctx);
-      }
-
-      HIP_CHECK(hipSetDevice(tp_leader->device_id));
-      stream_wait_on(tp_leader, tp_follower);
-
-      unsigned long long *tp_packed = tp_leader->state.tp_argmax_packed;
-      if (tp_packed == nullptr) {
-        fprintf(stderr, "[GPU] Leader TP argmax staging buffer missing.\n");
+      if (ctx->logits_tile_count <= 0) {
+        fprintf(stderr, "[GPU] Invalid logits tile assignment for single-GPU path.\n");
         exit(EXIT_FAILURE);
       }
-      size_t stride = (size_t)tp_leader->max_batch;
-      size_t bytes = (size_t)batch * sizeof(unsigned long long);
+      const hip_bfloat16 *w_out_packed = ctx->weights.out_packed16;
+      dim3 block_gemm(16, 4, kLogitsRowTilesPerBlock);
+      int grid_x = (ctx->logits_tile_count + kLogitsRowTilesPerBlock - 1) / kLogitsRowTilesPerBlock;
+      dim3 grid_gemm(grid_x, grid_y, 1);
+      logits_kernel<<<grid_gemm, block_gemm, 0, ctx->batch_stream>>>(
+        w_out_packed, ctx->state.xpack_bf16, nullptr, nullptr,
+        vocab, hidden_dim, batch, Bpad_logits, 0,
+        ctx->d_batch_iota, Mpad_logits, Kpad_logits,
+        ctx->logits_tile_offset, ctx->logits_tile_count, ctx->logits_row_offset,
+        ctx->state.argmax_packed, vocab);
 
+      unsigned long long *tp_packed = ctx->state.tp_argmax_packed;
+      if (tp_packed == nullptr) {
+        fprintf(stderr, "[GPU] Missing argmax staging buffer on single-GPU path.\n");
+        exit(EXIT_FAILURE);
+      }
+      size_t bytes = static_cast<size_t>(batch) * sizeof(unsigned long long);
       HIP_CHECK(hipMemcpyAsync(tp_packed,
-                               tp_leader->state.argmax_packed,
+                               ctx->state.argmax_packed,
                                bytes,
                                hipMemcpyDeviceToDevice,
-                               tp_leader->batch_stream));
-      HIP_CHECK(hipMemcpyPeerAsync(tp_packed + stride, tp_leader->device_id,
-                                   tp_follower->state.argmax_packed, tp_follower->device_id,
-                                   bytes, tp_leader->batch_stream));
+                               ctx->batch_stream));
 
       dim3 block_merge(128);
       dim3 grid_merge((batch + block_merge.x - 1) / block_merge.x);
-      merge_argmax_candidates_kernel<<<grid_merge, block_merge, 0, tp_leader->batch_stream>>>(
+      merge_argmax_candidates_kernel<<<grid_merge, block_merge, 0, ctx->batch_stream>>>(
         tp_packed,
-        tp_leader->d_next_tokens,
+        ctx->d_next_tokens,
         batch,
-        2,
-        tp_leader->max_batch);
+        1,
+        ctx->max_batch);
     }
 
-    HIP_CHECK(hipSetDevice(tp_leader->device_id));
-    HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, tp_leader->d_next_tokens,
-                             batch * sizeof(int), hipMemcpyDeviceToHost, tp_leader->batch_stream));
-    record_batch_event(tp_leader);
-    wait_batch_event_host(tp_leader);
+    HIP_CHECK(hipMemcpyAsync(host_next_tokens_out, ctx->d_next_tokens,
+                             batch * sizeof(int), hipMemcpyDeviceToHost, ctx->batch_stream));
+    record_batch_event(ctx);
+    wait_batch_event_host(ctx);
   }
 
   // // Keep follower activations aligned (optional)
@@ -4657,24 +4631,17 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
 
   Config *cfg = &transformer->config;
 
-  int desired_tp = (device_count >= 2) ? 2 : 1;
-  const char *env_tp = getenv("GETP_TP_SIZE");
-  if (env_tp && atoi(env_tp) > 0) desired_tp = atoi(env_tp);
-  if (desired_tp < 1) desired_tp = 1;
-  if (desired_tp > device_count) desired_tp = device_count;
-
-  int desired_dp = std::max(1, device_count / 2);
-  const char *env_dp = getenv("GETP_DP_SIZE");
-  if (env_dp && atoi(env_dp) > 0) desired_dp = atoi(env_dp);
-  if (desired_dp < 1) desired_dp = 1;
-  if (desired_dp * desired_tp > device_count) {
-    desired_dp = device_count / desired_tp;
-    if (desired_dp < 1) desired_dp = 1;
+  // Force single-GPU execution: tensor parallel = 1, data parallel = 1
+  int desired_tp = 1;
+  int desired_dp = 1;
+  if (device_count < desired_tp * desired_dp) {
+    fprintf(stderr, "[GPU] Requested single-GPU run but no devices available.\n");
+    exit(EXIT_FAILURE);
   }
 
   parallel_layout.tp_size = desired_tp;
   parallel_layout.dp_size = desired_dp;
-  int used_devices = parallel_layout.tp_size * parallel_layout.dp_size;
+  int used_devices = 1;
 
   if ((cfg->n_attn_heads % parallel_layout.tp_size) != 0 ||
       (cfg->n_kv_heads % parallel_layout.tp_size) != 0) {
