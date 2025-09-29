@@ -51,7 +51,7 @@
 
 static int get_default_window_attention_size() {
   static int value = []() {
-    const int fallback = 512;
+    const int fallback = 256;
     const char *env = getenv("GETP_WINDOW_ATTENTION");
     if (!env || !env[0]) {
       return fallback;
@@ -308,9 +308,9 @@ public:
     if (sliding_window_size_ > 0) {
       printf("  - Sliding window tokens on even layers: %d\n", std::min(sliding_window_size_, seq_len_));
     }
-    if (window_attention_size_ > 0) {
-      printf("  - Window attention tokens on odd layers: %d\n", std::min(window_attention_size_, seq_len_));
-    }
+    // if (window_attention_size_ > 0) {
+    //   printf("  - Window attention tokens on odd layers: %d\n", std::min(window_attention_size_, seq_len_));
+    // }
   }
 
   ~KVCacheManager() {
