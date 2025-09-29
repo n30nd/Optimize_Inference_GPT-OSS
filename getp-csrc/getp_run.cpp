@@ -81,7 +81,8 @@ typedef struct {
 
 enum LayerType {
   FULL_ATTENTION = 0,
-  SLIDING_WINDOW = 1
+  SLIDING_WINDOW = 1,
+  WINDOW_ATTENTION = 2
 };
 
 struct KVCacheDeviceData {
@@ -94,10 +95,17 @@ struct KVCacheDeviceData {
   int n_layers;
   int seq_len;
   int sliding_window_size;
+  int window_attention_size;
   int tokens_per_slot;
 
   __device__ __forceinline__ LayerType get_layer_type(int layer) const {
-    return (sliding_window_size > 0 && (layer % 2 == 0)) ? SLIDING_WINDOW : FULL_ATTENTION;
+    if (window_attention_size > 0 && (layer % 2 == 1)) {
+      return WINDOW_ATTENTION;
+    }
+    if (sliding_window_size > 0 && (layer % 2 == 0)) {
+      return SLIDING_WINDOW;
+    }
+    return FULL_ATTENTION;
   }
 
   __device__ __forceinline__ int layer_capacity(int layer) const {
@@ -132,7 +140,7 @@ struct KVCacheDeviceData {
     (void)slot_id;
     LayerType lt = get_layer_type(layer);
     int capacity = layer_capacities[layer];
-    if (lt == SLIDING_WINDOW && sliding_window_size > 0 && capacity > 0) {
+    if ((lt == SLIDING_WINDOW || lt == WINDOW_ATTENTION) && capacity > 0) {
       return pos % capacity;
     }
     return pos;
@@ -143,7 +151,7 @@ struct KVCacheDeviceData {
     (void)slot_id;
     LayerType lt = get_layer_type(layer);
     int capacity = layer_capacities[layer];
-    if (lt == SLIDING_WINDOW && sliding_window_size > 0 && capacity > 0) {
+    if ((lt == SLIDING_WINDOW || lt == WINDOW_ATTENTION) && capacity > 0) {
       if (current_pos < capacity) {
         return logical_pos;
       }
@@ -162,7 +170,7 @@ struct KVCacheDeviceData {
                                                       int *start_pos, int *end_pos) const {
     (void)slot_id;
     LayerType lt = get_layer_type(layer);
-    if (lt == SLIDING_WINDOW && sliding_window_size > 0) {
+    if ((lt == SLIDING_WINDOW || lt == WINDOW_ATTENTION) && layer_capacities[layer] > 0) {
       int capacity = layer_capacities[layer];
       int start = current_pos - capacity + 1;
       if (start < 0) start = 0;
@@ -177,12 +185,14 @@ struct KVCacheDeviceData {
 
 class KVCacheManager {
 public:
-  KVCacheManager(int max_batch, int n_layers, int seq_len, size_t kv_dim, int sliding_window_size)
+  KVCacheManager(int max_batch, int n_layers, int seq_len, size_t kv_dim,
+                 int sliding_window_size, int window_attention_size)
       : max_batch_(max_batch),
         n_layers_(n_layers),
         seq_len_(seq_len),
         kv_dim_(kv_dim),
         sliding_window_size_(sliding_window_size),
+        window_attention_size_(window_attention_size),
         tokens_per_slot_(0),
         key_cache_(nullptr),
         value_cache_(nullptr),
@@ -194,6 +204,9 @@ public:
       exit(EXIT_FAILURE);
     }
 
+    if (sliding_window_size_ < 0) sliding_window_size_ = 0;
+    if (window_attention_size_ < 0) window_attention_size_ = 0;
+
     layer_offsets_.resize(n_layers_);
     layer_capacities_.resize(n_layers_);
 
@@ -203,6 +216,8 @@ public:
       int capacity = seq_len_;
       if (lt == SLIDING_WINDOW && sliding_window_size_ > 0) {
         capacity = std::min(sliding_window_size_, seq_len_);
+      } else if (lt == WINDOW_ATTENTION && window_attention_size_ > 0) {
+        capacity = std::min(window_attention_size_, seq_len_);
       }
       if (capacity <= 0) capacity = 1;
       if (running > (size_t)std::numeric_limits<int>::max()) {
@@ -247,6 +262,7 @@ public:
     device_data.n_layers = n_layers_;
     device_data.seq_len = seq_len_;
     device_data.sliding_window_size = sliding_window_size_;
+    device_data.window_attention_size = window_attention_size_;
     device_data.tokens_per_slot = tokens_per_slot_;
     HIP_CHECK(hipMemcpy(d_device_data_, &device_data, sizeof(KVCacheDeviceData), hipMemcpyHostToDevice));
 
@@ -256,6 +272,9 @@ public:
            tokens_per_slot_, tokens_capacity / 1e3, total_gb);
     if (sliding_window_size_ > 0) {
       printf("  - Sliding window tokens on even layers: %d\n", std::min(sliding_window_size_, seq_len_));
+    }
+    if (window_attention_size_ > 0) {
+      printf("  - Window attention tokens on odd layers: %d\n", std::min(window_attention_size_, seq_len_));
     }
   }
 
@@ -296,7 +315,13 @@ public:
 
 private:
   LayerType host_layer_type(int layer) const {
-    return (sliding_window_size_ > 0 && (layer % 2 == 0)) ? SLIDING_WINDOW : FULL_ATTENTION;
+    if (window_attention_size_ > 0 && (layer % 2 == 1)) {
+      return WINDOW_ATTENTION;
+    }
+    if (sliding_window_size_ > 0 && (layer % 2 == 0)) {
+      return SLIDING_WINDOW;
+    }
+    return FULL_ATTENTION;
   }
 
   int max_batch_;
@@ -304,6 +329,7 @@ private:
   int seq_len_;
   size_t kv_dim_;
   int sliding_window_size_;
+  int window_attention_size_;
   int tokens_per_slot_;
   hip_bfloat16 *key_cache_;
   hip_bfloat16 *value_cache_;
@@ -4488,8 +4514,20 @@ void gpu_malloc_run_state(GPUContext *ctx, Config *p, int max_batch) {
 
   HIP_CHECK(hipMalloc(&s->qkv, B * (size_t)local_qkv_dim * sizeof(float)));
 
+  int window_attention = 512;
+  if (const char *env_window = getenv("GETP_WINDOW_ATTENTION")) {
+    int parsed = atoi(env_window);
+    if (parsed >= 0) {
+      window_attention = parsed;
+    }
+  }
+  if (window_attention > p->seq_len) {
+    window_attention = p->seq_len;
+  }
+
   s->kv_cache_manager = new KVCacheManager(max_batch, p->n_layers, p->seq_len,
-                                           (size_t)local_kv_dim, p->sliding_window);
+                                           (size_t)local_kv_dim, p->sliding_window,
+                                           window_attention);
 
   HIP_CHECK(hipMalloc(&s->logits_fp32, B * (size_t)p->vocab_size * sizeof(float)));
 
