@@ -2121,18 +2121,22 @@ void mlp1_grouped_mfma32_fused_swiglu_kernel(
   const float alpha = 1.702f;
   const int I = Mout >> 1;
 
-  int processed_tiles = 0;
-  const int opt_tiles = (col_tiles_per_block >= 2) ? 2 : 1;
-  const int col_base0 = col_block_base;
-  const int col_base1 = col_block_base + MLP_MFMA_N;
-  const bool tile_valid0 = (opt_tiles >= 1) && (col_base0 < Bpad_live);
-  const bool tile_valid1 = (opt_tiles >= 2) && (col_base1 < Bpad_live);
-  const bool all_cols_active0 = tile_valid0 && (col_base0 + MLP_MFMA_N - 1) < Btotal_live;
-  const bool all_cols_active1 = tile_valid1 && (col_base1 + MLP_MFMA_N - 1) < Btotal_live;
+  int cn = 0;
+  for (; cn + 1 < col_tiles_per_block; cn += 2) {
+    const int col0 = col_block_base + cn * MLP_MFMA_N;
+    if (col0 >= Bpad_live) {
+      cn = col_tiles_per_block;
+      break;
+    }
+    const int col1 = col0 + MLP_MFMA_N;
+    const bool tile0_valid = col0 < Bpad_live;
+    const bool tile1_valid = col1 < Bpad_live;
+    const bool all_cols_active0 = tile0_valid && (col0 + MLP_MFMA_N - 1) < Btotal_live;
+    const bool all_cols_active1 = tile1_valid && (col1 + MLP_MFMA_N - 1) < Btotal_live;
 
-  if (tile_valid0 || tile_valid1) {
     float16v acc0 = {0.0f};
     float16v acc1 = {0.0f};
+
     for (int kk = 0; kk < tiles_k; ++kk) {
       short4v w_frag = {0, 0, 0, 0};
       if (tile_active) {
@@ -2140,50 +2144,49 @@ void mlp1_grouped_mfma32_fused_swiglu_kernel(
         w_frag = load_mlp1_w_fragment(Wpack, tile_linear, lane_col, lane_wave);
       }
 
-      if (tile_valid0) {
+      if (tile0_valid) {
         if (wave_id == 0) {
           load_x_tile_to_shared(sXbf16, x_block, lane_in_wave, kk, block_cols_aligned,
-                                0, K, col_base0, Btotal_live, all_cols_active0);
+                                cn * MLP_MFMA_N, K, col0, Btotal_live, all_cols_active0);
         }
         __syncthreads();
         if (tile_active) {
-          const short4v Breg = load_mlp1_x_fragment(sXbf16, lane_col, lane_wave);
-          acc0 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(w_frag, Breg, acc0, 0, 0, 0);
+          const short4v Breg0 = load_mlp1_x_fragment(sXbf16, lane_col, lane_wave);
+          acc0 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(w_frag, Breg0, acc0, 0, 0, 0);
         }
         __syncthreads();
       }
 
-      if (tile_valid1) {
+      if (tile1_valid) {
         if (wave_id == 0) {
           load_x_tile_to_shared(sXbf16, x_block, lane_in_wave, kk, block_cols_aligned,
-                                MLP_MFMA_N, K, col_base1, Btotal_live, all_cols_active1);
+                                (cn + 1) * MLP_MFMA_N, K, col1, Btotal_live, all_cols_active1);
         }
         __syncthreads();
         if (tile_active) {
-          const short4v Breg = load_mlp1_x_fragment(sXbf16, lane_col, lane_wave);
-          acc1 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(w_frag, Breg, acc1, 0, 0, 0);
+          const short4v Breg1 = load_mlp1_x_fragment(sXbf16, lane_col, lane_wave);
+          acc1 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(w_frag, Breg1, acc1, 0, 0, 0);
         }
         __syncthreads();
       }
     }
 
-    if (tile_valid0) {
+    if (tile0_valid) {
       store_gate_tile(acc0, lane_col, lane_wave, lane_in_wave, base_row, Mout, I,
-                      tile_active, col_base0, Btotal_live, has_bias,
+                      tile_active, col0, Btotal_live, has_bias,
                       sBias_tile, gate_up_out, out_stride_cols, swiglu_limit, alpha);
     }
 
-    if (tile_valid1) {
+    if (tile1_valid) {
       store_gate_tile(acc1, lane_col, lane_wave, lane_in_wave, base_row, Mout, I,
-                      tile_active, col_base1, Btotal_live, has_bias,
+                      tile_active, col1, Btotal_live, has_bias,
                       sBias_tile, gate_up_out, out_stride_cols, swiglu_limit, alpha);
     }
 
-    processed_tiles = (tile_valid0 ? 1 : 0) + (tile_valid1 ? 1 : 0);
     __syncthreads();
   }
 
-  for (int cn = processed_tiles; cn < col_tiles_per_block; ++cn) {
+  for (; cn < col_tiles_per_block; ++cn) {
     const int col0 = col_block_base + cn * MLP_MFMA_N;
     if (col0 >= Bpad_live) continue;
     const bool all_cols_active = (col0 + MLP_MFMA_N - 1) < Btotal_live;
