@@ -695,10 +695,8 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout(
     const hip_bfloat16* __restrict__ W_packed,
     const hip_bfloat16* __restrict__ Xpack,
     float* __restrict__ dst,
-    const hip_bfloat16* __restrict__ bias,  // nullable
     int M, int K, int B, int Bpad,
     int out_stride,
-    const int* __restrict__ slot_ids,
     int Mpad, int Kpad)
 {
   const int tx = threadIdx.x;
@@ -739,8 +737,6 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout(
   for (int rg = 0; rg < GEMM_WOUT_ROW_GROUPS; ++rg) {
     dmn[rg] = float4v{0.f, 0.f, 0.f, 0.f};
   }
-
-  const bool use_slot_ids = slot_ids != nullptr;
 
   // Preload first W and X tiles (kk = 0).
   if (group == 0 && lane < 32) {
@@ -841,8 +837,7 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout(
 
   const int col = base_col + tx;
   if (col < B) {
-    const int sid = use_slot_ids ? slot_ids[col] : col;
-    float* out_s = dst + (size_t)sid * (size_t)out_stride;
+    float* out_s = dst + (size_t)col * (size_t)out_stride;
 
     #pragma unroll
     for (int rg = 0; rg < GEMM_WOUT_ROW_GROUPS; ++rg) {
@@ -850,16 +845,9 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout(
       const int row_base = base_row_rg[rg] + ty * 4;
       if (row_base >= M) continue;
 
-      float vals[4] = {dmn[rg].x, dmn[rg].y, dmn[rg].z, dmn[rg].w};
+      const float vals[4] = {dmn[rg].x, dmn[rg].y, dmn[rg].z, dmn[rg].w};
 
       if (row_base + 3 < M) {
-        if (bias) {
-          const float4 bias_vec = bfloat16_to_float4(bias + row_base);
-          vals[0] += bias_vec.x;
-          vals[1] += bias_vec.y;
-          vals[2] += bias_vec.z;
-          vals[3] += bias_vec.w;
-        }
         float4 out_vec = {vals[0], vals[1], vals[2], vals[3]};
         reinterpret_cast<float4*>(out_s + row_base)[0] = out_vec;
       } else {
@@ -867,8 +855,7 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout(
         for (int i = 0; i < 4; ++i) {
           const int row = row_base + i;
           if (row < M) {
-            const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
-            out_s[row] = vals[i] + biasv;
+            out_s[row] = vals[i];
           }
         }
       }
@@ -2986,8 +2973,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       dim3 gridG((unsigned int)((Mpad3 + tile_rows - 1) / tile_rows),
                  (unsigned int)((Bpad3 + tile_cols - 1) / tile_cols));
       gemm16x16_mfma_f32_packedW_batched_scatter_bias_wout<<<gridG, blockG, 0, gpu_ctx->batch_stream>>>(
-        w_out_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.logits_fp32, /*bias*/nullptr,
-        Mout, Kout, batch, Bpad3, Mout, /*slot_ids*/nullptr, Mpad3, Kpad3);
+        w_out_packed, gpu_ctx->state.xpack_bf16, gpu_ctx->state.logits_fp32,
+        Mout, Kout, batch, Bpad3, Mout, Mpad3, Kpad3);
     }
 
     // Launch optimized argmax kernel: one block per batch element
