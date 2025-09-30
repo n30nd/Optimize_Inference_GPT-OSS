@@ -182,7 +182,7 @@ typedef struct {
   float *tb2;
   float *router_score;
   float *e_agg;
-  hip_bfloat16 *qkv;
+  float *qkv;
 
   float *mask;
   float *cos_vals;
@@ -214,6 +214,7 @@ typedef struct {
   int sliding_layers;
   int full_layers;
   int sliding_window_tokens;
+  int full_window_tokens;
 } GPURunState;
 
 // Per-GPU device context
@@ -340,7 +341,7 @@ __global__ __launch_bounds__(64)
 void gemm16x16_mfma_f32_packedW_batched_scatter_bias_qkv(
     const hip_bfloat16* __restrict__ W_packed,
     const hip_bfloat16* __restrict__ Xpack,
-    hip_bfloat16* __restrict__ dst,
+    float* __restrict__ dst,
     const hip_bfloat16* __restrict__ bias,  // nullable
     int M, int K, int B, int Bpad,
     int out_stride,
@@ -442,14 +443,14 @@ void gemm16x16_mfma_f32_packedW_batched_scatter_bias_qkv(
   const int col = base_col + tx;
   if (col < B) {
     const int sid = slot_ids[col];
-    hip_bfloat16* out_s = dst + (size_t)sid * (size_t)out_stride;
+    float* out_s = dst + (size_t)sid * (size_t)out_stride;
     // Each thread writes 4 rows: row = base_row + (ty*4 + i)
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
       const int row = base_row + (ty * 4 + i);
       if (row < M) {
         const float biasv = bias ? bfloat16_to_float(bias[row]) : 0.f;
-        out_s[row] = float_to_bfloat16(dmn[i] + biasv);
+        out_s[row] = dmn[i] + biasv;
       }
     }
   }
@@ -913,7 +914,7 @@ __global__ void pack_convert_fp32_to_bf16_tiles32x8_kernel(
 
 
 // Batched RoPE: x is [B, n_heads*head_dim], cos/sin per batch
-__global__ void apply_rotary_emb_kernel_float_batched(hip_bfloat16 *x, const float *cos, const float *sin,
+__global__ void apply_rotary_emb_kernel_float_batched(float *x, const float *cos, const float *sin,
                                                      int n_heads, int head_dim, int batch, int x_stride, int cs_stride,
                                                      const int *slot_ids) {
   int h = blockIdx.x;
@@ -922,19 +923,19 @@ __global__ void apply_rotary_emb_kernel_float_batched(hip_bfloat16 *x, const flo
   int half = head_dim / 2;
   if (b < batch && h < n_heads && i < half) {
     int sid = slot_ids[b];
-    hip_bfloat16 *x_b = x + (size_t)sid * (size_t)x_stride;
+    float *x_b = x + (size_t)sid * (size_t)x_stride;
     const float *cos_b = cos + (size_t)sid * (size_t)cs_stride;
     const float *sin_b = sin + (size_t)sid * (size_t)cs_stride;
     int idx1 = h * head_dim + i;
     int idx2 = idx1 + half;
-    float x1 = bfloat16_to_float(x_b[idx1]);
-    float x2 = bfloat16_to_float(x_b[idx2]);
+    float x1 = x_b[idx1];
+    float x2 = x_b[idx2];
     float c  = cos_b[i];
     float s  = sin_b[i];
     float o1 = x1 * c - x2 * s;
     float o2 = x2 * c + x1 * s;
-    x_b[idx1] = float_to_bfloat16(o1);
-    x_b[idx2] = float_to_bfloat16(o2);
+    x_b[idx1] = o1;
+    x_b[idx2] = o2;
   }
 }
 
@@ -1112,7 +1113,7 @@ __device__ __forceinline__ float4 bfloat16_to_float4(const hip_bfloat16 *bf16_pt
 
 __global__ __launch_bounds__(64)
 void paged_flash_attention_kernel_sliding(
-    const hip_bfloat16 * __restrict__ all_q,
+    const float * __restrict__ all_q,
     const hip_bfloat16 * __restrict__ key_cache_sliding,
     const hip_bfloat16 * __restrict__ value_cache_sliding,
     const hip_bfloat16 * __restrict__ attn_sinks,
@@ -1145,7 +1146,7 @@ void paged_flash_attention_kernel_sliding(
 
   int pos = pos_list[b];
 
-  const hip_bfloat16 *q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
+  const float *q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
   const hip_bfloat16 *key_cache_layer = kv_cache_layer_ptr(key_cache_sliding, sid, sliding_layer_index_param,
                                                            sliding_layers, layer_capacity, kv_dim);
   const hip_bfloat16 *value_cache_layer = kv_cache_layer_ptr(value_cache_sliding, sid, sliding_layer_index_param,
@@ -1164,17 +1165,11 @@ void paged_flash_attention_kernel_sliding(
   const int att_slots = layer_capacity + 1;
   extern __shared__ unsigned char smem_raw[];
   float *shared_att_paged = reinterpret_cast<float*>(smem_raw);
-  short *shared_q_bf16 = reinterpret_cast<short*>(shared_att_paged + att_slots);
+  float *shared_q = shared_att_paged + att_slots;
 
   const int head_dim_aligned = round_up16(head_dim);
   for (int idx = threadIdx.x; idx < head_dim_aligned; idx += blockDim.x) {
-    short q_short = 0;
-    if (idx < head_dim) {
-      union { hip_bfloat16 b; unsigned short u; } uq;
-      uq.b = q_head[idx];
-      q_short = static_cast<short>(uq.u);
-    }
-    shared_q_bf16[idx] = q_short;
+    shared_q[idx] = (idx < head_dim) ? q_head[idx] : 0.f;
   }
   __syncthreads();
 
@@ -1191,9 +1186,8 @@ void paged_flash_attention_kernel_sliding(
 
   const hip_bfloat16 *key_head = key_cache_layer + (size_t)head_base;
   const hip_bfloat16 *value_head = value_cache_layer + (size_t)head_base;
+  const int dot_dim = min(head_dim, kv_dim);
 
-  using float4v = __attribute__((ext_vector_type(4))) float;
-  using short4v = __attribute__((ext_vector_type(4))) short;
   __shared__ int sColPos[16];
 
   for (int col0 = 0; col0 < att_len; col0 += 16) {
@@ -1211,46 +1205,16 @@ void paged_flash_attention_kernel_sliding(
     }
     __syncthreads();
 
-    float4v acc = {0.f, 0.f, 0.f, 0.f};
-    const int Ktiles = (head_dim + 15) / 16;
-    for (int kk = 0; kk < Ktiles; ++kk) {
-      const int kbase = ty * 4;
-      const int k_col_base = kk * 16 + kbase;
-      const int cp = sColPos[tx];
-      short4v Areg;
-      short4v Breg;
-      ushort4v kval4 = {0u, 0u, 0u, 0u};
-
-      if (cp >= 0 && k_col_base < head_dim) {
-        const hip_bfloat16 *k_ptr = key_head + (size_t)cp * (size_t)kv_dim + (size_t)k_col_base;
-        if ((k_col_base + 3) < head_dim) {
-          kval4 = *reinterpret_cast<const ushort4v*>(k_ptr);
-        } else {
-          #pragma unroll
-          for (int t = 0; t < 4; ++t) {
-            const int idx = k_col_base + t;
-            if (idx < head_dim) {
-              union { hip_bfloat16 b; unsigned short u; } uk;
-              uk.b = k_ptr[t];
-              kval4[t] = uk.u;
-            }
-          }
-        }
+    float partial = 0.f;
+    const int cp = sColPos[tx];
+    if (col_in_range && cp >= 0) {
+      const hip_bfloat16 *k_ptr = key_head + (size_t)cp * (size_t)kv_dim;
+      for (int k = ty; k < dot_dim; k += 4) {
+        float q_val = shared_q[k];
+        float k_val = bfloat16_to_float(k_ptr[k]);
+        partial += q_val * k_val;
       }
-
-      #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const int kij = kbase + j;
-        const int k_abs = k_col_base + j;
-        Areg[j] = (tx == kij && k_abs < head_dim) ? shared_q_bf16[k_abs] : (short)0;
-        short kval = (k_abs < head_dim) ? static_cast<short>(kval4[j]) : (short)0;
-        Breg[j] = kval;
-      }
-
-      acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
     }
-
-    float partial = acc.x + acc.y + acc.z + acc.w;
     partial += __shfl_xor(partial, 16, 64);
     partial += __shfl_xor(partial, 32, 64);
 
@@ -1359,7 +1323,7 @@ void paged_flash_attention_kernel_sliding(
 // Flash-decoder style full attention: stream softmax and stage V tiles in shared memory.
 __global__ __launch_bounds__(64)
 void paged_flash_attention_kernel_full(
-    const hip_bfloat16 * __restrict__ all_q,
+    const float * __restrict__ all_q,
     const hip_bfloat16 * __restrict__ key_cache_full,
     const hip_bfloat16 * __restrict__ value_cache_full,
     const hip_bfloat16 * __restrict__ attn_sinks,
@@ -1367,6 +1331,7 @@ void paged_flash_attention_kernel_full(
     int head_dim, int kv_dim, int kv_mul,
     int n_heads, int seq_len, int layer,
     int full_layer_index_param, int full_layers,
+    int layer_capacity,
     const int * __restrict__ pos_list,
     int batch,
     int q_stride,
@@ -1379,7 +1344,6 @@ void paged_flash_attention_kernel_full(
   if (h >= n_heads || b >= batch) return;
 
   int sid = slot_ids ? slot_ids[b] : b;
-  const int layer_capacity = seq_len;
   float *output = all_output + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
 
   const bool valid_cache = key_cache_full && value_cache_full &&
@@ -1394,7 +1358,7 @@ void paged_flash_attention_kernel_full(
 
   int pos = pos_list[b];
 
-  const hip_bfloat16 *q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
+  const float *q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
   const hip_bfloat16 *key_cache_layer = kv_cache_layer_ptr(key_cache_full, sid, full_layer_index_param,
                                                            full_layers, layer_capacity, kv_dim);
   const hip_bfloat16 *value_cache_layer = kv_cache_layer_ptr(value_cache_full, sid, full_layer_index_param,
@@ -1404,13 +1368,18 @@ void paged_flash_attention_kernel_full(
   if (att_len > layer_capacity) att_len = layer_capacity;
   if (att_len < 0) att_len = 0;
   const int token_count = att_len;
-  int cache_base = pos - (token_count - 1);
-  if (cache_base < 0) cache_base = 0;
+  int write_pos_mod = (layer_capacity > 0) ? (pos % layer_capacity) : 0;
+  if (layer_capacity > 0 && write_pos_mod < 0) write_pos_mod += layer_capacity;
+  int cache_base = write_pos_mod;
+  if (token_count > 0 && layer_capacity > 0) {
+    cache_base = write_pos_mod - (token_count - 1);
+    if (cache_base < 0) cache_base += layer_capacity;
+  }
 
   const int head_dim_aligned = round_up16(head_dim);
   extern __shared__ unsigned char smem_raw[];
-  short *shared_q_bf16 = reinterpret_cast<short*>(smem_raw);
-  hip_bfloat16 *shared_v = reinterpret_cast<hip_bfloat16*>(shared_q_bf16 + head_dim_aligned);
+  float *shared_q = reinterpret_cast<float*>(smem_raw);
+  hip_bfloat16 *shared_v = reinterpret_cast<hip_bfloat16*>(shared_q + head_dim_aligned);
   size_t v_words = (size_t)TILE_TOKENS * (size_t)head_dim;
   hip_bfloat16 *shared_v_end = shared_v + v_words;
   if (v_words & 1) {
@@ -1420,13 +1389,7 @@ void paged_flash_attention_kernel_full(
   float *sh_probs = sh_scores + TILE_TOKENS;
 
   for (int idx = threadIdx.x; idx < head_dim_aligned; idx += blockDim.x) {
-    short q_short = 0;
-    if (idx < head_dim) {
-      union { hip_bfloat16 b; unsigned short u; } uq;
-      uq.b = q_head[idx];
-      q_short = static_cast<short>(uq.u);
-    }
-    shared_q_bf16[idx] = q_short;
+    shared_q[idx] = (idx < head_dim) ? q_head[idx] : 0.f;
   }
   __syncthreads();
 
@@ -1438,9 +1401,8 @@ void paged_flash_attention_kernel_full(
 
   const hip_bfloat16 *key_head = key_cache_layer + (size_t)head_base;
   const hip_bfloat16 *value_head = value_cache_layer + (size_t)head_base;
+  const int dot_dim = min(head_dim, kv_dim);
 
-  using float4v = __attribute__((ext_vector_type(4))) float;
-  using short4v = __attribute__((ext_vector_type(4))) short;
   __shared__ int sColPos[TILE_TOKENS];
   __shared__ float s_tile_pscale;
   __shared__ int s_tile_count;
@@ -1469,55 +1431,33 @@ void paged_flash_attention_kernel_full(
     const bool col_in_range = (tx < tile_count);
 
     if (ty == 0 && tx < TILE_TOKENS) {
-      sColPos[tx] = col_in_range ? (cache_base + col) : -1;
+      if (col_in_range) {
+        int cp = cache_base + col;
+        if (layer_capacity > 0) {
+          while (cp >= layer_capacity) cp -= layer_capacity;
+        }
+        sColPos[tx] = cp;
+      } else {
+        sColPos[tx] = -1;
+      }
     }
     __syncthreads();
 
-    float4v acc = {0.f, 0.f, 0.f, 0.f};
-    const int Ktiles = (head_dim + 15) / 16;
-    for (int kk = 0; kk < Ktiles; ++kk) {
-      const int kbase = ty * 4;
-      const int k_col_base = kk * 16 + kbase;
-      const int cp = sColPos[tx];
-      short4v Areg;
-      short4v Breg;
-      ushort4v kval4 = {0u, 0u, 0u, 0u};
-
-      if (cp >= 0 && k_col_base < head_dim) {
-        const hip_bfloat16 *k_ptr = key_head + (size_t)cp * (size_t)kv_dim + (size_t)k_col_base;
-        if ((k_col_base + 3) < head_dim) {
-          kval4 = *reinterpret_cast<const ushort4v*>(k_ptr);
-        } else {
-          #pragma unroll
-          for (int t = 0; t < 4; ++t) {
-            const int idx = k_col_base + t;
-            if (idx < head_dim) {
-              union { hip_bfloat16 b; unsigned short u; } uk;
-              uk.b = k_ptr[t];
-              kval4[t] = uk.u;
-            }
-          }
-        }
+    float partial = 0.f;
+    const int cp = sColPos[tx];
+    if (col_in_range && cp >= 0) {
+      const hip_bfloat16 *k_ptr = key_head + (size_t)cp * (size_t)kv_dim;
+      for (int k = ty; k < dot_dim; k += 4) {
+        float q_val = shared_q[k];
+        float k_val = bfloat16_to_float(k_ptr[k]);
+        partial += q_val * k_val;
       }
-
-      #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const int kij = kbase + j;
-        const int k_abs = k_col_base + j;
-        Areg[j] = (tx == kij && k_abs < head_dim) ? shared_q_bf16[k_abs] : (short)0;
-        short kval = (k_abs < head_dim) ? static_cast<short>(kval4[j]) : (short)0;
-        Breg[j] = kval;
-      }
-
-      acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(Areg, Breg, acc, 0, 0, 0);
     }
-
-    float partial = acc.x + acc.y + acc.z + acc.w;
     partial += __shfl_xor(partial, 16, 64);
     partial += __shfl_xor(partial, 32, 64);
 
     if (ty == 0 && tx < TILE_TOKENS) {
-      float score = (sColPos[tx] >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
+      float score = (tx < tile_count && sColPos[tx] >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
       sh_scores[tx] = score;
     }
     __syncthreads();
@@ -2034,7 +1974,7 @@ static __device__ __forceinline__ void store_gate_tile(
       float up = value;
       gate = fminf(swiglu_limit, gate);
       up = fminf(swiglu_limit, fmaxf(-swiglu_limit, up));
-      const float inv_denom = __fdividef(1.f, 1.f + __expf(-alpha * gate));
+      const float inv_denom = 1.0f / (1.0f + expf(-alpha * gate));
       gate *= inv_denom;
       const int row_half = row >> 1;
       if (row_half < I) {
@@ -2598,7 +2538,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
   // New paged attention KV writers that handle sliding window caches
   struct PagedKVWriterV {
-    static __global__ void run(const hip_bfloat16 *qkv,
+    static __global__ void run(const float *qkv,
                                hip_bfloat16 *value_cache_sliding,
                                hip_bfloat16 *value_cache_full,
                                int layer,
@@ -2610,6 +2550,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
                                int sliding_layers,
                                int full_layers,
                                int sliding_window,
+                               int full_window,
                                int seq_len,
                                const int *pos_list,
                                const int *slot_ids) {
@@ -2620,8 +2561,11 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         int pos = pos_list[b];
         const bool sliding_enabled = (sliding_window > 0) && (sliding_layers > 0);
         const bool layer_sliding = sliding_enabled && uses_sliding_window(layer);
-        const int capacity = layer_sliding ? sliding_window : seq_len;
-        const int write_pos = layer_sliding ? (pos % capacity) : pos;
+        const int full_capacity = (full_window > 0) ? full_window : seq_len;
+        const int capacity = layer_sliding ? sliding_window : full_capacity;
+        if (capacity <= 0) return;
+        int write_pos = pos % capacity;
+        if (write_pos < 0) write_pos += capacity;
         hip_bfloat16 *value_ptr = nullptr;
         if (layer_sliding) {
           if (!value_cache_sliding) return;
@@ -2630,17 +2574,17 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         } else {
           if (!value_cache_full) return;
           int layer_idx = sliding_enabled ? full_layer_index(layer) : layer;
-          value_ptr = kv_cache_layer_ptr(value_cache_full, sid, layer_idx, full_layers, seq_len, kv_dim);
+          value_ptr = kv_cache_layer_ptr(value_cache_full, sid, layer_idx, full_layers, full_capacity, kv_dim);
         }
-        const hip_bfloat16 *v_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)v_offset;
+        const float *v_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)v_offset;
         hip_bfloat16 *v_dst = value_ptr + (size_t)write_pos * (size_t)kv_dim;
-        v_dst[i] = v_src[i];
+        v_dst[i] = float_to_bfloat16(v_src[i]);
       }
     }
   };
   
   struct PagedKVWriterK {
-    static __global__ void run(const hip_bfloat16 *qkv,
+    static __global__ void run(const float *qkv,
                                hip_bfloat16 *key_cache_sliding,
                                hip_bfloat16 *key_cache_full,
                                int layer,
@@ -2652,6 +2596,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
                                int sliding_layers,
                                int full_layers,
                                int sliding_window,
+                               int full_window,
                                int seq_len,
                                const int *pos_list,
                                const int *slot_ids) {
@@ -2662,8 +2607,11 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         int pos = pos_list[b];
         const bool sliding_enabled = (sliding_window > 0) && (sliding_layers > 0);
         const bool layer_sliding = sliding_enabled && uses_sliding_window(layer);
-        const int capacity = layer_sliding ? sliding_window : seq_len;
-        const int write_pos = layer_sliding ? (pos % capacity) : pos;
+        const int full_capacity = (full_window > 0) ? full_window : seq_len;
+        const int capacity = layer_sliding ? sliding_window : full_capacity;
+        if (capacity <= 0) return;
+        int write_pos = pos % capacity;
+        if (write_pos < 0) write_pos += capacity;
         hip_bfloat16 *key_ptr = nullptr;
         if (layer_sliding) {
           if (!key_cache_sliding) return;
@@ -2672,11 +2620,11 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         } else {
           if (!key_cache_full) return;
           int layer_idx = sliding_enabled ? full_layer_index(layer) : layer;
-          key_ptr = kv_cache_layer_ptr(key_cache_full, sid, layer_idx, full_layers, seq_len, kv_dim);
+          key_ptr = kv_cache_layer_ptr(key_cache_full, sid, layer_idx, full_layers, full_capacity, kv_dim);
         }
-        const hip_bfloat16 *k_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)k_offset;
+        const float *k_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)k_offset;
         hip_bfloat16 *k_dst = key_ptr + (size_t)write_pos * (size_t)kv_dim;
-        k_dst[i] = k_src[i];
+        k_dst[i] = float_to_bfloat16(k_src[i]);
       }
     }
   };
@@ -2736,6 +2684,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         gpu_ctx->state.sliding_layers,
         gpu_ctx->state.full_layers,
         gpu_ctx->state.sliding_window_tokens,
+        gpu_ctx->state.full_window_tokens,
         p->seq_len,
         gpu_ctx->d_pos_list,
         gpu_ctx->d_slot_ids);
@@ -2772,6 +2721,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         gpu_ctx->state.sliding_layers,
         gpu_ctx->state.full_layers,
         gpu_ctx->state.sliding_window_tokens,
+        gpu_ctx->state.full_window_tokens,
         p->seq_len,
         gpu_ctx->d_pos_list,
         gpu_ctx->d_slot_ids);
@@ -2787,7 +2737,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
       if (layer_sliding) {
         int layer_capacity = gpu_ctx->state.sliding_window_tokens;
         size_t shared_mem_bytes = (size_t)(layer_capacity + 1) * sizeof(float);
-        shared_mem_bytes += (size_t)round_up16(head_dim) * sizeof(short);
+        shared_mem_bytes += (size_t)round_up16(head_dim) * sizeof(float);
 
         paged_flash_attention_kernel_sliding<<<grid, block, shared_mem_bytes, gpu_ctx->batch_stream>>>(
           gpu_ctx->state.qkv,
@@ -2810,9 +2760,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           gpu_ctx->d_slot_ids);
       } else {
         int layer_idx_full = sliding_enabled ? full_layer_index(l) : l;
-        int layer_capacity = p->seq_len;
         constexpr int kTileTokens = 16;
-        size_t shared_mem_bytes = (size_t)round_up16(head_dim) * sizeof(short);
+        size_t shared_mem_bytes = (size_t)round_up16(head_dim) * sizeof(float);
         shared_mem_bytes += ((size_t)kTileTokens * (size_t)head_dim + 1) * sizeof(hip_bfloat16);
         shared_mem_bytes += (size_t)kTileTokens * sizeof(float) * 2;
 
@@ -2830,6 +2779,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           l,
           layer_idx_full,
           gpu_ctx->state.full_layers,
+          gpu_ctx->state.full_window_tokens,
           gpu_ctx->d_pos_list,
           batch,
           qkv_out_dim,
@@ -3315,12 +3265,21 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   HIP_CHECK(hipMalloc(&s->e_agg,    B * (size_t)p->hidden_dim * sizeof(float)));
 
 
-  HIP_CHECK(hipMalloc(&s->qkv, B * (size_t)p->head_dim * (size_t)(p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(hip_bfloat16)));
+  HIP_CHECK(hipMalloc(&s->qkv, B * (size_t)p->head_dim * (size_t)(p->n_attn_heads + 2 * p->n_kv_heads) * sizeof(float)));
 
   const bool enable_sliding = (p->sliding_window > 0);
   s->sliding_window_tokens = enable_sliding ? p->sliding_window : 0;
   s->sliding_layers = enable_sliding ? ((p->n_layers + 1) / 2) : 0;
   s->full_layers = p->n_layers - s->sliding_layers;
+
+  int full_window_env = read_int_env("GETP_FULL_WINDOW");
+  int full_window_default = (p->sliding_window > 0) ? p->sliding_window : p->seq_len;
+  if (full_window_default <= 0) full_window_default = p->seq_len;
+  if (full_window_default <= 0) full_window_default = 1;
+  int full_window = (full_window_env > 0) ? full_window_env : full_window_default;
+  if (full_window > p->seq_len) full_window = p->seq_len;
+  if (full_window <= 0) full_window = 1;
+  s->full_window_tokens = full_window;
 
   s->key_cache_sliding = nullptr;
   s->value_cache_sliding = nullptr;
@@ -3335,15 +3294,16 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   }
 
   size_t full_elems = 0;
-  if (s->full_layers > 0) {
-    full_elems = B * (size_t)s->full_layers * (size_t)p->seq_len * (size_t)kv_dim;
+  if (s->full_layers > 0 && s->full_window_tokens > 0) {
+    full_elems = B * (size_t)s->full_layers * (size_t)s->full_window_tokens * (size_t)kv_dim;
     HIP_CHECK(hipMalloc(&s->key_cache_full, full_elems * sizeof(hip_bfloat16)));
     HIP_CHECK(hipMalloc(&s->value_cache_full, full_elems * sizeof(hip_bfloat16)));
   }
 
   double sliding_gb = (double)(2 * sliding_elems * sizeof(hip_bfloat16)) / GB;
   double full_gb = (double)(2 * full_elems * sizeof(hip_bfloat16)) / GB;
-  printf("KV cache allocated (BF16): sliding %.2f GB, full %.2f GB\n", sliding_gb, full_gb);
+  printf("KV cache allocated (BF16): sliding %.2f GB (cap %d), full %.2f GB (cap %d)\n",
+         sliding_gb, s->sliding_window_tokens, full_gb, s->full_window_tokens);
 
   HIP_CHECK(hipMalloc(&s->cos_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->sin_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
