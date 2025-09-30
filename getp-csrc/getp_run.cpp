@@ -3273,7 +3273,7 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   s->full_layers = p->n_layers - s->sliding_layers;
 
   int full_window_env = read_int_env("GETP_FULL_WINDOW");
-  if (full_window_default <= 0) full_window_default = p->seq_len;
+  int full_window_default = p->seq_len;
   int full_window = (full_window_env > 0) ? full_window_env : full_window_default;
   if (full_window > p->seq_len) full_window = p->seq_len;
   if (full_window <= 0) full_window = 1;
