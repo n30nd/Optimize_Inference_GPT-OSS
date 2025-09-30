@@ -2269,11 +2269,9 @@ void mlp2_grouped_mfma32_matvec_residual_kernel(
   const hip_bfloat16* __restrict__ W = w_packed_mlp2 + mat_index * per_mat_elems;
   const hip_bfloat16* __restrict__ B = b_mlp2 ? (b_mlp2 + mat_index * (size_t)hidden_dim) : nullptr;
 
-  __shared__ __align__(16) uint16_t sWbf16[MAX_MLP_ROW_TILES][MLP_MFMA_M * MLP_MFMA_K];
   __shared__ __align__(16) uint16_t sXbf16[MLP_MFMA_K * MLP_MFMA_N];
   __shared__ __align__(16) float sBias[MAX_MLP_ROW_TILES][MLP_MFMA_M];
 
-  uint16_t* __restrict__ sW_tile = sWbf16[wave_id];
   float* __restrict__ sBias_tile = sBias[wave_id];
 
   const int tiles_k = (Kpad + MLP_MFMA_K - 1) / MLP_MFMA_K;
@@ -2288,19 +2286,10 @@ void mlp2_grouped_mfma32_matvec_residual_kernel(
   float16v acc = {0.0f};
 
   for (int kk = 0; kk < tiles_k; ++kk) {
+    short4v w_frag = {0, 0, 0, 0};
     if (tile_active) {
       const size_t tile_linear = (size_t)tile_m_global * tiles_per_row + (size_t)kk;
-      const uint16_t* src16 = reinterpret_cast<const uint16_t*>(W + tile_linear * (size_t)(MLP_MFMA_M * MLP_MFMA_K));
-      int idx4 = lane_in_wave * 4;
-      if (idx4 < (MLP_MFMA_M * MLP_MFMA_K)) {
-        const int row_local = idx4 / MLP_MFMA_K;
-        const int k_base = idx4 % MLP_MFMA_K;
-        uint16_t* dst = sW_tile + row_local * MLP_MFMA_K + k_base;
-        dst[0] = src16[row_local * MLP_MFMA_K + k_base + 0];
-        dst[1] = src16[row_local * MLP_MFMA_K + k_base + 1];
-        dst[2] = src16[row_local * MLP_MFMA_K + k_base + 2];
-        dst[3] = src16[row_local * MLP_MFMA_K + k_base + 3];
-      }
+      w_frag = load_mlp1_w_fragment(W, tile_linear, lane_col, lane_wave);
     }
 
     if (wave_id == 0) {
@@ -2329,16 +2318,8 @@ void mlp2_grouped_mfma32_matvec_residual_kernel(
     __syncthreads();
 
     if (tile_active) {
-      using short4v = __attribute__((ext_vector_type(4))) short;
-      short4v Areg;
-      short4v Breg;
-      #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const int kidx = lane_wave * 4 + j;
-        Areg[j] = static_cast<short>(sW_tile[lane_col * MLP_MFMA_K + kidx]);
-        Breg[j] = static_cast<short>(sXbf16[kidx * MLP_MFMA_N + lane_col]);
-      }
-      acc = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(Areg, Breg, acc, 0, 0, 0);
+      const short4v Breg = load_mlp1_x_fragment(sXbf16, lane_col, lane_wave);
+      acc = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(w_frag, Breg, acc, 0, 0, 0);
     }
     __syncthreads();
   }
@@ -2350,18 +2331,32 @@ void mlp2_grouped_mfma32_matvec_residual_kernel(
   const float ew = sorted_w[col];
   if (valid_idx < 0 || ew == 0.f) return;
   const int sid = sorted_sids[col];
+  const size_t x_base = (size_t)sid * (size_t)x_stride;
 
-  for (int g = 0; g < 16; ++g) {
-    const int group = g >> 2;
-    const int g_mod = g & 3;
-    const int row_in_tile = ((group << 3) & (MLP_MFMA_M - 1)) + lane_wave * 4 + g_mod;
-    if (row_in_tile >= MLP_MFMA_M) continue;
-    const int row = base_row + row_in_tile;
-    if (row >= hidden_dim) continue;
-
-    float value = acc[g];
-    if (B) value += sBias_tile[row_in_tile];
-    atomicAdd(&x[(size_t)sid * (size_t)x_stride + (size_t)row], ew * value);
+  if (B) {
+    #pragma unroll
+    for (int g = 0; g < 16; ++g) {
+      const int group = g >> 2;
+      const int g_mod = g & 3;
+      const int row_in_tile = ((group << 3) & (MLP_MFMA_M - 1)) + lane_wave * 4 + g_mod;
+      if (row_in_tile >= MLP_MFMA_M) continue;
+      const int row = base_row + row_in_tile;
+      if (row >= hidden_dim) continue;
+      const float value = (acc[g] + sBias_tile[row_in_tile]) * ew;
+      atomicAdd(x + x_base + (size_t)row, value);
+    }
+  } else {
+    #pragma unroll
+    for (int g = 0; g < 16; ++g) {
+      const int group = g >> 2;
+      const int g_mod = g & 3;
+      const int row_in_tile = ((group << 3) & (MLP_MFMA_M - 1)) + lane_wave * 4 + g_mod;
+      if (row_in_tile >= MLP_MFMA_M) continue;
+      const int row = base_row + row_in_tile;
+      if (row >= hidden_dim) continue;
+      const float scaled = acc[g] * ew;
+      atomicAdd(x + x_base + (size_t)row, scaled);
+    }
   }
 }
 
