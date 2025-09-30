@@ -212,6 +212,7 @@ typedef struct {
   int sliding_layers;
   int full_layers;
   int sliding_window_tokens;
+  int full_window_tokens;
 } GPURunState;
 
 // Per-GPU device context
@@ -1328,6 +1329,7 @@ void paged_flash_attention_kernel_full(
     int head_dim, int kv_dim, int kv_mul,
     int n_heads, int seq_len, int layer,
     int full_layer_index_param, int full_layers,
+    int layer_capacity,
     const int * __restrict__ pos_list,
     int batch,
     int q_stride,
@@ -1340,7 +1342,6 @@ void paged_flash_attention_kernel_full(
   if (h >= n_heads || b >= batch) return;
 
   int sid = slot_ids ? slot_ids[b] : b;
-  const int layer_capacity = seq_len;
   float *output = all_output + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
 
   const bool valid_cache = key_cache_full && value_cache_full &&
@@ -1365,8 +1366,13 @@ void paged_flash_attention_kernel_full(
   if (att_len > layer_capacity) att_len = layer_capacity;
   if (att_len < 0) att_len = 0;
   const int token_count = att_len;
-  int cache_base = pos - (token_count - 1);
-  if (cache_base < 0) cache_base = 0;
+  int write_pos_mod = (layer_capacity > 0) ? (pos % layer_capacity) : 0;
+  if (layer_capacity > 0 && write_pos_mod < 0) write_pos_mod += layer_capacity;
+  int cache_base = write_pos_mod;
+  if (token_count > 0 && layer_capacity > 0) {
+    cache_base = write_pos_mod - (token_count - 1);
+    if (cache_base < 0) cache_base += layer_capacity;
+  }
 
   const int head_dim_aligned = round_up16(head_dim);
   extern __shared__ unsigned char smem_raw[];
@@ -1423,7 +1429,15 @@ void paged_flash_attention_kernel_full(
     const bool col_in_range = (tx < tile_count);
 
     if (ty == 0 && tx < TILE_TOKENS) {
-      sColPos[tx] = col_in_range ? (cache_base + col) : -1;
+      if (col_in_range) {
+        int cp = cache_base + col;
+        if (layer_capacity > 0) {
+          while (cp >= layer_capacity) cp -= layer_capacity;
+        }
+        sColPos[tx] = cp;
+      } else {
+        sColPos[tx] = -1;
+      }
     }
     __syncthreads();
 
@@ -2530,6 +2544,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
                                int sliding_layers,
                                int full_layers,
                                int sliding_window,
+                               int full_window,
                                int seq_len,
                                const int *pos_list,
                                const int *slot_ids) {
@@ -2540,8 +2555,11 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         int pos = pos_list[b];
         const bool sliding_enabled = (sliding_window > 0) && (sliding_layers > 0);
         const bool layer_sliding = sliding_enabled && uses_sliding_window(layer);
-        const int capacity = layer_sliding ? sliding_window : seq_len;
-        const int write_pos = layer_sliding ? (pos % capacity) : pos;
+        const int full_capacity = (full_window > 0) ? full_window : seq_len;
+        const int capacity = layer_sliding ? sliding_window : full_capacity;
+        if (capacity <= 0) return;
+        int write_pos = pos % capacity;
+        if (write_pos < 0) write_pos += capacity;
         hip_bfloat16 *value_ptr = nullptr;
         if (layer_sliding) {
           if (!value_cache_sliding) return;
@@ -2550,7 +2568,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         } else {
           if (!value_cache_full) return;
           int layer_idx = sliding_enabled ? full_layer_index(layer) : layer;
-          value_ptr = kv_cache_layer_ptr(value_cache_full, sid, layer_idx, full_layers, seq_len, kv_dim);
+          value_ptr = kv_cache_layer_ptr(value_cache_full, sid, layer_idx, full_layers, full_capacity, kv_dim);
         }
         const float *v_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)v_offset;
         hip_bfloat16 *v_dst = value_ptr + (size_t)write_pos * (size_t)kv_dim;
@@ -2572,6 +2590,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
                                int sliding_layers,
                                int full_layers,
                                int sliding_window,
+                               int full_window,
                                int seq_len,
                                const int *pos_list,
                                const int *slot_ids) {
@@ -2582,8 +2601,11 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         int pos = pos_list[b];
         const bool sliding_enabled = (sliding_window > 0) && (sliding_layers > 0);
         const bool layer_sliding = sliding_enabled && uses_sliding_window(layer);
-        const int capacity = layer_sliding ? sliding_window : seq_len;
-        const int write_pos = layer_sliding ? (pos % capacity) : pos;
+        const int full_capacity = (full_window > 0) ? full_window : seq_len;
+        const int capacity = layer_sliding ? sliding_window : full_capacity;
+        if (capacity <= 0) return;
+        int write_pos = pos % capacity;
+        if (write_pos < 0) write_pos += capacity;
         hip_bfloat16 *key_ptr = nullptr;
         if (layer_sliding) {
           if (!key_cache_sliding) return;
@@ -2592,7 +2614,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         } else {
           if (!key_cache_full) return;
           int layer_idx = sliding_enabled ? full_layer_index(layer) : layer;
-          key_ptr = kv_cache_layer_ptr(key_cache_full, sid, layer_idx, full_layers, seq_len, kv_dim);
+          key_ptr = kv_cache_layer_ptr(key_cache_full, sid, layer_idx, full_layers, full_capacity, kv_dim);
         }
         const float *k_src = qkv + (size_t)sid * (size_t)qkv_stride + (size_t)k_offset;
         hip_bfloat16 *k_dst = key_ptr + (size_t)write_pos * (size_t)kv_dim;
@@ -2656,6 +2678,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         gpu_ctx->state.sliding_layers,
         gpu_ctx->state.full_layers,
         gpu_ctx->state.sliding_window_tokens,
+        gpu_ctx->state.full_window_tokens,
         p->seq_len,
         gpu_ctx->d_pos_list,
         gpu_ctx->d_slot_ids);
@@ -2692,6 +2715,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
         gpu_ctx->state.sliding_layers,
         gpu_ctx->state.full_layers,
         gpu_ctx->state.sliding_window_tokens,
+        gpu_ctx->state.full_window_tokens,
         p->seq_len,
         gpu_ctx->d_pos_list,
         gpu_ctx->d_slot_ids);
@@ -2730,7 +2754,6 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           gpu_ctx->d_slot_ids);
       } else {
         int layer_idx_full = sliding_enabled ? full_layer_index(l) : l;
-        int layer_capacity = p->seq_len;
         constexpr int kTileTokens = 16;
         size_t shared_mem_bytes = (size_t)round_up16(head_dim) * sizeof(float);
         shared_mem_bytes += ((size_t)kTileTokens * (size_t)head_dim + 1) * sizeof(hip_bfloat16);
@@ -2750,6 +2773,7 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           l,
           layer_idx_full,
           gpu_ctx->state.full_layers,
+          gpu_ctx->state.full_window_tokens,
           gpu_ctx->d_pos_list,
           batch,
           qkv_out_dim,
@@ -3242,6 +3266,15 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   s->sliding_layers = enable_sliding ? ((p->n_layers + 1) / 2) : 0;
   s->full_layers = p->n_layers - s->sliding_layers;
 
+  int full_window_env = read_int_env("GETP_FULL_WINDOW");
+  int full_window_default = (p->sliding_window > 0) ? p->sliding_window : p->seq_len;
+  if (full_window_default <= 0) full_window_default = p->seq_len;
+  if (full_window_default <= 0) full_window_default = 1;
+  int full_window = (full_window_env > 0) ? full_window_env : full_window_default;
+  if (full_window > p->seq_len) full_window = p->seq_len;
+  if (full_window <= 0) full_window = 1;
+  s->full_window_tokens = full_window;
+
   s->key_cache_sliding = nullptr;
   s->value_cache_sliding = nullptr;
   s->key_cache_full = nullptr;
@@ -3255,15 +3288,16 @@ void gpu_malloc_run_state(GPURunState *s, Config *p, int max_batch) {
   }
 
   size_t full_elems = 0;
-  if (s->full_layers > 0) {
-    full_elems = B * (size_t)s->full_layers * (size_t)p->seq_len * (size_t)kv_dim;
+  if (s->full_layers > 0 && s->full_window_tokens > 0) {
+    full_elems = B * (size_t)s->full_layers * (size_t)s->full_window_tokens * (size_t)kv_dim;
     HIP_CHECK(hipMalloc(&s->key_cache_full, full_elems * sizeof(hip_bfloat16)));
     HIP_CHECK(hipMalloc(&s->value_cache_full, full_elems * sizeof(hip_bfloat16)));
   }
 
   double sliding_gb = (double)(2 * sliding_elems * sizeof(hip_bfloat16)) / GB;
   double full_gb = (double)(2 * full_elems * sizeof(hip_bfloat16)) / GB;
-  printf("KV cache allocated (BF16): sliding %.2f GB, full %.2f GB\n", sliding_gb, full_gb);
+  printf("KV cache allocated (BF16): sliding %.2f GB (cap %d), full %.2f GB (cap %d)\n",
+         sliding_gb, s->sliding_window_tokens, full_gb, s->full_window_tokens);
 
   HIP_CHECK(hipMalloc(&s->cos_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
   HIP_CHECK(hipMalloc(&s->sin_vals, B * (size_t)(p->head_dim / 2) * sizeof(float)));
