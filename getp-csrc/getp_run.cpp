@@ -101,6 +101,7 @@ static const int MLP2_ROW_TILES = read_row_tiles_env("GETP_MLP2_ROW_TILES", 8);
 using u32x4 = __attribute__((ext_vector_type(4))) unsigned int;
 using u32x2 = __attribute__((ext_vector_type(2))) unsigned int;
 using ushort4v = __attribute__((ext_vector_type(4))) unsigned short;
+using short4v = __attribute__((ext_vector_type(4))) short;
 using float16v = __attribute__((ext_vector_type(16))) float;
 
 // ------------------------- Utility: GPU Memory Logging -------------------------
@@ -1924,6 +1925,125 @@ __global__ void iota_kernel(int* a, int n) {
   if (i < n) a[i] = i;
 }
 
+static __device__ __forceinline__ short4v load_mlp1_w_fragment(
+    const hip_bfloat16* __restrict__ Wpack,
+    size_t tile_linear,
+    int lane_col,
+    int lane_wave) {
+  const uint16_t* src16 = reinterpret_cast<const uint16_t*>(
+      Wpack + tile_linear * (size_t)(MLP_MFMA_M * MLP_MFMA_K));
+  const uint16_t* row_ptr = src16 + lane_col * MLP_MFMA_K + lane_wave * 4;
+  const u32x2 raw = reinterpret_cast<const u32x2*>(row_ptr)[0];
+  short4v frag;
+  frag[0] = static_cast<short>(raw[0] & 0xffff);
+  frag[1] = static_cast<short>(raw[0] >> 16);
+  frag[2] = static_cast<short>(raw[1] & 0xffff);
+  frag[3] = static_cast<short>(raw[1] >> 16);
+  return frag;
+}
+
+static __device__ __forceinline__ short4v load_mlp1_x_fragment(
+    const uint16_t* __restrict__ sXbf16,
+    int lane_col,
+    int lane_wave) {
+  short4v frag;
+  #pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int kidx = lane_wave * 4 + j;
+    frag[j] = static_cast<short>(sXbf16[kidx * MLP_MFMA_N + lane_col]);
+  }
+  return frag;
+}
+
+static __device__ __forceinline__ void load_x_tile_to_shared(
+    uint16_t* __restrict__ sXbf16,
+    const hip_bfloat16* __restrict__ x_block,
+    int lane_in_wave,
+    int kk,
+    int block_cols_aligned,
+    int tile_offset_cols,
+    int K,
+    int col_base,
+    int Btotal_live,
+    bool all_cols_active) {
+  const int r = lane_in_wave % MLP_MFMA_K;
+  const int c4 = (lane_in_wave / MLP_MFMA_K) * 4;
+  const int k_row = kk * MLP_MFMA_K + r;
+  uint16_t* dst = sXbf16 + r * MLP_MFMA_N + c4;
+  if (k_row < K) {
+    const size_t row_offset = (size_t)k_row * (size_t)block_cols_aligned +
+                              (size_t)tile_offset_cols + (size_t)c4;
+    if (all_cols_active || (col_base + c4 + 3) < Btotal_live) {
+      reinterpret_cast<u32x2*>(dst)[0] = reinterpret_cast<const u32x2*>(x_block + row_offset)[0];
+    } else {
+      union { hip_bfloat16 b; uint16_t u; } tmp[4];
+      #pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const int global_col = col_base + c4 + t;
+        tmp[t].b = (global_col < Btotal_live) ? x_block[row_offset + t] : hip_bfloat16(0.0f);
+      }
+      reinterpret_cast<u32x2*>(dst)[0] = u32x2{(uint32_t)tmp[0].u | ((uint32_t)tmp[1].u << 16),
+                                              (uint32_t)tmp[2].u | ((uint32_t)tmp[3].u << 16)};
+    }
+  } else {
+    reinterpret_cast<u32x2*>(dst)[0] = u32x2{0u, 0u};
+  }
+}
+
+static __device__ __forceinline__ void store_gate_tile(
+    const float16v& acc,
+    int lane_col,
+    int lane_wave,
+    int lane_in_wave,
+    int base_row,
+    int Mout,
+    int I,
+    bool tile_active,
+    int col_base,
+    int Btotal_live,
+    bool has_bias,
+    const float* __restrict__ sBias_tile,
+    hip_bfloat16* __restrict__ gate_up_out,
+    int out_stride_cols,
+    float swiglu_limit,
+    float alpha) {
+  if (!tile_active) return;
+  const int col = col_base + lane_col;
+  if (col >= Btotal_live) return;
+
+  float gate_cache[MLP_MFMA_M / 2] = {0.f};
+
+  for (int g = 0; g < 16; ++g) {
+    const int group = g >> 2;
+    const int g_mod = g & 3;
+    const int row_in_tile = ((group << 3) & (MLP_MFMA_M - 1)) + lane_wave * 4 + g_mod;
+    if (row_in_tile >= MLP_MFMA_M) continue;
+    const int row = base_row + row_in_tile;
+    if (row >= Mout) continue;
+
+    float value = acc[g];
+    if (has_bias) value += sBias_tile[row_in_tile];
+
+    const int pair_idx = row_in_tile >> 1;
+    if ((row & 1) == 0) {
+      gate_cache[pair_idx] = value;
+    } else {
+      float gate = gate_cache[pair_idx];
+      float up = value;
+      gate = fminf(swiglu_limit, gate);
+      up = fminf(swiglu_limit, fmaxf(-swiglu_limit, up));
+      const float inv_denom = __fdividef(1.f, 1.f + __expf(-alpha * gate));
+      gate *= inv_denom;
+      const int row_half = row >> 1;
+      if (row_half < I) {
+        float fused = gate * (up + 1.f);
+        hip_bfloat16* row_base = gate_up_out + (size_t)row_half * (size_t)out_stride_cols;
+        row_base[col] = float_to_bfloat16(fused);
+      }
+    }
+  }
+}
+
 // Fused GEMM (W_mlp1 * Xpack) + bias + SwiGLU + scatter to gate_up_all using 32x32x8 BF16 MFMA tiles.
 // Mỗi wave xử lý đúng 1 tile 32x32; số wave trong block tỉ lệ với RowTiles.
 template<int RowTiles>
@@ -1984,26 +2104,86 @@ void mlp1_grouped_mfma32_fused_swiglu_kernel(
   const size_t block_stride_vals = (size_t)block_cols_aligned * (size_t)K;
   const hip_bfloat16* __restrict__ x_block = Xpack + block_stride_vals * (size_t)block_id;
 
-  __shared__ __align__(16) uint16_t sWbf16[MAX_MLP_ROW_TILES][MLP_MFMA_M * MLP_MFMA_K];
   __shared__ __align__(16) uint16_t sXbf16[MLP_MFMA_K * MLP_MFMA_N];
   __shared__ __align__(16) float sBias[MAX_MLP_ROW_TILES][MLP_MFMA_M];
 
-  uint16_t* __restrict__ sW_tile = sWbf16[wave_id];
   float* __restrict__ sBias_tile = sBias[wave_id];
 
   const int tiles_k = (Kpad + MLP_MFMA_K - 1) / MLP_MFMA_K;
   const size_t tiles_per_row = (size_t)tiles_k;
-
+  const bool has_bias = (B != nullptr);
   if (tile_active && lane_in_wave < MLP_MFMA_M) {
     const int row = base_row + lane_in_wave;
-    sBias_tile[lane_in_wave] = (B && row < Mout) ? bfloat16_to_float(B[row]) : 0.f;
+    sBias_tile[lane_in_wave] = (has_bias && row < Mout) ? bfloat16_to_float(B[row]) : 0.f;
   }
   __syncthreads();
 
   const float alpha = 1.702f;
   const int I = Mout >> 1;
 
-  for (int cn = 0; cn < col_tiles_per_block; ++cn) {
+  int processed_tiles = 0;
+  const int opt_tiles = (col_tiles_per_block >= 2) ? 2 : 1;
+  const int col_base0 = col_block_base;
+  const int col_base1 = col_block_base + MLP_MFMA_N;
+  const bool tile_valid0 = (opt_tiles >= 1) && (col_base0 < Bpad_live);
+  const bool tile_valid1 = (opt_tiles >= 2) && (col_base1 < Bpad_live);
+  const bool all_cols_active0 = tile_valid0 && (col_base0 + MLP_MFMA_N - 1) < Btotal_live;
+  const bool all_cols_active1 = tile_valid1 && (col_base1 + MLP_MFMA_N - 1) < Btotal_live;
+
+  if (tile_valid0 || tile_valid1) {
+    float16v acc0 = {0.0f};
+    float16v acc1 = {0.0f};
+    for (int kk = 0; kk < tiles_k; ++kk) {
+      short4v w_frag = {0, 0, 0, 0};
+      if (tile_active) {
+        const size_t tile_linear = (size_t)tile_m_global * tiles_per_row + (size_t)kk;
+        w_frag = load_mlp1_w_fragment(Wpack, tile_linear, lane_col, lane_wave);
+      }
+
+      if (tile_valid0) {
+        if (wave_id == 0) {
+          load_x_tile_to_shared(sXbf16, x_block, lane_in_wave, kk, block_cols_aligned,
+                                0, K, col_base0, Btotal_live, all_cols_active0);
+        }
+        __syncthreads();
+        if (tile_active) {
+          const short4v Breg = load_mlp1_x_fragment(sXbf16, lane_col, lane_wave);
+          acc0 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(w_frag, Breg, acc0, 0, 0, 0);
+        }
+        __syncthreads();
+      }
+
+      if (tile_valid1) {
+        if (wave_id == 0) {
+          load_x_tile_to_shared(sXbf16, x_block, lane_in_wave, kk, block_cols_aligned,
+                                MLP_MFMA_N, K, col_base1, Btotal_live, all_cols_active1);
+        }
+        __syncthreads();
+        if (tile_active) {
+          const short4v Breg = load_mlp1_x_fragment(sXbf16, lane_col, lane_wave);
+          acc1 = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(w_frag, Breg, acc1, 0, 0, 0);
+        }
+        __syncthreads();
+      }
+    }
+
+    if (tile_valid0) {
+      store_gate_tile(acc0, lane_col, lane_wave, lane_in_wave, base_row, Mout, I,
+                      tile_active, col_base0, Btotal_live, has_bias,
+                      sBias_tile, gate_up_out, out_stride_cols, swiglu_limit, alpha);
+    }
+
+    if (tile_valid1) {
+      store_gate_tile(acc1, lane_col, lane_wave, lane_in_wave, base_row, Mout, I,
+                      tile_active, col_base1, Btotal_live, has_bias,
+                      sBias_tile, gate_up_out, out_stride_cols, swiglu_limit, alpha);
+    }
+
+    processed_tiles = (tile_valid0 ? 1 : 0) + (tile_valid1 ? 1 : 0);
+    __syncthreads();
+  }
+
+  for (int cn = processed_tiles; cn < col_tiles_per_block; ++cn) {
     const int col0 = col_block_base + cn * MLP_MFMA_N;
     if (col0 >= Bpad_live) continue;
     const bool all_cols_active = (col0 + MLP_MFMA_N - 1) < Btotal_live;
@@ -2011,95 +2191,28 @@ void mlp1_grouped_mfma32_fused_swiglu_kernel(
     float16v acc = {0.0f};
 
     for (int kk = 0; kk < tiles_k; ++kk) {
+      short4v w_frag = {0, 0, 0, 0};
       if (tile_active) {
         const size_t tile_linear = (size_t)tile_m_global * tiles_per_row + (size_t)kk;
-        const uint16_t* src16 = reinterpret_cast<const uint16_t*>(Wpack + tile_linear * (size_t)(MLP_MFMA_M * MLP_MFMA_K));
-        int idx4 = lane_in_wave * 4;
-        if (idx4 < (MLP_MFMA_M * MLP_MFMA_K)) {
-          const int row_local = idx4 / MLP_MFMA_K;
-          const int k_base = idx4 % MLP_MFMA_K;
-          uint16_t* dst = sW_tile + row_local * MLP_MFMA_K + k_base;
-          dst[0] = src16[row_local * MLP_MFMA_K + k_base + 0];
-          dst[1] = src16[row_local * MLP_MFMA_K + k_base + 1];
-          dst[2] = src16[row_local * MLP_MFMA_K + k_base + 2];
-          dst[3] = src16[row_local * MLP_MFMA_K + k_base + 3];
-        }
+        w_frag = load_mlp1_w_fragment(Wpack, tile_linear, lane_col, lane_wave);
       }
 
       if (wave_id == 0) {
-        const int r = lane_in_wave % MLP_MFMA_K;
-        const int c4 = (lane_in_wave / MLP_MFMA_K) * 4;
-        const int k_row = kk * MLP_MFMA_K + r;
-        uint16_t* dst = sXbf16 + r * MLP_MFMA_N + c4;
-        if (k_row < K) {
-          const size_t row_offset = (size_t)k_row * (size_t)block_cols_aligned + (size_t)cn * MLP_MFMA_N + (size_t)c4;
-          if (all_cols_active || (col0 + c4 + 3) < Btotal_live) {
-            reinterpret_cast<u32x2*>(dst)[0] = reinterpret_cast<const u32x2*>(x_block + row_offset)[0];
-          } else {
-            union { hip_bfloat16 b; uint16_t u; } tmp[4];
-            #pragma unroll
-            for (int t = 0; t < 4; ++t) {
-              const int global_col = col0 + c4 + t;
-              tmp[t].b = (global_col < Btotal_live) ? x_block[row_offset + t] : hip_bfloat16(0.0f);
-            }
-            reinterpret_cast<u32x2*>(dst)[0] = u32x2{(uint32_t)tmp[0].u | ((uint32_t)tmp[1].u << 16),
-                                                    (uint32_t)tmp[2].u | ((uint32_t)tmp[3].u << 16)};
-          }
-        } else {
-          reinterpret_cast<u32x2*>(dst)[0] = u32x2{0u, 0u};
-        }
+        load_x_tile_to_shared(sXbf16, x_block, lane_in_wave, kk, block_cols_aligned,
+                              cn * MLP_MFMA_N, K, col0, Btotal_live, all_cols_active);
       }
       __syncthreads();
 
       if (tile_active) {
-        using short4v = __attribute__((ext_vector_type(4))) short;
-        short4v Areg;
-        short4v Breg;
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          const int kidx = lane_wave * 4 + j;
-          Areg[j] = static_cast<short>(sW_tile[lane_col * MLP_MFMA_K + kidx]);
-          Breg[j] = static_cast<short>(sXbf16[kidx * MLP_MFMA_N + lane_col]);
-        }
-        acc = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(Areg, Breg, acc, 0, 0, 0);
+        const short4v Breg = load_mlp1_x_fragment(sXbf16, lane_col, lane_wave);
+        acc = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(w_frag, Breg, acc, 0, 0, 0);
       }
       __syncthreads();
     }
 
-    const int col = col0 + lane_col;
-    if (tile_active && col < Btotal_live) {
-      float gate_cache[MLP_MFMA_M / 2] = {0.f};
-
-      for (int g = 0; g < 16; ++g) {
-        const int group = g >> 2;
-        const int g_mod = g & 3;
-        const int row_in_tile = ((group << 3) & (MLP_MFMA_M - 1)) + lane_wave * 4 + g_mod;
-        if (row_in_tile >= MLP_MFMA_M) continue;
-        const int row = base_row + row_in_tile;
-        if (row >= Mout) continue;
-
-        float value = acc[g];
-        if (B) value += sBias_tile[row_in_tile];
-
-        const int pair_idx = row_in_tile >> 1;
-        if ((row & 1) == 0) {
-          gate_cache[pair_idx] = value;
-        } else {
-          float gate = gate_cache[pair_idx];
-          float up = value;
-          gate = fminf(swiglu_limit, gate);
-          up = fminf(swiglu_limit, fmaxf(-swiglu_limit, up));
-          const float inv_denom = __fdividef(1.f, 1.f + __expf(-alpha * gate));
-          gate *= inv_denom;
-          const int row_half = row >> 1;
-          if (row_half < I) {
-            float fused = gate * (up + 1.f);
-            hip_bfloat16* row_base = gate_up_out + (size_t)row_half * (size_t)out_stride_cols;
-            row_base[col] = float_to_bfloat16(fused);
-          }
-        }
-      }
-    }
+    store_gate_tile(acc, lane_col, lane_wave, lane_in_wave, base_row, Mout, I,
+                    tile_active, col0, Btotal_live, has_bias,
+                    sBias_tile, gate_up_out, out_stride_cols, swiglu_limit, alpha);
     __syncthreads();
   }
 }
