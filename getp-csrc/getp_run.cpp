@@ -1111,6 +1111,7 @@ __device__ __forceinline__ float4 bfloat16_to_float4(const hip_bfloat16 *bf16_pt
   return result;
 }
 
+// Flash-decoder++ style sliding attention: streaming softmax with register-resident Q and direct KV fetches.
 __global__ __launch_bounds__(64)
 void paged_flash_attention_kernel_sliding(
     const float * __restrict__ all_q,
@@ -1125,6 +1126,8 @@ void paged_flash_attention_kernel_sliding(
     int batch,
     int q_stride,
     const int * __restrict__ slot_ids) {
+
+  constexpr int TILE_TOKENS = 32;
 
   int h = blockIdx.y;
   int b = blockIdx.z;
@@ -1159,28 +1162,26 @@ void paged_flash_attention_kernel_sliding(
 
   int write_pos_mod = (layer_capacity > 0) ? (pos % layer_capacity) : 0;
   if (write_pos_mod < 0) write_pos_mod += layer_capacity;
-  int cache_base = write_pos_mod - (token_count - 1);
-  if (cache_base < 0) cache_base += layer_capacity;
+  int cache_base = write_pos_mod;
+  if (token_count > 0 && layer_capacity > 0) {
+    cache_base = write_pos_mod - (token_count - 1);
+    if (cache_base < 0) cache_base += layer_capacity;
+  }
 
-  const int att_slots = layer_capacity + 1;
   extern __shared__ unsigned char smem_raw[];
-  float *shared_att_paged = reinterpret_cast<float*>(smem_raw);
-  float *shared_q = shared_att_paged + att_slots;
-
+  float *shared_q = reinterpret_cast<float*>(smem_raw);
   const int head_dim_aligned = round_up16(head_dim);
+  float *sh_scores = shared_q + head_dim_aligned;
+  float *sh_probs = sh_scores + TILE_TOKENS;
+
   for (int idx = threadIdx.x; idx < head_dim_aligned; idx += blockDim.x) {
     shared_q[idx] = (idx < head_dim) ? q_head[idx] : 0.f;
   }
   __syncthreads();
 
-  __shared__ int s_att_len;
-  __shared__ float s_softmax_stats[2];
-  if (threadIdx.x == 0) s_att_len = att_len;
-  __syncthreads();
-
   const int lane_id = threadIdx.x;
-  const int tx = lane_id & 15;
-  const int ty = (lane_id >> 4) & 3;
+  const int tx = lane_id & (TILE_TOKENS - 1);
+  const int ty = lane_id >> 5;
   const float inv_sqrt_d = rsqrtf((float)head_dim);
   const int head_base = (h / kv_mul) * head_dim;
 
@@ -1188,16 +1189,28 @@ void paged_flash_attention_kernel_sliding(
   const hip_bfloat16 *value_head = value_cache_layer + (size_t)head_base;
   const int dot_dim = min(head_dim, kv_dim);
 
-  __shared__ int sColPos[16];
+  __shared__ int sColPos[TILE_TOKENS];
 
-  for (int col0 = 0; col0 < att_len; col0 += 16) {
-    const int col = col0 + tx;
-    const bool col_in_range = (col < att_len);
+  float m_prev = -INFINITY;
+  float l_prev = 0.0f;
 
-    if (ty == 0 && tx < 16) {
+  const int base = threadIdx.x * 4;
+  const bool base_active = (base < head_dim);
+  const bool full_vec = (base + 3) < head_dim;
+  float4 acc4 = {0.f, 0.f, 0.f, 0.f};
+  float tail_acc[4] = {0.f, 0.f, 0.f, 0.f};
+
+  const int dot_vec4 = dot_dim >> 2;
+  const int tail_start = dot_vec4 << 2;
+
+  for (int col0 = 0; col0 < att_len; col0 += TILE_TOKENS) {
+    const int tile_count = min(TILE_TOKENS, att_len - col0);
+    const bool col_in_range = (tx < tile_count);
+
+    if (ty == 0 && tx < TILE_TOKENS) {
       if (col_in_range) {
-        int cp = cache_base + col;
-        if (cp >= layer_capacity) cp -= layer_capacity;
+        int cp = cache_base + col0 + tx;
+        while (cp >= layer_capacity) cp -= layer_capacity;
         sColPos[tx] = cp;
       } else {
         sColPos[tx] = -1;
@@ -1206,121 +1219,154 @@ void paged_flash_attention_kernel_sliding(
     __syncthreads();
 
     float partial = 0.f;
-    const int cp = sColPos[tx];
+    int cp = sColPos[tx];
     if (col_in_range && cp >= 0) {
       const hip_bfloat16 *k_ptr = key_head + (size_t)cp * (size_t)kv_dim;
-      for (int k = ty; k < dot_dim; k += 4) {
+      for (int vec = ty; vec < dot_vec4; vec += 2) {
+        int q_idx = vec * 4;
+        float4 kv = bfloat16_to_float4(k_ptr + q_idx);
+        partial = fmaf(shared_q[q_idx + 0], kv.x, partial);
+        partial = fmaf(shared_q[q_idx + 1], kv.y, partial);
+        partial = fmaf(shared_q[q_idx + 2], kv.z, partial);
+        partial = fmaf(shared_q[q_idx + 3], kv.w, partial);
+      }
+      for (int k = tail_start + ty; k < dot_dim; k += 2) {
         float q_val = shared_q[k];
         float k_val = bfloat16_to_float(k_ptr[k]);
-        partial += q_val * k_val;
+        partial = fmaf(q_val, k_val, partial);
       }
     }
-    partial += __shfl_xor(partial, 16, 64);
     partial += __shfl_xor(partial, 32, 64);
 
-    if (ty == 0 && col_in_range) {
-      float score = (sColPos[tx] >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
-      shared_att_paged[col] = score;
+    if (ty == 0 && tx < tile_count) {
+      float score = (cp >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
+      sh_scores[tx] = score;
+    } else if (ty == 0 && tx < TILE_TOKENS) {
+      sh_scores[tx] = -INFINITY;
     }
     __syncthreads();
-  }
 
-  if (threadIdx.x == 0 && (pos + 1) < seq_len) {
-    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
-    if (s_att_len < layer_capacity + 1) {
-      shared_att_paged[s_att_len] = bfloat16_to_float(attn_sinks[sink_idx]);
-      s_att_len++;
+    float score_local = (ty == 0 && tx < tile_count) ? sh_scores[tx] : -INFINITY;
+    float tile_max = score_local;
+    for (int offset = 32; offset > 0; offset >>= 1) {
+      float other = __shfl_down(tile_max, offset, 64);
+      tile_max = fmaxf(tile_max, other);
     }
-  }
-  __syncthreads();
-  const int len = s_att_len;
+    tile_max = __shfl(tile_max, 0, 64);
 
-  float thread_max = -INFINITY;
-  for (int i = threadIdx.x; i < len; i += blockDim.x) {
-    thread_max = fmaxf(thread_max, shared_att_paged[i]);
-  }
-  for (int offset = 32; offset > 0; offset >>= 1) {
-    float other = __shfl_down(thread_max, offset, 64);
-    thread_max = fmaxf(thread_max, other);
-  }
-  if ((threadIdx.x & 63) == 0) {
-    s_softmax_stats[0] = thread_max;
-  }
-  __syncthreads();
-  const float max_val = s_softmax_stats[0];
+    float m_new = fmaxf(m_prev, tile_max);
+    float p_scale = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - m_new);
 
-  float thread_sum = 0.0f;
-  for (int i = threadIdx.x; i < len; i += blockDim.x) {
-    float v = shared_att_paged[i];
-    v = (v == -INFINITY) ? 0.0f : expf(v - max_val);
-    shared_att_paged[i] = v;
-    thread_sum += v;
-  }
-  for (int offset = 32; offset > 0; offset >>= 1) {
-    thread_sum += __shfl_down(thread_sum, offset, 64);
-  }
-  if ((threadIdx.x & 63) == 0) {
-    s_softmax_stats[1] = thread_sum;
-  }
-  __syncthreads();
-  float inv_sum = 1.0f / (s_softmax_stats[1] + 1e-8f);
-  if ((threadIdx.x & 63) == 0) {
-    s_softmax_stats[1] = inv_sum;
-  }
-  __syncthreads();
-  inv_sum = s_softmax_stats[1];
-  for (int i = threadIdx.x; i < len; i += blockDim.x) {
-    shared_att_paged[i] *= inv_sum;
-  }
-  __syncthreads();
+    if (ty == 0 && tx < tile_count) {
+      float score_val = sh_scores[tx];
+      sh_probs[tx] = expf(score_val - m_new);
+    } else if (ty == 0 && tx < TILE_TOKENS) {
+      sh_probs[tx] = 0.0f;
+    }
+    __syncthreads();
 
-  constexpr int vec_width = 4;
-  const int lane_stride = blockDim.x * vec_width;
-  for (int base = threadIdx.x * vec_width; base < head_dim; base += lane_stride) {
-    float4 acc4 = {0.f, 0.f, 0.f, 0.f};
-    float tail_acc[vec_width] = {0.f, 0.f, 0.f, 0.f};
-    const bool full_vec = (base + (vec_width - 1)) < head_dim;
+    float tile_sum = (ty == 0 && tx < tile_count) ? sh_probs[tx] : 0.0f;
+    for (int offset = 32; offset > 0; offset >>= 1) {
+      tile_sum += __shfl_down(tile_sum, offset, 64);
+    }
+    tile_sum = __shfl(tile_sum, 0, 64);
 
-    for (int idx = 0; idx < len; idx++) {
-      const float p = shared_att_paged[idx];
-      if (!(idx < token_count) || p <= 0.f) continue;
-      int cache_pos = cache_base + idx;
-      if (cache_pos >= layer_capacity) cache_pos -= layer_capacity;
-      const hip_bfloat16 *v_bf16 = value_head + (size_t)cache_pos * (size_t)kv_dim + (size_t)base;
-
+    if (base_active && p_scale != 0.0f) {
       if (full_vec) {
-        float4 v = bfloat16_to_float4(v_bf16);
-        acc4.x += p * v.x;
-        acc4.y += p * v.y;
-        acc4.z += p * v.z;
-        acc4.w += p * v.w;
+        acc4.x *= p_scale;
+        acc4.y *= p_scale;
+        acc4.z *= p_scale;
+        acc4.w *= p_scale;
       } else {
         #pragma unroll
-        for (int t = 0; t < vec_width; ++t) {
-          const int elem = base + t;
-          if (elem < head_dim) {
-            tail_acc[t] += p * bfloat16_to_float(v_bf16[t]);
+        for (int i = 0; i < 4; ++i) {
+          tail_acc[i] *= p_scale;
+        }
+      }
+    }
+
+    if (base_active) {
+      for (int t = 0; t < tile_count; ++t) {
+        float prob = sh_probs[t];
+        if (prob <= 0.f) continue;
+        int cp_t = sColPos[t];
+        if (cp_t < 0) continue;
+        const hip_bfloat16 *v_ptr = value_head + (size_t)cp_t * (size_t)kv_dim + (size_t)base;
+        if (full_vec) {
+          float4 v = bfloat16_to_float4(v_ptr);
+          acc4.x = fmaf(prob, v.x, acc4.x);
+          acc4.y = fmaf(prob, v.y, acc4.y);
+          acc4.z = fmaf(prob, v.z, acc4.z);
+          acc4.w = fmaf(prob, v.w, acc4.w);
+        } else {
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            int elem = base + i;
+            if (elem < head_dim) {
+              float v_val = bfloat16_to_float(v_ptr[i]);
+              tail_acc[i] = fmaf(prob, v_val, tail_acc[i]);
+            }
           }
         }
       }
     }
 
+    m_prev = m_new;
+    l_prev = l_prev * p_scale + tile_sum;
+
+    __syncthreads();
+  }
+
+  bool has_sink = ((pos + 1) < seq_len);
+  if (has_sink) {
+    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
+    float sink_score = bfloat16_to_float(attn_sinks[sink_idx]);
+    float m_new = fmaxf(m_prev, sink_score);
+    float p_scale = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - m_new);
+    float p = expf(sink_score - m_new);
+    if (base_active && p_scale != 0.0f) {
+      if (full_vec) {
+        acc4.x *= p_scale;
+        acc4.y *= p_scale;
+        acc4.z *= p_scale;
+        acc4.w *= p_scale;
+      } else {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          tail_acc[i] *= p_scale;
+        }
+      }
+    }
+    l_prev = l_prev * p_scale + p;
+    m_prev = m_new;
+  }
+
+  float inv_denom = (l_prev > 1e-8f) ? (1.0f / l_prev) : 0.0f;
+
+  if (base_active) {
     if (full_vec) {
+      acc4.x *= inv_denom;
+      acc4.y *= inv_denom;
+      acc4.z *= inv_denom;
+      acc4.w *= inv_denom;
       output[base + 0] = acc4.x;
       output[base + 1] = acc4.y;
       output[base + 2] = acc4.z;
       output[base + 3] = acc4.w;
     } else {
       #pragma unroll
-      for (int t = 0; t < vec_width; ++t) {
-        const int elem = base + t;
-        if (elem < head_dim) output[elem] = tail_acc[t];
+      for (int i = 0; i < 4; ++i) {
+        int elem = base + i;
+        if (elem < head_dim) {
+          float val = tail_acc[i] * inv_denom;
+          output[elem] = val;
+        }
       }
     }
   }
 }
 
-// Flash-decoder style full attention: stream softmax and stage V tiles in shared memory.
+// Flash-decoder++ style full attention: streaming softmax with register-resident Q and on-the-fly V fetches.
 __global__ __launch_bounds__(64)
 void paged_flash_attention_kernel_full(
     const float * __restrict__ all_q,
@@ -1337,7 +1383,7 @@ void paged_flash_attention_kernel_full(
     int q_stride,
     const int * __restrict__ slot_ids) {
 
-  constexpr int TILE_TOKENS = 16;
+  constexpr int TILE_TOKENS = 32;
 
   int h = blockIdx.y;
   int b = blockIdx.z;
@@ -1379,13 +1425,7 @@ void paged_flash_attention_kernel_full(
   const int head_dim_aligned = round_up16(head_dim);
   extern __shared__ unsigned char smem_raw[];
   float *shared_q = reinterpret_cast<float*>(smem_raw);
-  hip_bfloat16 *shared_v = reinterpret_cast<hip_bfloat16*>(shared_q + head_dim_aligned);
-  size_t v_words = (size_t)TILE_TOKENS * (size_t)head_dim;
-  hip_bfloat16 *shared_v_end = shared_v + v_words;
-  if (v_words & 1) {
-    ++shared_v_end;
-  }
-  float *sh_scores = reinterpret_cast<float*>(shared_v_end);
+  float *sh_scores = shared_q + head_dim_aligned;
   float *sh_probs = sh_scores + TILE_TOKENS;
 
   for (int idx = threadIdx.x; idx < head_dim_aligned; idx += blockDim.x) {
@@ -1394,8 +1434,8 @@ void paged_flash_attention_kernel_full(
   __syncthreads();
 
   const int lane_id = threadIdx.x;
-  const int tx = lane_id & 15;
-  const int ty = (lane_id >> 4) & 3;
+  const int tx = lane_id & (TILE_TOKENS - 1);
+  const int ty = lane_id >> 5;
   const float inv_sqrt_d = rsqrtf((float)head_dim);
   const int head_base = (h / kv_mul) * head_dim;
 
@@ -1404,26 +1444,15 @@ void paged_flash_attention_kernel_full(
   const int dot_dim = min(head_dim, kv_dim);
 
   __shared__ int sColPos[TILE_TOKENS];
-  __shared__ float s_tile_pscale;
-  __shared__ int s_tile_count;
-  __shared__ float s_m;
-  __shared__ float s_l;
 
-  if (threadIdx.x == 0) {
-    s_m = -INFINITY;
-    s_l = 0.0f;
-  }
-  __syncthreads();
+  float m_prev = -INFINITY;
+  float l_prev = 0.0f;
 
   const int base = threadIdx.x * 4;
   const bool base_active = (base < head_dim);
   const bool full_vec = (base + 3) < head_dim;
   float4 acc4 = {0.f, 0.f, 0.f, 0.f};
   float tail_acc[4] = {0.f, 0.f, 0.f, 0.f};
-
-  const int head_dim_vec4 = head_dim / 4;
-  const int head_dim_tail = head_dim & 3;
-  const int tail_offset = head_dim - head_dim_tail;
 
   for (int col0 = 0; col0 < att_len; col0 += TILE_TOKENS) {
     const int tile_count = min(TILE_TOKENS, att_len - col0);
@@ -1444,141 +1473,60 @@ void paged_flash_attention_kernel_full(
     __syncthreads();
 
     float partial = 0.f;
-    const int cp = sColPos[tx];
+    int cp = sColPos[tx];
     if (col_in_range && cp >= 0) {
       const hip_bfloat16 *k_ptr = key_head + (size_t)cp * (size_t)kv_dim;
-      for (int k = ty; k < dot_dim; k += 4) {
+      const int dot_vec4 = dot_dim >> 2;
+      for (int vec = ty; vec < dot_vec4; vec += 2) {
+        int q_idx = vec * 4;
+        float4 kv = bfloat16_to_float4(k_ptr + q_idx);
+        partial = fmaf(shared_q[q_idx + 0], kv.x, partial);
+        partial = fmaf(shared_q[q_idx + 1], kv.y, partial);
+        partial = fmaf(shared_q[q_idx + 2], kv.z, partial);
+        partial = fmaf(shared_q[q_idx + 3], kv.w, partial);
+      }
+      const int tail_start = dot_vec4 << 2;
+      for (int k = tail_start + ty; k < dot_dim; k += 2) {
         float q_val = shared_q[k];
         float k_val = bfloat16_to_float(k_ptr[k]);
-        partial += q_val * k_val;
+        partial = fmaf(q_val, k_val, partial);
       }
     }
-    partial += __shfl_xor(partial, 16, 64);
     partial += __shfl_xor(partial, 32, 64);
 
-    if (ty == 0 && tx < TILE_TOKENS) {
-      float score = (tx < tile_count && sColPos[tx] >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
+    if (ty == 0 && tx < tile_count) {
+      float score = (cp >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
       sh_scores[tx] = score;
-    }
-    __syncthreads();
-
-    for (int idx4 = threadIdx.x; idx4 < tile_count * head_dim_vec4; idx4 += blockDim.x) {
-      int t = idx4 / head_dim_vec4;
-      int d4 = idx4 % head_dim_vec4;
-      int d = d4 * 4;
-      ushort4v val4 = {0u, 0u, 0u, 0u};
-      int cp = sColPos[t];
-      if (cp >= 0) {
-        const ushort4v *src = reinterpret_cast<const ushort4v*>(value_head + (size_t)cp * (size_t)kv_dim + (size_t)d);
-        val4 = *src;
-      }
-      reinterpret_cast<ushort4v*>(shared_v + (size_t)t * (size_t)head_dim + (size_t)d)[0] = val4;
-    }
-
-    if (head_dim_tail > 0) {
-      for (int idx = threadIdx.x; idx < tile_count * head_dim_tail; idx += blockDim.x) {
-        int t = idx / head_dim_tail;
-        int off = idx % head_dim_tail;
-        int cp = sColPos[t];
-        hip_bfloat16 val = hip_bfloat16(0.0f);
-        if (cp >= 0) {
-          val = value_head[(size_t)cp * (size_t)kv_dim + (size_t)tail_offset + (size_t)off];
-        }
-        shared_v[(size_t)t * (size_t)head_dim + (size_t)tail_offset + (size_t)off] = val;
-      }
+    } else if (ty == 0 && tx < TILE_TOKENS) {
+      sh_scores[tx] = -INFINITY;
     }
     __syncthreads();
 
     float score_local = (ty == 0 && tx < tile_count) ? sh_scores[tx] : -INFINITY;
     float tile_max = score_local;
     for (int offset = 32; offset > 0; offset >>= 1) {
-      float other = __shfl_xor(tile_max, offset, 64);
+      float other = __shfl_down(tile_max, offset, 64);
       tile_max = fmaxf(tile_max, other);
     }
+    tile_max = __shfl(tile_max, 0, 64);
 
-    float m_prev = s_m;
-    float l_prev = s_l;
-    float m_new = (tile_count > 0) ? fmaxf(m_prev, tile_max) : m_prev;
+    float m_new = fmaxf(m_prev, tile_max);
     float p_scale = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - m_new);
 
-    float p = 0.0f;
     if (ty == 0 && tx < tile_count) {
-      p = expf(score_local - m_new);
-      sh_probs[tx] = p;
+      float score_val = sh_scores[tx];
+      sh_probs[tx] = expf(score_val - m_new);
+    } else if (ty == 0 && tx < TILE_TOKENS) {
+      sh_probs[tx] = 0.0f;
     }
+    __syncthreads();
 
-    float tile_sum = p;
+    float tile_sum = (ty == 0 && tx < tile_count) ? sh_probs[tx] : 0.0f;
     for (int offset = 32; offset > 0; offset >>= 1) {
-      tile_sum += __shfl_xor(tile_sum, offset, 64);
+      tile_sum += __shfl_down(tile_sum, offset, 64);
     }
+    tile_sum = __shfl(tile_sum, 0, 64);
 
-    if (threadIdx.x == 0) {
-      s_tile_pscale = (tile_count > 0) ? p_scale : 0.0f;
-      s_tile_count = tile_count;
-      s_m = m_new;
-      s_l = l_prev * s_tile_pscale + tile_sum;
-    }
-    __syncthreads();
-
-    p_scale = s_tile_pscale;
-    int active_tokens = s_tile_count;
-
-    if (base_active && p_scale != 0.0f) {
-      if (full_vec) {
-        acc4.x *= p_scale;
-        acc4.y *= p_scale;
-        acc4.z *= p_scale;
-        acc4.w *= p_scale;
-      } else {
-        #pragma unroll
-        for (int t = 0; t < 4; ++t) {
-          tail_acc[t] *= p_scale;
-        }
-      }
-    }
-
-    if (base_active) {
-      for (int t = 0; t < active_tokens; ++t) {
-        float p = sh_probs[t];
-        if (p <= 0.f) continue;
-        const hip_bfloat16 *v_ptr = shared_v + (size_t)t * (size_t)head_dim + (size_t)base;
-        if (full_vec) {
-          float4 v = bfloat16_to_float4(v_ptr);
-          acc4.x += p * v.x;
-          acc4.y += p * v.y;
-          acc4.z += p * v.z;
-          acc4.w += p * v.w;
-        } else {
-          #pragma unroll
-          for (int i = 0; i < 4; ++i) {
-            int elem = base + i;
-            if (elem < head_dim) {
-              tail_acc[i] += p * bfloat16_to_float(v_ptr[i]);
-            }
-          }
-        }
-      }
-    }
-    __syncthreads();
-  }
-
-  bool has_sink = ((pos + 1) < seq_len);
-  if (has_sink) {
-    if (threadIdx.x == 0) {
-      float m_prev = s_m;
-      float l_prev = s_l;
-      size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
-      float sink_score = bfloat16_to_float(attn_sinks[sink_idx]);
-      float m_new = fmaxf(m_prev, sink_score);
-      float p_scale = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - m_new);
-      float p = expf(sink_score - m_new);
-      s_tile_pscale = p_scale;
-      s_m = m_new;
-      s_l = l_prev * p_scale + p;
-    }
-    __syncthreads();
-
-    float p_scale = s_tile_pscale;
     if (base_active && p_scale != 0.0f) {
       if (full_vec) {
         acc4.x *= p_scale;
@@ -1592,11 +1540,64 @@ void paged_flash_attention_kernel_full(
         }
       }
     }
+
+    if (base_active) {
+      for (int t = 0; t < tile_count; ++t) {
+        float prob = sh_probs[t];
+        if (prob <= 0.f) continue;
+        int cp_t = sColPos[t];
+        if (cp_t < 0) continue;
+        const hip_bfloat16 *v_ptr = value_head + (size_t)cp_t * (size_t)kv_dim + (size_t)base;
+        if (full_vec) {
+          float4 v = bfloat16_to_float4(v_ptr);
+          acc4.x = fmaf(prob, v.x, acc4.x);
+          acc4.y = fmaf(prob, v.y, acc4.y);
+          acc4.z = fmaf(prob, v.z, acc4.z);
+          acc4.w = fmaf(prob, v.w, acc4.w);
+        } else {
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            int elem = base + i;
+            if (elem < head_dim) {
+              float v_val = bfloat16_to_float(v_ptr[i]);
+              tail_acc[i] = fmaf(prob, v_val, tail_acc[i]);
+            }
+          }
+        }
+      }
+    }
+
+    m_prev = m_new;
+    l_prev = l_prev * p_scale + tile_sum;
+
     __syncthreads();
   }
 
-  float denom = s_l;
-  float inv_denom = (denom > 1e-8f) ? (1.0f / denom) : 0.0f;
+  bool has_sink = ((pos + 1) < seq_len);
+  if (has_sink) {
+    size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
+    float sink_score = bfloat16_to_float(attn_sinks[sink_idx]);
+    float m_new = fmaxf(m_prev, sink_score);
+    float p_scale = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - m_new);
+    float p = expf(sink_score - m_new);
+    if (base_active && p_scale != 0.0f) {
+      if (full_vec) {
+        acc4.x *= p_scale;
+        acc4.y *= p_scale;
+        acc4.z *= p_scale;
+        acc4.w *= p_scale;
+      } else {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          tail_acc[i] *= p_scale;
+        }
+      }
+    }
+    l_prev = l_prev * p_scale + p;
+    m_prev = m_new;
+  }
+
+  float inv_denom = (l_prev > 1e-8f) ? (1.0f / l_prev) : 0.0f;
 
   if (base_active) {
     if (full_vec) {
@@ -2736,8 +2737,9 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
 
       if (layer_sliding) {
         int layer_capacity = gpu_ctx->state.sliding_window_tokens;
-        size_t shared_mem_bytes = (size_t)(layer_capacity + 1) * sizeof(float);
-        shared_mem_bytes += (size_t)round_up16(head_dim) * sizeof(float);
+        constexpr int kTileTokensSliding = 32;
+        size_t shared_mem_bytes = (size_t)round_up16(head_dim) * sizeof(float);
+        shared_mem_bytes += (size_t)kTileTokensSliding * sizeof(float) * 2;
 
         paged_flash_attention_kernel_sliding<<<grid, block, shared_mem_bytes, gpu_ctx->batch_stream>>>(
           gpu_ctx->state.qkv,
@@ -2760,9 +2762,8 @@ void gpu_forward_batch_step(Transformer *transformer, GPUContext *gpu_ctx,
           gpu_ctx->d_slot_ids);
       } else {
         int layer_idx_full = sliding_enabled ? full_layer_index(l) : l;
-        constexpr int kTileTokens = 16;
+        constexpr int kTileTokens = 32;
         size_t shared_mem_bytes = (size_t)round_up16(head_dim) * sizeof(float);
-        shared_mem_bytes += ((size_t)kTileTokens * (size_t)head_dim + 1) * sizeof(hip_bfloat16);
         shared_mem_bytes += (size_t)kTileTokens * sizeof(float) * 2;
 
         paged_flash_attention_kernel_full<<<grid, block, shared_mem_bytes, gpu_ctx->batch_stream>>>(
