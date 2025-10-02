@@ -64,7 +64,6 @@ constexpr int MLP_MFMA_M = 32;
 constexpr int MLP_MFMA_N = 32;
 constexpr int MLP_MFMA_K = 8;
 constexpr int MAX_MLP_ROW_TILES = 16;
-constexpr int MLP_MFMA_COL_GROUP = 2;
 constexpr int MLP_MFMA_K_STAGES = 2;
 
 static int clamp_row_tiles(int tiles) {
@@ -2047,7 +2046,7 @@ void mlp1_grouped_mfma32_fused_swiglu_kernel(
   const size_t block_stride_vals = (size_t)block_cols_aligned * (size_t)K;
   const hip_bfloat16* __restrict__ x_block = Xpack + block_stride_vals * (size_t)block_id;
 
-  __shared__ __align__(16) uint16_t sXbf16[MLP_MFMA_COL_GROUP][MLP_MFMA_K_STAGES][MLP_MFMA_K * MLP_MFMA_N];
+  __shared__ __align__(16) uint16_t sXbf16[MLP_MFMA_K_STAGES][MLP_MFMA_K * MLP_MFMA_N];
   __shared__ __align__(16) float sBias[MAX_MLP_ROW_TILES][MLP_MFMA_M];
 
   float* __restrict__ sBias_tile = sBias[wave_id];
@@ -2065,55 +2064,21 @@ void mlp1_grouped_mfma32_fused_swiglu_kernel(
   const int I = Mout >> 1;
   const size_t tile_row_offset = (size_t)tile_m_global * tiles_per_row;
 
-  constexpr int COL_TILE_GROUP = MLP_MFMA_COL_GROUP;
-
-  float16v acc_group[COL_TILE_GROUP];
-  bool tile_valid[COL_TILE_GROUP];
-  bool tile_full_active[COL_TILE_GROUP];
-  int col_bases[COL_TILE_GROUP];
-
-  for (int tile_base = 0; tile_base < col_tiles_per_block; tile_base += COL_TILE_GROUP) {
-    int tiles_in_group = col_tiles_per_block - tile_base;
-    if (tiles_in_group > COL_TILE_GROUP) tiles_in_group = COL_TILE_GROUP;
-
-    #pragma unroll
-    for (int t = 0; t < COL_TILE_GROUP; ++t) {
-      acc_group[t] = float16v{};
-      tile_valid[t] = false;
-      tile_full_active[t] = false;
-      col_bases[t] = 0;
-    }
-
-    bool any_tile_valid = false;
-
-    #pragma unroll
-    for (int t = 0; t < COL_TILE_GROUP; ++t) {
-      if (t >= tiles_in_group) continue;
-      const int col_base = col_block_base + (tile_base + t) * MLP_MFMA_N;
-      col_bases[t] = col_base;
-      const bool valid = col_base < Bpad_live;
-      tile_valid[t] = valid;
-      if (valid) {
-        tile_full_active[t] = (col_base + MLP_MFMA_N - 1) < Btotal_live;
-        any_tile_valid = true;
-      }
-    }
-
-    if (!any_tile_valid) {
+  for (int tile_idx = 0; tile_idx < col_tiles_per_block; ++tile_idx) {
+    const int col_base = col_block_base + tile_idx * MLP_MFMA_N;
+    if (col_base >= Bpad_live) {
       continue;
     }
 
+    const bool tile_full_active = (col_base + MLP_MFMA_N - 1) < Btotal_live;
+    float16v acc = float16v{};
     int stage = 0;
 
     if (tiles_k > 0) {
       if (wave_id == 0) {
-        #pragma unroll
-        for (int t = 0; t < COL_TILE_GROUP; ++t) {
-          if (!tile_valid[t]) continue;
-          load_x_tile_to_shared(&sXbf16[t][stage][0], x_block, lane_in_wave, 0,
-                                block_cols_aligned, (tile_base + t) * MLP_MFMA_N, K,
-                                col_bases[t], Btotal_live, tile_full_active[t]);
-        }
+        load_x_tile_to_shared(&sXbf16[stage][0], x_block, lane_in_wave, 0,
+                              block_cols_aligned, tile_idx * MLP_MFMA_N, K,
+                              col_base, Btotal_live, tile_full_active);
       }
       __syncthreads();
 
@@ -2130,26 +2095,18 @@ void mlp1_grouped_mfma32_fused_swiglu_kernel(
         }
 
         if (tile_active) {
-          #pragma unroll
-          for (int t = 0; t < COL_TILE_GROUP; ++t) {
-            if (!tile_valid[t]) continue;
-            const uint16_t* sX_tile = &sXbf16[t][stage][0];
-            const short4v Breg = load_mlp1_x_fragment(sX_tile, lane_col, lane_wave);
-            acc_group[t] = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(
-                w_frag, Breg, acc_group[t], 0, 0, 0);
-          }
+          const uint16_t* sX_tile = &sXbf16[stage][0];
+          const short4v Breg = load_mlp1_x_fragment(sX_tile, lane_col, lane_wave);
+          acc = __builtin_amdgcn_mfma_f32_32x32x8bf16_1k(
+              w_frag, Breg, acc, 0, 0, 0);
         }
 
         const int next_stage = stage ^ 1;
         if ((kk + 1) < tiles_k) {
           if (wave_id == 0) {
-            #pragma unroll
-            for (int t = 0; t < COL_TILE_GROUP; ++t) {
-              if (!tile_valid[t]) continue;
-              load_x_tile_to_shared(&sXbf16[t][next_stage][0], x_block, lane_in_wave, kk + 1,
-                                    block_cols_aligned, (tile_base + t) * MLP_MFMA_N, K,
-                                    col_bases[t], Btotal_live, tile_full_active[t]);
-            }
+            load_x_tile_to_shared(&sXbf16[next_stage][0], x_block, lane_in_wave, kk + 1,
+                                  block_cols_aligned, tile_idx * MLP_MFMA_N, K,
+                                  col_base, Btotal_live, tile_full_active);
           }
           __syncthreads();
           stage = next_stage;
@@ -2157,14 +2114,10 @@ void mlp1_grouped_mfma32_fused_swiglu_kernel(
       }
     }
 
-    #pragma unroll
-    for (int t = 0; t < COL_TILE_GROUP; ++t) {
-      if (!tile_valid[t]) continue;
-      store_gate_tile(acc_group[t], lane_col, lane_wave, lane_in_wave,
-                      base_row, Mout, I, tile_active, col_bases[t],
-                      Btotal_live, has_bias, sBias_tile, gate_up_out,
-                      out_stride_cols, swiglu_limit, alpha);
-    }
+    store_gate_tile(acc, lane_col, lane_wave, lane_in_wave,
+                    base_row, Mout, I, tile_active, col_base,
+                    Btotal_live, has_bias, sBias_tile, gate_up_out,
+                    out_stride_cols, swiglu_limit, alpha);
   }
 
 }
