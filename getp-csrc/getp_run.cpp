@@ -695,7 +695,6 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   __shared__ __align__(16) float sBias[MLP1_WAVES_PER_BLOCK * 32];
   __shared__ __align__(16) const hip_bfloat16* sXPtrs[32];
   __shared__ __align__(16) float* sOutPtrs[32];
-  __shared__ __align__(16) uint8_t sScaleCodes[MLP1_WAVES_PER_BLOCK * 32];
   short4v* __restrict__ sXvec = reinterpret_cast<short4v*>(sXbf16);
 
   const int rows_remaining = out_dim - base_row_group;
@@ -709,7 +708,6 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
   const bool full_row_tile = tile_active && ((base_row + 31) < out_dim);
 
   uint16_t* __restrict__ sWbf16_tile = sWbf16 + wave_id * 32 * 8;
-  uint8_t* __restrict__ sScaleCodes_tile = sScaleCodes + wave_id * 32;
   float* __restrict__ sBias_tile = sBias + wave_id * 32;
   short4v* __restrict__ sWvec_tile = reinterpret_cast<short4v*>(sWbf16_tile);
 
@@ -742,20 +740,9 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
     const bool fast_w_tile = full_row_tile && full_k_tile;
     const bool fast_x_tile = all_cols_active && full_k_tile;
 
-    if (tile_active && lane_in_wave < 32) {
-      const size_t tile_linear = (size_t)tile_m_global * tiles_per_row + (size_t)kk;
-      const uint8_t* __restrict__ tile_base = Wtiles + tile_linear * tile_packet_bytes;
-      uint8_t scale_code = static_cast<uint8_t>(0x7F);
-      const int row = base_row + lane_in_wave;
-      if (row < out_dim) {
-        scale_code = tile_base[lane_in_wave];
-      }
-      sScaleCodes_tile[lane_in_wave] = scale_code;
-    }
-    __syncthreads();
-
     if (tile_active) {
       const size_t tile_linear = (size_t)tile_m_global * tiles_per_row + (size_t)kk;
+      const uint8_t* __restrict__ tile_base = Wtiles + tile_linear * tile_packet_bytes;
       const size_t tile_base_byte = tile_linear * tile_packet_bytes + MXFP4_TILE32X8_SCALE_BYTES;
 
       int idx4 = lane_in_wave * 4;
@@ -766,7 +753,10 @@ void mlp1_grouped_mfma_matvec_mxfp4_kernel(
         int col_base = kk * 8 + ik_base;
         size_t byte_off = tile_base_byte + static_cast<size_t>(idx4 >> 1);
         uint16_t packed16 = *reinterpret_cast<const uint16_t*>(Wtiles + byte_off);
-        const uint8_t scale_code = sScaleCodes_tile[im];
+        uint8_t scale_code = static_cast<uint8_t>(0x7F);
+        if (row < out_dim) {
+          scale_code = tile_base[im];
+        }
         const uint16_t* __restrict__ lut_row = MXFP4_DEQUANT_LUT_BF16[scale_code];
         short4v wvec = {0, 0, 0, 0};
         if (fast_w_tile) {
