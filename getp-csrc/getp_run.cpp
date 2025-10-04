@@ -256,6 +256,14 @@ __device__ __host__ __forceinline__ float bfloat16_to_float(hip_bfloat16 bf) {
 }
 static_assert(sizeof(hip_bfloat16) == 2, "hip_bfloat16 is expected to be 2 bytes");
 
+__host__ __device__ __forceinline__ float fast_exp(float x) {
+#if defined(__HIP_DEVICE_COMPILE__)
+  return __expf(x);
+#else
+  return expf(x);
+#endif
+}
+
 __device__ __forceinline__ float4 bfloat16_to_float4(const hip_bfloat16 *bf16_ptr);
 __host__ __device__ __forceinline__ int round_up16(int x) { return ((x + 15) / 16) * 16; }
 __host__ __device__ __forceinline__ int round_up32(int x) { return ((x + 31) / 32) * 32; }
@@ -1187,8 +1195,11 @@ void paged_flash_attention_kernel_sliding(
   const hip_bfloat16 *key_head = key_cache_layer + (size_t)head_base;
   const hip_bfloat16 *value_head = value_cache_layer + (size_t)head_base;
   const int dot_dim = min(head_dim, kv_dim);
-
+  const int dot_vec4 = dot_dim >> 2;
+  const int tail_start = dot_vec4 << 2;
+  const size_t kv_stride = (size_t)kv_dim;
   __shared__ int sColPos[TILE_TOKENS];
+  __shared__ size_t sOffsets[TILE_TOKENS];
 
   float m_prev = -INFINITY;
   float l_prev = 0.0f;
@@ -1196,11 +1207,9 @@ void paged_flash_attention_kernel_sliding(
   const int base = threadIdx.x * 4;
   const bool base_active = (base < head_dim);
   const bool full_vec = (base + 3) < head_dim;
+  const size_t base_offset = (size_t)base;
   float4 acc4 = {0.f, 0.f, 0.f, 0.f};
   float tail_acc[4] = {0.f, 0.f, 0.f, 0.f};
-
-  const int dot_vec4 = dot_dim >> 2;
-  const int tail_start = dot_vec4 << 2;
 
   for (int col0 = 0; col0 < att_len; col0 += TILE_TOKENS) {
     const int tile_count = min(TILE_TOKENS, att_len - col0);
@@ -1209,10 +1218,12 @@ void paged_flash_attention_kernel_sliding(
     if (ty == 0 && tx < TILE_TOKENS) {
       if (col_in_range) {
         int cp = cache_base + col0 + tx;
-        while (cp >= layer_capacity) cp -= layer_capacity;
+        if (cp >= layer_capacity) cp -= layer_capacity;
         sColPos[tx] = cp;
+        sOffsets[tx] = (cp >= 0) ? (static_cast<size_t>(cp) * kv_stride) : 0;
       } else {
         sColPos[tx] = -1;
+        sOffsets[tx] = 0;
       }
     }
     __syncthreads();
@@ -1220,8 +1231,26 @@ void paged_flash_attention_kernel_sliding(
     float partial = 0.f;
     int cp = sColPos[tx];
     if (col_in_range && cp >= 0) {
-      const hip_bfloat16 *k_ptr = key_head + (size_t)cp * (size_t)kv_dim;
-      for (int vec = ty; vec < dot_vec4; vec += 2) {
+      const hip_bfloat16 *k_ptr = key_head + sOffsets[tx];
+
+      int vec = ty;
+      for (; vec + 2 < dot_vec4; vec += 4) {
+        int q_idx0 = vec * 4;
+        float4 kv0 = bfloat16_to_float4(k_ptr + q_idx0);
+        partial = fmaf(shared_q[q_idx0 + 0], kv0.x, partial);
+        partial = fmaf(shared_q[q_idx0 + 1], kv0.y, partial);
+        partial = fmaf(shared_q[q_idx0 + 2], kv0.z, partial);
+        partial = fmaf(shared_q[q_idx0 + 3], kv0.w, partial);
+
+        int vec1 = vec + 2;
+        int q_idx1 = vec1 * 4;
+        float4 kv1 = bfloat16_to_float4(k_ptr + q_idx1);
+        partial = fmaf(shared_q[q_idx1 + 0], kv1.x, partial);
+        partial = fmaf(shared_q[q_idx1 + 1], kv1.y, partial);
+        partial = fmaf(shared_q[q_idx1 + 2], kv1.z, partial);
+        partial = fmaf(shared_q[q_idx1 + 3], kv1.w, partial);
+      }
+      for (; vec < dot_vec4; vec += 2) {
         int q_idx = vec * 4;
         float4 kv = bfloat16_to_float4(k_ptr + q_idx);
         partial = fmaf(shared_q[q_idx + 0], kv.x, partial);
@@ -1254,11 +1283,18 @@ void paged_flash_attention_kernel_sliding(
     tile_max = __shfl(tile_max, 0, 64);
 
     float m_new = fmaxf(m_prev, tile_max);
-    float p_scale = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - m_new);
+    float p_scale = 0.0f;
+    if (m_prev == -INFINITY) {
+      p_scale = 0.0f;
+    } else if (m_new == m_prev) {
+      p_scale = 1.0f;
+    } else {
+      p_scale = fast_exp(m_prev - m_new);
+    }
 
     if (ty == 0 && tx < tile_count) {
       float score_val = sh_scores[tx];
-      sh_probs[tx] = expf(score_val - m_new);
+      sh_probs[tx] = (score_val == -INFINITY) ? 0.0f : fast_exp(score_val - m_new);
     } else if (ty == 0 && tx < TILE_TOKENS) {
       sh_probs[tx] = 0.0f;
     }
@@ -1290,7 +1326,7 @@ void paged_flash_attention_kernel_sliding(
         if (prob <= 0.f) continue;
         int cp_t = sColPos[t];
         if (cp_t < 0) continue;
-        const hip_bfloat16 *v_ptr = value_head + (size_t)cp_t * (size_t)kv_dim + (size_t)base;
+        const hip_bfloat16 *v_ptr = value_head + sOffsets[t] + base_offset;
         if (full_vec) {
           float4 v = bfloat16_to_float4(v_ptr);
           acc4.x = fmaf(prob, v.x, acc4.x);
@@ -1321,8 +1357,22 @@ void paged_flash_attention_kernel_sliding(
     size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
     float sink_score = bfloat16_to_float(attn_sinks[sink_idx]);
     float m_new = fmaxf(m_prev, sink_score);
-    float p_scale = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - m_new);
-    float p = expf(sink_score - m_new);
+    float p_scale = 0.0f;
+    if (m_prev == -INFINITY) {
+      p_scale = 0.0f;
+    } else if (m_new == m_prev) {
+      p_scale = 1.0f;
+    } else {
+      p_scale = fast_exp(m_prev - m_new);
+    }
+    float p = 0.0f;
+    if (sink_score == -INFINITY) {
+      p = 0.0f;
+    } else if (sink_score == m_new) {
+      p = 1.0f;
+    } else {
+      p = fast_exp(sink_score - m_new);
+    }
     if (base_active && p_scale != 0.0f) {
       if (full_vec) {
         acc4.x *= p_scale;
@@ -1441,8 +1491,12 @@ void paged_flash_attention_kernel_full(
   const hip_bfloat16 *key_head = key_cache_layer + (size_t)head_base;
   const hip_bfloat16 *value_head = value_cache_layer + (size_t)head_base;
   const int dot_dim = min(head_dim, kv_dim);
+  const int dot_vec4 = dot_dim >> 2;
+  const int tail_start = dot_vec4 << 2;
+  const size_t kv_stride = (size_t)kv_dim;
 
   __shared__ int sColPos[TILE_TOKENS];
+  __shared__ size_t sOffsets[TILE_TOKENS];
 
   float m_prev = -INFINITY;
   float l_prev = 0.0f;
@@ -1450,6 +1504,7 @@ void paged_flash_attention_kernel_full(
   const int base = threadIdx.x * 4;
   const bool base_active = (base < head_dim);
   const bool full_vec = (base + 3) < head_dim;
+  const size_t base_offset = (size_t)base;
   float4 acc4 = {0.f, 0.f, 0.f, 0.f};
   float tail_acc[4] = {0.f, 0.f, 0.f, 0.f};
 
@@ -1461,12 +1516,12 @@ void paged_flash_attention_kernel_full(
     if (ty == 0 && tx < TILE_TOKENS) {
       if (col_in_range) {
         int cp = cache_base + col;
-        if (layer_capacity > 0) {
-          while (cp >= layer_capacity) cp -= layer_capacity;
-        }
+        if (layer_capacity > 0 && cp >= layer_capacity) cp -= layer_capacity;
         sColPos[tx] = cp;
+        sOffsets[tx] = (cp >= 0) ? (static_cast<size_t>(cp) * kv_stride) : 0;
       } else {
         sColPos[tx] = -1;
+        sOffsets[tx] = 0;
       }
     }
     __syncthreads();
@@ -1474,9 +1529,26 @@ void paged_flash_attention_kernel_full(
     float partial = 0.f;
     int cp = sColPos[tx];
     if (col_in_range && cp >= 0) {
-      const hip_bfloat16 *k_ptr = key_head + (size_t)cp * (size_t)kv_dim;
-      const int dot_vec4 = dot_dim >> 2;
-      for (int vec = ty; vec < dot_vec4; vec += 2) {
+      const hip_bfloat16 *k_ptr = key_head + sOffsets[tx];
+
+      int vec = ty;
+      for (; vec + 2 < dot_vec4; vec += 4) {
+        int q_idx0 = vec * 4;
+        float4 kv0 = bfloat16_to_float4(k_ptr + q_idx0);
+        partial = fmaf(shared_q[q_idx0 + 0], kv0.x, partial);
+        partial = fmaf(shared_q[q_idx0 + 1], kv0.y, partial);
+        partial = fmaf(shared_q[q_idx0 + 2], kv0.z, partial);
+        partial = fmaf(shared_q[q_idx0 + 3], kv0.w, partial);
+
+        int vec1 = vec + 2;
+        int q_idx1 = vec1 * 4;
+        float4 kv1 = bfloat16_to_float4(k_ptr + q_idx1);
+        partial = fmaf(shared_q[q_idx1 + 0], kv1.x, partial);
+        partial = fmaf(shared_q[q_idx1 + 1], kv1.y, partial);
+        partial = fmaf(shared_q[q_idx1 + 2], kv1.z, partial);
+        partial = fmaf(shared_q[q_idx1 + 3], kv1.w, partial);
+      }
+      for (; vec < dot_vec4; vec += 2) {
         int q_idx = vec * 4;
         float4 kv = bfloat16_to_float4(k_ptr + q_idx);
         partial = fmaf(shared_q[q_idx + 0], kv.x, partial);
@@ -1484,7 +1556,6 @@ void paged_flash_attention_kernel_full(
         partial = fmaf(shared_q[q_idx + 2], kv.z, partial);
         partial = fmaf(shared_q[q_idx + 3], kv.w, partial);
       }
-      const int tail_start = dot_vec4 << 2;
       for (int k = tail_start + ty; k < dot_dim; k += 2) {
         float q_val = shared_q[k];
         float k_val = bfloat16_to_float(k_ptr[k]);
@@ -1510,11 +1581,18 @@ void paged_flash_attention_kernel_full(
     tile_max = __shfl(tile_max, 0, 64);
 
     float m_new = fmaxf(m_prev, tile_max);
-    float p_scale = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - m_new);
+    float p_scale = 0.0f;
+    if (m_prev == -INFINITY) {
+      p_scale = 0.0f;
+    } else if (m_new == m_prev) {
+      p_scale = 1.0f;
+    } else {
+      p_scale = fast_exp(m_prev - m_new);
+    }
 
     if (ty == 0 && tx < tile_count) {
       float score_val = sh_scores[tx];
-      sh_probs[tx] = expf(score_val - m_new);
+      sh_probs[tx] = (score_val == -INFINITY) ? 0.0f : fast_exp(score_val - m_new);
     } else if (ty == 0 && tx < TILE_TOKENS) {
       sh_probs[tx] = 0.0f;
     }
@@ -1546,7 +1624,7 @@ void paged_flash_attention_kernel_full(
         if (prob <= 0.f) continue;
         int cp_t = sColPos[t];
         if (cp_t < 0) continue;
-        const hip_bfloat16 *v_ptr = value_head + (size_t)cp_t * (size_t)kv_dim + (size_t)base;
+        const hip_bfloat16 *v_ptr = value_head + sOffsets[t] + base_offset;
         if (full_vec) {
           float4 v = bfloat16_to_float4(v_ptr);
           acc4.x = fmaf(prob, v.x, acc4.x);
@@ -1577,8 +1655,22 @@ void paged_flash_attention_kernel_full(
     size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
     float sink_score = bfloat16_to_float(attn_sinks[sink_idx]);
     float m_new = fmaxf(m_prev, sink_score);
-    float p_scale = (m_prev == -INFINITY) ? 0.0f : expf(m_prev - m_new);
-    float p = expf(sink_score - m_new);
+    float p_scale = 0.0f;
+    if (m_prev == -INFINITY) {
+      p_scale = 0.0f;
+    } else if (m_new == m_prev) {
+      p_scale = 1.0f;
+    } else {
+      p_scale = fast_exp(m_prev - m_new);
+    }
+    float p = 0.0f;
+    if (sink_score == -INFINITY) {
+      p = 0.0f;
+    } else if (sink_score == m_new) {
+      p = 1.0f;
+    } else {
+      p = fast_exp(sink_score - m_new);
+    }
     if (base_active && p_scale != 0.0f) {
       if (full_vec) {
         acc4.x *= p_scale;
