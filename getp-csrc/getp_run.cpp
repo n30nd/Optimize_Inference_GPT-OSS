@@ -2733,7 +2733,7 @@ __device__ inline float block_reduce_sum(float val, float *shared) {
 // ========= FlashAttention v2 (drop-in, tối ưu vi mô) =========
 
 #ifndef FA_V2_BK_FULL
-#define FA_V2_BK_FULL 64  // BK=64 thường hợp lý cho head_dim 64..128 (có thể 32/128 tùy profile)
+#define FA_V2_BK_FULL 32  // BK=64 thường hợp lý cho head_dim 64..128 (có thể 32/128 tùy profile)
 #endif
 // Gợi ý lượng shared mem để set khi launch (giữ nguyên chữ ký cũ)
 static inline size_t flash_attention_v2_smem_bytes(int head_dim, int BK = 64) {
@@ -2935,7 +2935,7 @@ void flash_attention_full(
 }
 
 #ifndef FA_V2_BK
-#define FA_V2_BK 64  // BK=64 thường hợp lý cho head_dim 64..128 (có thể 32/128 tùy profile)
+#define FA_V2_BK 32  // BK=64 thường hợp lý cho head_dim 64..128 (có thể 32/128 tùy profile)
 #endif
 
 __global__ __launch_bounds__(64)
