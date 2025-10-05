@@ -1432,15 +1432,20 @@ void paged_flash_attention_kernel_full(
     int q_stride,
     const int * __restrict__ slot_ids) {
 
+  // Size of the KV tile processed per loop iteration (matches warp width)
   constexpr int TILE_TOKENS = 32;
 
+  // Each block covers one attention head for one batch slot
   int h = blockIdx.y;
   int b = blockIdx.z;
   if (h >= n_heads || b >= batch) return;
 
+  // Map logical batch slot to physical slot id (handles paged decoding)
   int sid = slot_ids ? slot_ids[b] : b;
+  // Pointer to the output vector for the current (slot, head)
   float *output = all_output + (size_t)sid * (size_t)(n_heads * head_dim) + (size_t)h * (size_t)head_dim;
 
+  // Guard against missing/full cache data; fall back to zeros when cache is unusable
   const bool valid_cache = key_cache_full && value_cache_full &&
                            (full_layers > 0) && (layer_capacity > 0) &&
                            (full_layer_index_param >= 0) && (full_layer_index_param < full_layers);
@@ -1451,14 +1456,17 @@ void paged_flash_attention_kernel_full(
     return;
   }
 
+  // Absolute decode position for this sequence (current token index)
   int pos = pos_list[b];
 
+  // Fetch Q vector for the active head and the corresponding K/V cache layers
   const float *q_head = all_q + (size_t)sid * (size_t)q_stride + (size_t)h * (size_t)head_dim;
   const hip_bfloat16 *key_cache_layer = kv_cache_layer_ptr(key_cache_full, sid, full_layer_index_param,
                                                            full_layers, layer_capacity, kv_dim);
   const hip_bfloat16 *value_cache_layer = kv_cache_layer_ptr(value_cache_full, sid, full_layer_index_param,
                                                              full_layers, layer_capacity, kv_dim);
 
+  // Determine how many cached tokens we can attend to (ring buffer semantics)
   int att_len = pos + 1;
   if (att_len > layer_capacity) att_len = layer_capacity;
   if (att_len < 0) att_len = 0;
@@ -1471,36 +1479,43 @@ void paged_flash_attention_kernel_full(
     if (cache_base < 0) cache_base += layer_capacity;
   }
 
+  // Shared memory layout: [aligned Q][scores][softmax probs]
   const int head_dim_aligned = round_up16(head_dim);
   extern __shared__ unsigned char smem_raw[];
   float *shared_q = reinterpret_cast<float*>(smem_raw);
   float *sh_scores = shared_q + head_dim_aligned;
   float *sh_probs = sh_scores + TILE_TOKENS;
 
+  // Stage Q into shared memory (pad to 16 for vectorized loads)
   for (int idx = threadIdx.x; idx < head_dim_aligned; idx += blockDim.x) {
     shared_q[idx] = (idx < head_dim) ? q_head[idx] : 0.f;
   }
   __syncthreads();
 
+  // Per-thread identifiers within the 64-thread block
   const int lane_id = threadIdx.x;
-  const int tx = lane_id & (TILE_TOKENS - 1);
-  const int ty = lane_id >> 5;
-  const float inv_sqrt_d = rsqrtf((float)head_dim);
-  const int head_base = (h / kv_mul) * head_dim;
+  const int tx = lane_id & (TILE_TOKENS - 1);  // lane within the tile (0..31)
+  const int ty = lane_id >> 5;                 // warp id (0 or 1 on RDNA/CDNA)
+  const float inv_sqrt_d = rsqrtf((float)head_dim);  // 1/sqrt(d) scaling for dot products
+  const int head_base = (h / kv_mul) * head_dim;      // Multi-query head remapping
 
+  // Base pointers for the current KV head
   const hip_bfloat16 *key_head = key_cache_layer + (size_t)head_base;
   const hip_bfloat16 *value_head = value_cache_layer + (size_t)head_base;
-  const int dot_dim = min(head_dim, kv_dim);
-  const int dot_vec4 = dot_dim >> 2;
-  const int tail_start = dot_vec4 << 2;
-  const size_t kv_stride = (size_t)kv_dim;
+  const int dot_dim = min(head_dim, kv_dim);          // MQA allows kv_dim <= head_dim
+  const int dot_vec4 = dot_dim >> 2;                  // Vectorized chunk count (float4)
+  const int tail_start = dot_vec4 << 2;               // Starting index of the scalar tail
+  const size_t kv_stride = (size_t)kv_dim;            // Advance between tokens in cache
 
+  // Shared buffers with per-token metadata (index in ring buffer and byte offset)
   __shared__ int sColPos[TILE_TOKENS];
   __shared__ size_t sOffsets[TILE_TOKENS];
 
+  // Online softmax running max (m_prev) and sum of exp values (l_prev)
   float m_prev = -INFINITY;
   float l_prev = 0.0f;
 
+  // Each thread accumulates 4 output elements (vectorized) when possible
   const int base = threadIdx.x * 4;
   const bool base_active = (base < head_dim);
   const bool full_vec = (base + 3) < head_dim;
@@ -1508,11 +1523,13 @@ void paged_flash_attention_kernel_full(
   float4 acc4 = {0.f, 0.f, 0.f, 0.f};
   float tail_acc[4] = {0.f, 0.f, 0.f, 0.f};
 
+  // Loop over the accessible KV tokens in tiles of TILE_TOKENS
   for (int col0 = 0; col0 < att_len; col0 += TILE_TOKENS) {
     const int tile_count = min(TILE_TOKENS, att_len - col0);
     const int col = col0 + tx;
     const bool col_in_range = (tx < tile_count);
 
+    // Warp 0 prepares the per-token cache positions and offsets inside shared memory
     if (ty == 0 && tx < TILE_TOKENS) {
       if (col_in_range) {
         int cp = cache_base + col;
@@ -1526,12 +1543,14 @@ void paged_flash_attention_kernel_full(
     }
     __syncthreads();
 
+    // Compute the partial dot-product q·k for the assigned token (two warps cooperate)
     float partial = 0.f;
     int cp = sColPos[tx];
     if (col_in_range && cp >= 0) {
       const hip_bfloat16 *k_ptr = key_head + sOffsets[tx];
 
       int vec = ty;
+      // Unrolled float4 FMAs: each iteration consumes 8 floats (two float4 loads)
       for (; vec + 2 < dot_vec4; vec += 4) {
         int q_idx0 = vec * 4;
         float4 kv0 = bfloat16_to_float4(k_ptr + q_idx0);
@@ -1548,6 +1567,7 @@ void paged_flash_attention_kernel_full(
         partial = fmaf(shared_q[q_idx1 + 2], kv1.z, partial);
         partial = fmaf(shared_q[q_idx1 + 3], kv1.w, partial);
       }
+      // Finish remaining float4 chunks (if any)
       for (; vec < dot_vec4; vec += 2) {
         int q_idx = vec * 4;
         float4 kv = bfloat16_to_float4(k_ptr + q_idx);
@@ -1556,14 +1576,17 @@ void paged_flash_attention_kernel_full(
         partial = fmaf(shared_q[q_idx + 2], kv.z, partial);
         partial = fmaf(shared_q[q_idx + 3], kv.w, partial);
       }
+      // Scalar tail for dimensions not divisible by 4 (each warp handles interleaved elements)
       for (int k = tail_start + ty; k < dot_dim; k += 2) {
         float q_val = shared_q[k];
         float k_val = bfloat16_to_float(k_ptr[k]);
         partial = fmaf(q_val, k_val, partial);
       }
     }
+    // Cross-warp reduction: sum partial contributions from the paired warp (ty=0/1)
     partial += __shfl_xor(partial, 32, 64);
 
+    // Warp 0 writes the scaled dot product (attention score) into shared memory
     if (ty == 0 && tx < tile_count) {
       float score = (cp >= 0) ? (partial * inv_sqrt_d) : -INFINITY;
       sh_scores[tx] = score;
@@ -1572,6 +1595,7 @@ void paged_flash_attention_kernel_full(
     }
     __syncthreads();
 
+    // Compute tile-level maximum for streaming softmax
     float score_local = (ty == 0 && tx < tile_count) ? sh_scores[tx] : -INFINITY;
     float tile_max = score_local;
     for (int offset = 32; offset > 0; offset >>= 1) {
@@ -1580,6 +1604,7 @@ void paged_flash_attention_kernel_full(
     }
     tile_max = __shfl(tile_max, 0, 64);
 
+    // Update running max and compute scaling for previous accumulator (m_prev, l_prev)
     float m_new = fmaxf(m_prev, tile_max);
     float p_scale = 0.0f;
     if (m_prev == -INFINITY) {
@@ -1590,6 +1615,7 @@ void paged_flash_attention_kernel_full(
       p_scale = fast_exp(m_prev - m_new);
     }
 
+    // Convert tile scores to exp(score - m_new) for numerically-stable softmax
     if (ty == 0 && tx < tile_count) {
       float score_val = sh_scores[tx];
       sh_probs[tx] = (score_val == -INFINITY) ? 0.0f : fast_exp(score_val - m_new);
@@ -1598,12 +1624,14 @@ void paged_flash_attention_kernel_full(
     }
     __syncthreads();
 
+    // Sum probabilities within the tile (only warp 0 carries data, but both warps reduce)
     float tile_sum = (ty == 0 && tx < tile_count) ? sh_probs[tx] : 0.0f;
     for (int offset = 32; offset > 0; offset >>= 1) {
       tile_sum += __shfl_down(tile_sum, offset, 64);
     }
     tile_sum = __shfl(tile_sum, 0, 64);
 
+    // Rescale previous value accumulators if the running max changed
     if (base_active && p_scale != 0.0f) {
       if (full_vec) {
         acc4.x *= p_scale;
@@ -1618,6 +1646,7 @@ void paged_flash_attention_kernel_full(
       }
     }
 
+    // Accumulate V contributions weighted by the tile probabilities
     if (base_active) {
       for (int t = 0; t < tile_count; ++t) {
         float prob = sh_probs[t];
@@ -1644,12 +1673,14 @@ void paged_flash_attention_kernel_full(
       }
     }
 
+    // Carry softmax statistics to the next tile iteration
     m_prev = m_new;
     l_prev = l_prev * p_scale + tile_sum;
 
     __syncthreads();
   }
 
+  // Optional attention sink token (e.g., extra bias vector) for future positions
   bool has_sink = ((pos + 1) < seq_len);
   if (has_sink) {
     size_t sink_idx = (size_t)layer * (size_t)n_heads + (size_t)h;
@@ -1688,6 +1719,7 @@ void paged_flash_attention_kernel_full(
     m_prev = m_new;
   }
 
+  // Final normalization by softmax denominator and write back to global memory
   float inv_denom = (l_prev > 1e-8f) ? (1.0f / l_prev) : 0.0f;
 
   if (base_active) {
@@ -3128,9 +3160,9 @@ void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   for (int d = 0; d < max_devices; ++d) {
     HIP_CHECK(hipSetDevice(d));
     gpu_contexts[d].device_id = d;
-    // Configure per-GPU max batch from env, default 512
+    // Configure per-GPU max batch from env, default 640
     const char *env_mb = getenv("GETP_MAX_BATCH");
-    int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 512;
+    int mb = (env_mb && atoi(env_mb) > 0) ? atoi(env_mb) : 640;
     gpu_contexts[d].max_batch = mb;
     log_gpu_mem(d, "[GPU] Before memory allocation on device:");
     gpu_copy_weights(&gpu_contexts[d].weights, &transformer->weights, &transformer->config);
