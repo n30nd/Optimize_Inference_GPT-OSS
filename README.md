@@ -1,3 +1,16 @@
+# Introduce project and some technical use
+
+File Introduce_project.pdf
+
+# Submit version
+
+Branch merge_code
+
+```bash
+git fetch origin
+git checkout merge_code
+git pull --ff-only origin merge_code
+```
 # Environment Setup
 
 ```bash
