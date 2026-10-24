@@ -1,7 +1,13 @@
-// getp on GPUs. Every visible GCD holds a full copy of the model and serves an
-// equal, contiguous share of the requests (data parallel). On a GCD, up to
-// `batch` requests run together and advance one position per step (static
-// batching); finished requests stay in the batch until the wave ends.
+// getp on GPUs.
+//
+// The visible GCDs are split into groups. A group is one GCD holding the whole
+// model (gpt-oss-20b), or two GCDs of one MI250 card that share the model:
+// both hold the dense weights, each holds half of every layer's experts
+// (gpt-oss-120b, which does not fit on one GCD). Every GCD serves its own
+// requests; inside a group the two GCDs only meet in the expert step, where
+// each runs its experts for both GCDs' tokens. Groups never talk to each
+// other (data parallel). On a GCD, up to `batch` requests run together and
+// advance one position per step (static batching).
 //
 // Weights: bf16 for the dense matrices, MXFP4 for the experts, fp32 for norms,
 // biases and sinks, exactly as stored in the checkpoint.
@@ -28,6 +34,7 @@
 #include "../kernels/gemm.hpp"
 #include "../kernels/misc.hpp"
 #include "../kernels/moe.hpp"
+#include "../kernels/moe_ep.hpp"
 #include "hf_model.hpp"
 
 #define HIP_CHECK(call)                                                        \
@@ -46,12 +53,13 @@
 struct GpuLayer {
   const uint16_t *w_qkv, *w_o, *w_router;
   const float *b_qkv, *b_o, *b_router, *sinks, *rms_attn, *rms_ffn;
+  // this GCD's experts only: e_count of them, starting at e_begin
   const uint8_t *mlp1_blocks, *mlp1_scales, *mlp2_blocks, *mlp2_scales;
   const float *b_mlp1, *b_mlp2;
-  float *kc, *vc;     // exact path KV cache (batch, slots, kv_dim)
+  float *kc, *vc;      // exact path KV cache (batch, slots, kv_dim)
   bf16_t *kc16, *vc16; // fast path KV cache, same layout
-  int slots;          // positions kept: max_pos, or the sliding window
-  int window;     // 0 for full attention
+  int slots;           // positions kept: max_pos, or the sliding window
+  int window;          // 0 for full attention
 };
 
 struct GpuWorker {
@@ -61,18 +69,27 @@ struct GpuWorker {
   Config cfg;
   int batch = 0;   // requests per wave
   int max_pos = 0; // positions the KV cache holds
+  int e_begin = 0, e_count = 0; // experts held: e_begin .. e_begin+e_count-1
+  GpuWorker *peer = nullptr;    // the GCD holding the other experts, if split
+  hipEvent_t ev_routed, ev_experts; // peer may read topk_e / Zg after these
   std::vector<GpuLayer> layers;
   const uint16_t *emb = nullptr, *unemb = nullptr;
   const float *rms_out = nullptr;
   float *cos_tab = nullptr, *sin_tab = nullptr; // (max_pos, head_dim / 2)
   int *tokens = nullptr, *next = nullptr;
   float *x, *t, *qkv, *att, *proj, *router, *topk_w, *Xg, *Yg, *Gg, *Zg, *logits;
-  int *topk_e, *offsets, *row_pair, *pair_row;
+  int *topk_e, *offsets, *row_pair, *own_row, *peer_row;
   bf16_t *t16, *att16, *Xg16, *Gg16; // fast path matrix-multiply inputs
   std::vector<void *> weight_allocs, state_allocs;
 };
 
+// One GCD, or two GCDs that split the experts.
+struct GpuGroup {
+  std::vector<GpuWorker *> m;
+};
+
 static std::vector<GpuWorker *> g_workers;
+static std::vector<GpuGroup> g_groups;
 
 template <class T>
 static T *gpu_alloc(std::vector<void *> &owner, size_t n) {
@@ -94,6 +111,11 @@ static int env_int(const char *name, int fallback) {
   return v && *v ? atoi(v) : fallback;
 }
 
+// Rows of the grouped expert buffers: this GCD's pairs, plus its partner's.
+static size_t gpu_expert_rows(const GpuWorker *w, int batch) {
+  return (size_t)batch * w->cfg.experts_per_token * (w->e_count < w->cfg.n_experts ? 2 : 1);
+}
+
 // Weights come from the safetensors mapping (bf16, MXFP4) and from the fp32
 // copies hf_build_transformer() made of the small tensors.
 static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
@@ -101,6 +123,8 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
   const TransformerWeights &tw = t->weights;
   const size_t H = c.hidden_dim, E = c.n_experts, I = c.intermediate_dim;
   const size_t QKV = (size_t)c.head_dim * (c.n_attn_heads + 2 * c.n_kv_heads);
+  const size_t e0 = w->e_begin, ne = w->e_count;
+  const size_t g1 = 2 * I * (H / 32), g2 = H * (I / 32); // scale groups per expert
   auto &own = w->weight_allocs;
   auto raw = [&](const std::string &name) -> const StTensor & {
     auto it = g_hf.st.tensors.find(name);
@@ -114,9 +138,8 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
     const StTensor &s = raw(name);
     return (const uint16_t *)gpu_upload<uint16_t>(own, s.data, s.nbytes / 2);
   };
-  auto bytes = [&](const std::string &name) {
-    const StTensor &s = raw(name);
-    return (const uint8_t *)gpu_upload<uint8_t>(own, s.data, s.nbytes);
+  auto bytes = [&](const std::string &name, size_t offset, size_t n) {
+    return (const uint8_t *)gpu_upload<uint8_t>(own, raw(name).data + offset, n);
   };
   auto f32 = [&](const float *src, size_t n) {
     return (const float *)gpu_upload<float>(own, src, n);
@@ -138,17 +161,19 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
     g.rms_ffn = f32(tw.rms_ffn_w + l * H, H);
     g.w_router = bf16(b + "mlp.gate.weight");
     g.b_router = f32(tw.b_router + l * E, E);
-    g.mlp1_blocks = bytes(b + "mlp.mlp1_weight.blocks");
-    g.mlp1_scales = bytes(b + "mlp.mlp1_weight.scales");
-    g.b_mlp1 = f32(tw.b_mlp1 + l * E * 2 * I, E * 2 * I);
-    g.mlp2_blocks = bytes(b + "mlp.mlp2_weight.blocks");
-    g.mlp2_scales = bytes(b + "mlp.mlp2_weight.scales");
-    g.b_mlp2 = f32(tw.b_mlp2 + l * E * H, E * H);
+    g.mlp1_blocks = bytes(b + "mlp.mlp1_weight.blocks", e0 * g1 * 16, ne * g1 * 16);
+    g.mlp1_scales = bytes(b + "mlp.mlp1_weight.scales", e0 * g1, ne * g1);
+    g.b_mlp1 = f32(tw.b_mlp1 + (l * E + e0) * 2 * I, ne * 2 * I);
+    g.mlp2_blocks = bytes(b + "mlp.mlp2_weight.blocks", e0 * g2 * 16, ne * g2 * 16);
+    g.mlp2_scales = bytes(b + "mlp.mlp2_weight.scales", e0 * g2, ne * g2);
+    g.b_mlp2 = f32(tw.b_mlp2 + (l * E + e0) * H, ne * H);
   }
 }
 
-static size_t gpu_state_bytes(const Config &c, bool exact, int batch, int max_pos) {
+static size_t gpu_state_bytes(const GpuWorker *w, int batch, int max_pos) {
+  const Config &c = w->cfg;
   const size_t B = batch, H = c.hidden_dim, K = c.experts_per_token;
+  const size_t R = gpu_expert_rows(w, batch);
   const size_t QKV = (size_t)c.head_dim * (c.n_attn_heads + 2 * c.n_kv_heads);
   const size_t ATT = (size_t)c.head_dim * c.n_attn_heads;
   const size_t KVD = (size_t)c.head_dim * c.n_kv_heads;
@@ -157,20 +182,21 @@ static size_t gpu_state_bytes(const Config &c, bool exact, int batch, int max_po
     kv_positions += (c.sliding_window > 0 && l % 2 == 0)
                         ? std::min(c.sliding_window, max_pos)
                         : max_pos;
-  const size_t act = exact ? 4 : 2; // bytes per KV / matrix-input element
-  size_t bytes = 2 * B * kv_positions * KVD * act                       // KV cache
-                 + B * (H + QKV + H + c.n_experts) * 4                  // x qkv proj router
-                 + B * (H + ATT) * act                                  // t att
-                 + B * K * (1 + 2 * c.intermediate_dim + H) * 4         // topk_w Yg Zg
-                 + B * K * (H + c.intermediate_dim) * act               // Xg Gg
-                 + B * (size_t)c.vocab_size * 4                         // logits
-                 + 2 * (size_t)max_pos * c.head_dim / 2 * 4;            // cos, sin
-  return bytes + B * K * 3 * sizeof(int);
+  const size_t act = w->exact ? 4 : 2; // bytes per KV / matrix-input element
+  size_t bytes = 2 * B * kv_positions * KVD * act          // KV cache
+                 + B * (H + QKV + H + c.n_experts + K) * 4 // x qkv proj router topk_w
+                 + B * (H + ATT) * act                     // t att
+                 + R * (2 * c.intermediate_dim + H) * 4    // Yg Zg
+                 + R * (H + c.intermediate_dim) * act      // Xg Gg
+                 + B * (size_t)c.vocab_size * 4            // logits
+                 + 2 * (size_t)max_pos * c.head_dim / 2 * 4; // cos, sin
+  return bytes + (B * K * 3 + R) * sizeof(int);
 }
 
 static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
   const Config &c = w->cfg;
   const size_t B = batch, H = c.hidden_dim, K = c.experts_per_token;
+  const size_t R = gpu_expert_rows(w, batch);
   const size_t QKV = (size_t)c.head_dim * (c.n_attn_heads + 2 * c.n_kv_heads);
   const size_t ATT = (size_t)c.head_dim * c.n_attn_heads;
   const size_t KVD = (size_t)c.head_dim * c.n_kv_heads;
@@ -199,23 +225,24 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
   w->router = gpu_alloc<float>(own, B * c.n_experts);
   w->topk_w = gpu_alloc<float>(own, B * K);
   w->topk_e = gpu_alloc<int>(own, B * K);
-  w->offsets = gpu_alloc<int>(own, c.n_experts + 1);
-  w->row_pair = gpu_alloc<int>(own, B * K);
-  w->pair_row = gpu_alloc<int>(own, B * K);
-  w->Yg = gpu_alloc<float>(own, B * K * 2 * c.intermediate_dim);
-  w->Zg = gpu_alloc<float>(own, B * K * H);
+  w->offsets = gpu_alloc<int>(own, w->e_count + 1);
+  w->row_pair = gpu_alloc<int>(own, R);
+  w->own_row = gpu_alloc<int>(own, B * K);
+  w->peer_row = gpu_alloc<int>(own, B * K);
+  w->Yg = gpu_alloc<float>(own, R * 2 * c.intermediate_dim);
+  w->Zg = gpu_alloc<float>(own, R * H);
   w->t = w->att = w->Xg = w->Gg = nullptr;
   w->t16 = w->att16 = w->Xg16 = w->Gg16 = nullptr;
   if (w->exact) {
     w->t = gpu_alloc<float>(own, B * H);
     w->att = gpu_alloc<float>(own, B * ATT);
-    w->Xg = gpu_alloc<float>(own, B * K * H);
-    w->Gg = gpu_alloc<float>(own, B * K * c.intermediate_dim);
+    w->Xg = gpu_alloc<float>(own, R * H);
+    w->Gg = gpu_alloc<float>(own, R * c.intermediate_dim);
   } else {
     w->t16 = gpu_alloc<bf16_t>(own, B * H);
     w->att16 = gpu_alloc<bf16_t>(own, B * ATT);
-    w->Xg16 = gpu_alloc<bf16_t>(own, B * K * H);
-    w->Gg16 = gpu_alloc<bf16_t>(own, B * K * c.intermediate_dim);
+    w->Xg16 = gpu_alloc<bf16_t>(own, R * H);
+    w->Gg16 = gpu_alloc<bf16_t>(own, R * c.intermediate_dim);
   }
   w->logits = gpu_alloc<float>(own, B * c.vocab_size);
 
@@ -236,130 +263,250 @@ static void gpu_free_state(GpuWorker *w) {
   w->state_allocs.clear();
 }
 
-static GpuWorker *gpu_create_worker(int device, const Transformer *t, bool exact,
-                                    int batch, int max_pos) {
+// Uploads the weights of experts e_begin .. e_begin+e_count-1; no run state yet.
+static GpuWorker *gpu_new_worker(int device, const Transformer *t, bool exact,
+                                 int e_begin, int e_count) {
   HIP_CHECK(hipSetDevice(device));
   GpuWorker *w = new GpuWorker();
   w->device = device;
   w->exact = exact;
   w->cfg = t->config;
+  w->e_begin = e_begin;
+  w->e_count = e_count;
   HIP_CHECK(hipStreamCreate(&w->stream));
+  HIP_CHECK(hipEventCreateWithFlags(&w->ev_routed, hipEventDisableTiming));
+  HIP_CHECK(hipEventCreateWithFlags(&w->ev_experts, hipEventDisableTiming));
   gpu_upload_weights(w, t);
-  size_t free_b = 0, total_b = 0;
-  HIP_CHECK(hipMemGetInfo(&free_b, &total_b));
-  const size_t reserve = (size_t)1 << 30;
-  while (batch > 1 && gpu_state_bytes(w->cfg, exact, batch, max_pos) + reserve > free_b)
-    batch /= 2;
-  gpu_alloc_state(w, batch, max_pos);
   return w;
 }
 
-static void gpu_step_exact(GpuWorker *w, int B, int pos) {
-  const Config &c = w->cfg;
-  const int H = c.hidden_dim, E = c.n_experts, K = c.experts_per_token;
-  const int I = c.intermediate_dim, D = c.head_dim, V = c.vocab_size;
-  const int ATT = D * c.n_attn_heads, KVD = D * c.n_kv_heads;
-  const int QKV = ATT + 2 * KVD;
-  const int half = D / 2;
-  const int R = B * K;
-  hipStream_t s = w->stream;
-
-  embed_kernel<<<B, 256, 0, s>>>(w->emb, w->tokens, w->x, H);
-  for (int l = 0; l < c.n_layers; l++) {
-    GpuLayer &g = w->layers[l];
-    rmsnorm_exact<<<B, 256, H * sizeof(float), s>>>(w->x, g.rms_attn, w->t, H);
-    gemm_bf16_exact(s, w->t, B, g.w_qkv, g.b_qkv, w->qkv, QKV, H);
-    rope_exact<<<B, 256, 0, s>>>(w->qkv, QKV, w->cos_tab + (size_t)pos * half,
-                                 w->sin_tab + (size_t)pos * half,
-                                 c.n_attn_heads + c.n_kv_heads, D);
-    const int slot = g.window > 0 ? pos % g.window : pos;
-    kv_write_kernel<<<B, 256, 0, s>>>(w->qkv, QKV, ATT, ATT + KVD, g.kc, g.vc,
-                                      g.slots, slot, KVD);
-    const int n_pos = g.window > 0 ? std::min(pos + 1, g.window) : pos + 1;
-    attention_exact<<<dim3(c.n_attn_heads, B), 64, (n_pos + 1) * sizeof(float), s>>>(
-        w->qkv, QKV, g.kc, g.vc, g.slots, KVD, c.n_attn_heads / c.n_kv_heads,
-        g.sinks, w->att, ATT, pos, g.window);
-    gemm_bf16_exact(s, w->att, B, g.w_o, g.b_o, w->proj, H, ATT);
-    add_inplace_kernel<<<((size_t)B * H + 255) / 256, 256, 0, s>>>(w->x, w->proj, (size_t)B * H);
-
-    rmsnorm_exact<<<B, 256, H * sizeof(float), s>>>(w->x, g.rms_ffn, w->t, H);
-    gemm_bf16_exact(s, w->t, B, g.w_router, g.b_router, w->router, E, H);
-    router_topk_exact<<<(B + 63) / 64, 64, 0, s>>>(w->router, E, K, w->topk_w, w->topk_e, B);
-    moe_group_kernel<<<1, ((E + 63) / 64) * 64, 0, s>>>(w->topk_e, R, E, w->offsets,
-                                                       w->row_pair, w->pair_row);
-    moe_gather_kernel<<<R, 256, 0, s>>>(w->t, w->row_pair, K, w->Xg, H);
-    gemm_grouped_mxfp4_exact(s, w->Xg, w->offsets, B, E, g.mlp1_blocks,
-                             g.mlp1_scales, g.b_mlp1, w->Yg, 2 * I, H);
-    swiglu_exact<<<((size_t)R * I + 255) / 256, 256, 0, s>>>(w->Yg, w->Gg, R, I, c.swiglu_limit);
-    gemm_grouped_mxfp4_exact(s, w->Gg, w->offsets, B, E, g.mlp2_blocks,
-                             g.mlp2_scales, g.b_mlp2, w->Zg, H, I);
-    moe_combine_exact<<<B, 256, 0, s>>>(w->x, w->Zg, w->pair_row, w->topk_w,
-                                        w->topk_e, K, H);
-  }
-  rmsnorm_exact<<<B, 256, H * sizeof(float), s>>>(w->x, w->rms_out, w->t, H);
-  gemm_bf16_exact(s, w->t, B, w->unemb, nullptr, w->logits, V, H);
-  argmax_kernel<<<B, 256, 0, s>>>(w->logits, V, w->next);
+// Largest batch (halving from `batch`) whose run state fits in free memory.
+static int gpu_fit_batch(const GpuWorker *w, int batch, int max_pos) {
+  HIP_CHECK(hipSetDevice(w->device));
+  size_t free_b = 0, total_b = 0;
+  HIP_CHECK(hipMemGetInfo(&free_b, &total_b));
+  const size_t reserve = (size_t)1 << 30;
+  while (batch > 1 && gpu_state_bytes(w, batch, max_pos) + reserve > free_b)
+    batch /= 2;
+  return batch;
 }
 
-static void gpu_step_fast(GpuWorker *w, int B, int pos) {
-  const Config &c = w->cfg;
-  const int H = c.hidden_dim, E = c.n_experts, K = c.experts_per_token;
-  const int I = c.intermediate_dim, D = c.head_dim, V = c.vocab_size;
-  const int ATT = D * c.n_attn_heads, KVD = D * c.n_kv_heads;
-  const int QKV = ATT + 2 * KVD;
-  const int half = D / 2;
-  const int R = B * K;
-  hipStream_t s = w->stream;
+// A whole-model worker with its run state, for tests.
+static GpuWorker *gpu_create_worker(int device, const Transformer *t, bool exact,
+                                    int batch, int max_pos) {
+  GpuWorker *w = gpu_new_worker(device, t, exact, 0, t->config.n_experts);
+  gpu_alloc_state(w, gpu_fit_batch(w, batch, max_pos), max_pos);
+  return w;
+}
 
-  embed_kernel<<<B, 256, 0, s>>>(w->emb, w->tokens, w->x, H);
-  for (int l = 0; l < c.n_layers; l++) {
-    GpuLayer &g = w->layers[l];
+static void gpu_pair(GpuWorker *a, GpuWorker *b) {
+  a->peer = b;
+  b->peer = a;
+  for (auto [x, y] : {std::make_pair(a, b), std::make_pair(b, a)}) {
+    HIP_CHECK(hipSetDevice(x->device));
+    hipError_t err = hipDeviceEnablePeerAccess(y->device, 0);
+    if (err != hipSuccess && err != hipErrorPeerAccessAlreadyEnabled)
+      HIP_CHECK(err);
+    (void)hipGetLastError();
+  }
+}
+
+// ---- one decode step, in four parts per layer --------------------------------
+
+static void step_embed(GpuWorker *w, int B) {
+  if (B > 0)
+    embed_kernel<<<B, 256, 0, w->stream>>>(w->emb, w->tokens, w->x, w->cfg.hidden_dim);
+}
+
+// x += attention(x) for this GCD's B rows.
+static void layer_attention(GpuWorker *w, int l, int B, int pos) {
+  if (B == 0)
+    return;
+  const Config &c = w->cfg;
+  const int H = c.hidden_dim, D = c.head_dim;
+  const int ATT = D * c.n_attn_heads, KVD = D * c.n_kv_heads, QKV = ATT + 2 * KVD;
+  const int half = D / 2;
+  GpuLayer &g = w->layers[l];
+  hipStream_t s = w->stream;
+  const float *cosv = w->cos_tab + (size_t)pos * half, *sinv = w->sin_tab + (size_t)pos * half;
+  const int kv_slot = g.window > 0 ? pos % g.window : pos;
+  if (w->exact) {
+    rmsnorm_exact<<<B, 256, H * sizeof(float), s>>>(w->x, g.rms_attn, w->t, H);
+    gemm_bf16_exact(s, w->t, B, g.w_qkv, g.b_qkv, w->qkv, QKV, H);
+    rope_exact<<<B, 256, 0, s>>>(w->qkv, QKV, cosv, sinv, c.n_attn_heads + c.n_kv_heads, D);
+    kv_write_kernel<<<B, 256, 0, s>>>(w->qkv, QKV, ATT, ATT + KVD, g.kc, g.vc, g.slots,
+                                      kv_slot, KVD);
+    const int n_pos = g.window > 0 ? std::min(pos + 1, g.window) : pos + 1;
+    attention_exact<<<dim3(c.n_attn_heads, B), 64, (n_pos + 1) * sizeof(float), s>>>(
+        w->qkv, QKV, g.kc, g.vc, g.slots, KVD, c.n_attn_heads / c.n_kv_heads, g.sinks,
+        w->att, ATT, pos, g.window);
+    gemm_bf16_exact(s, w->att, B, g.w_o, g.b_o, w->proj, H, ATT);
+  } else {
     rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, g.rms_attn, w->t16, H);
     gemm_bf16(s, w->t16, B, g.w_qkv, g.b_qkv, w->qkv, QKV, H);
-    const int slot = g.window > 0 ? pos % g.window : pos;
-    rope_kv_bf16_kernel<<<B, 256, 0, s>>>(w->qkv, QKV, w->cos_tab + (size_t)pos * half,
-                                          w->sin_tab + (size_t)pos * half, c.n_attn_heads,
-                                          c.n_kv_heads, D, g.kc16, g.vc16, g.slots, slot);
+    rope_kv_bf16_kernel<<<B, 256, 0, s>>>(w->qkv, QKV, cosv, sinv, c.n_attn_heads,
+                                          c.n_kv_heads, D, g.kc16, g.vc16, g.slots, kv_slot);
     attention_bf16(s, w->qkv, QKV, g.kc16, g.vc16, g.slots, KVD, c.n_attn_heads,
                    c.n_attn_heads / c.n_kv_heads, g.sinks, w->att16, ATT, B, pos, g.window);
     gemm_bf16(s, w->att16, B, g.w_o, g.b_o, w->proj, H, ATT);
-    add_inplace_kernel<<<((size_t)B * H + 255) / 256, 256, 0, s>>>(w->x, w->proj, (size_t)B * H);
+  }
+  add_inplace_kernel<<<((size_t)B * H + 255) / 256, 256, 0, s>>>(w->x, w->proj, (size_t)B * H);
+}
 
+// t = RMSNorm(x); each row's top-k experts and their weights.
+static void layer_route(GpuWorker *w, int l, int B) {
+  if (B == 0)
+    return;
+  const Config &c = w->cfg;
+  const int H = c.hidden_dim, E = c.n_experts, K = c.experts_per_token;
+  GpuLayer &g = w->layers[l];
+  hipStream_t s = w->stream;
+  if (w->exact) {
+    rmsnorm_exact<<<B, 256, H * sizeof(float), s>>>(w->x, g.rms_ffn, w->t, H);
+    gemm_bf16_exact(s, w->t, B, g.w_router, g.b_router, w->router, E, H);
+  } else {
     rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, g.rms_ffn, w->t16, H);
     gemm_bf16(s, w->t16, B, g.w_router, g.b_router, w->router, E, H);
-    router_topk_exact<<<(B + 63) / 64, 64, 0, s>>>(w->router, E, K, w->topk_w, w->topk_e, B);
-    moe_group_kernel<<<1, ((E + 63) / 64) * 64, 0, s>>>(w->topk_e, R, E, w->offsets,
-                                                       w->row_pair, w->pair_row);
-    gather_bf16_kernel<<<R, 256, 0, s>>>(w->t16, w->row_pair, K, w->Xg16, H);
-    gemm_grouped_mxfp4(s, w->Xg16, w->offsets, B, E, g.mlp1_blocks, g.mlp1_scales,
-                       g.b_mlp1, w->Yg, 2 * I, H);
+  }
+  router_topk_exact<<<(B + 63) / 64, 64, 0, s>>>(w->router, E, K, w->topk_w, w->topk_e, B);
+}
+
+// This GCD's experts on every row (own and partner's) that chose them -> Zg.
+static void layer_experts(GpuWorker *w, int l, int B, int B_peer) {
+  const Config &c = w->cfg;
+  const int H = c.hidden_dim, I = c.intermediate_dim, K = c.experts_per_token;
+  const int R = (B + B_peer) * K;
+  if (R == 0)
+    return;
+  GpuLayer &g = w->layers[l];
+  hipStream_t s = w->stream;
+  GpuWorker *p = w->peer;
+  moe_group_ep_kernel<<<1, std::max(64, ((w->e_count + 63) / 64) * 64), 0, s>>>(
+      w->topk_e, B * K, p ? p->topk_e : nullptr, B_peer * K, w->e_begin, w->e_count,
+      w->offsets, w->row_pair, w->own_row, w->peer_row);
+  if (w->exact) {
+    moe_gather_ep_kernel<float><<<R, 256, 0, s>>>(w->t, p ? p->t : nullptr, w->row_pair,
+                                                  w->offsets, w->e_count, K, w->Xg, H);
+    gemm_grouped_mxfp4_exact(s, w->Xg, w->offsets, B + B_peer, w->e_count, g.mlp1_blocks,
+                             g.mlp1_scales, g.b_mlp1, w->Yg, 2 * I, H);
+    swiglu_exact<<<((size_t)R * I + 255) / 256, 256, 0, s>>>(w->Yg, w->Gg, R, I, c.swiglu_limit);
+    gemm_grouped_mxfp4_exact(s, w->Gg, w->offsets, B + B_peer, w->e_count, g.mlp2_blocks,
+                             g.mlp2_scales, g.b_mlp2, w->Zg, H, I);
+  } else {
+    moe_gather_ep_kernel<bf16_t><<<R, 256, 0, s>>>(w->t16, p ? p->t16 : nullptr, w->row_pair,
+                                                   w->offsets, w->e_count, K, w->Xg16, H);
+    gemm_grouped_mxfp4(s, w->Xg16, w->offsets, B + B_peer, w->e_count, g.mlp1_blocks,
+                       g.mlp1_scales, g.b_mlp1, w->Yg, 2 * I, H);
     swiglu_bf16_kernel<<<((size_t)R * I + 255) / 256, 256, 0, s>>>(w->Yg, w->Gg16, R, I,
                                                                    c.swiglu_limit);
-    gemm_grouped_mxfp4(s, w->Gg16, w->offsets, B, E, g.mlp2_blocks, g.mlp2_scales,
-                       g.b_mlp2, w->Zg, H, I);
-    moe_combine_kernel<<<B, 256, 0, s>>>(w->x, w->Zg, w->pair_row, w->topk_w, K, H);
+    gemm_grouped_mxfp4(s, w->Gg16, w->offsets, B + B_peer, w->e_count, g.mlp2_blocks,
+                       g.mlp2_scales, g.b_mlp2, w->Zg, H, I);
   }
-  rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, w->rms_out, w->t16, H);
-  gemm_bf16(s, w->t16, B, w->unemb, nullptr, w->logits, V, H);
+}
+
+// x += weighted sum of each own row's expert outputs (some read from the partner).
+static void layer_combine(GpuWorker *w, int l, int B) {
+  if (B == 0)
+    return;
+  const Config &c = w->cfg;
+  GpuWorker *p = w->peer;
+  const float *Zp = p ? p->Zg : nullptr;
+  const int *rows_p = p ? p->peer_row : nullptr;
+  if (w->exact)
+    moe_combine_ep_kernel<true><<<B, 256, 0, w->stream>>>(
+        w->x, w->Zg, w->own_row, Zp, rows_p, w->topk_w, w->topk_e, w->e_begin, w->e_count,
+        c.experts_per_token, c.hidden_dim);
+  else
+    moe_combine_ep_kernel<false><<<B, 256, 0, w->stream>>>(
+        w->x, w->Zg, w->own_row, Zp, rows_p, w->topk_w, w->topk_e, w->e_begin, w->e_count,
+        c.experts_per_token, c.hidden_dim);
+}
+
+// Final RMSNorm, LM head, greedy next token.
+static void step_logits(GpuWorker *w, int B) {
+  if (B == 0)
+    return;
+  const Config &c = w->cfg;
+  const int H = c.hidden_dim, V = c.vocab_size;
+  hipStream_t s = w->stream;
+  if (w->exact) {
+    rmsnorm_exact<<<B, 256, H * sizeof(float), s>>>(w->x, w->rms_out, w->t, H);
+    gemm_bf16_exact(s, w->t, B, w->unemb, nullptr, w->logits, V, H);
+  } else {
+    rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, w->rms_out, w->t16, H);
+    gemm_bf16(s, w->t16, B, w->unemb, nullptr, w->logits, V, H);
+  }
   argmax_kernel<<<B, 256, 0, s>>>(w->logits, V, w->next);
 }
 
-// One decode step for rows 0..B-1 at position `pos`: tokens in w->tokens,
-// greedy next tokens to w->next. Logits stay in w->logits.
-static void gpu_step(GpuWorker *w, int B, int pos) {
-  if (w->exact)
-    gpu_step_exact(w, B, pos);
-  else
-    gpu_step_fast(w, B, pos);
+// One decode step for every GCD of a group at position `pos`: member i has
+// B[i] rows, tokens in its `tokens`, greedy next tokens to its `next`.
+// The partner reads a GCD's topk_e and t after ev_routed, and its Zg and
+// peer_row after ev_experts. A GCD overwrites those only in the next layer,
+// after it has waited for its partner's next event, which its partner records
+// after finishing these reads, so one copy of each buffer is enough.
+static void gpu_step_group(GpuGroup &g, const int *B, int pos) {
+  const int n = (int)g.m.size();
+  for (int i = 0; i < n; i++) {
+    HIP_CHECK(hipSetDevice(g.m[i]->device));
+    step_embed(g.m[i], B[i]);
+  }
+  const int n_layers = g.m[0]->cfg.n_layers;
+  for (int l = 0; l < n_layers; l++) {
+    for (int i = 0; i < n; i++) {
+      GpuWorker *w = g.m[i];
+      HIP_CHECK(hipSetDevice(w->device));
+      layer_attention(w, l, B[i], pos);
+      layer_route(w, l, B[i]);
+      if (n > 1)
+        HIP_CHECK(hipEventRecord(w->ev_routed, w->stream));
+    }
+    for (int i = 0; i < n; i++) {
+      GpuWorker *w = g.m[i];
+      HIP_CHECK(hipSetDevice(w->device));
+      if (n > 1)
+        HIP_CHECK(hipStreamWaitEvent(w->stream, w->peer->ev_routed, 0));
+      layer_experts(w, l, B[i], n > 1 ? B[1 - i] : 0);
+      if (n > 1)
+        HIP_CHECK(hipEventRecord(w->ev_experts, w->stream));
+    }
+    for (int i = 0; i < n; i++) {
+      GpuWorker *w = g.m[i];
+      HIP_CHECK(hipSetDevice(w->device));
+      if (n > 1)
+        HIP_CHECK(hipStreamWaitEvent(w->stream, w->peer->ev_experts, 0));
+      layer_combine(w, l, B[i]);
+    }
+  }
+  for (int i = 0; i < n; i++) {
+    HIP_CHECK(hipSetDevice(g.m[i]->device));
+    step_logits(g.m[i], B[i]);
+  }
   HIP_CHECK(hipGetLastError());
 }
 
-// Serves requests first .. first+n-1 together, mirroring simple_getp_generate()
-// in getp_run.cpp for each of them. Returns the number of generated tokens.
-static long long gpu_run_wave(GpuWorker *w, Tokenizer *tok, Requests *req,
-                              int first, int n, int steps) {
-  const Config &c = w->cfg;
-  std::vector<std::vector<int>> prompts(n);
+// One decode step for a single whole-model worker (tests).
+static void gpu_step(GpuWorker *w, int B, int pos) {
+  GpuGroup g;
+  g.m.push_back(w);
+  gpu_step_group(g, &B, pos);
+}
+
+// ---- serving requests --------------------------------------------------------
+
+// The requests one GCD serves in a wave, following simple_getp_generate() in
+// getp_run.cpp for each of them.
+struct WaveSlot {
+  int first = 0, n = 0;
+  std::vector<std::vector<int>> prompts;
+  std::vector<int> cur, next, done;
+};
+
+static void wave_slot_init(WaveSlot &ws, Tokenizer *tok, Requests *req,
+                           const Config &c, int first, int n) {
+  ws.first = first;
+  ws.n = n;
+  ws.prompts.assign(n, {});
   for (int b = 0; b < n; b++) {
     const char *text = get_str_req_ptr(req, first + b);
     std::vector<int> buf(strlen(text) + 3);
@@ -370,100 +517,192 @@ static long long gpu_run_wave(GpuWorker *w, Tokenizer *tok, Requests *req,
       exit(EXIT_FAILURE);
     }
     buf.resize(np);
-    prompts[b] = std::move(buf);
+    ws.prompts[b] = std::move(buf);
   }
-
-  std::vector<int> cur(n), next(n), done(n, 0);
+  ws.cur.resize(n);
+  ws.next.resize(n);
+  ws.done.assign(n, 0);
   for (int b = 0; b < n; b++)
-    cur[b] = prompts[b][0];
+    ws.cur[b] = ws.prompts[b][0];
+}
+
+// Serves slots[i] on group member i, all advancing together. Returns the
+// number of generated tokens.
+static long long gpu_run_wave(GpuGroup &g, std::vector<WaveSlot> &slots,
+                              Requests *req, int steps) {
+  const int n = (int)g.m.size();
+  std::vector<int> B(n);
+  int active = 0;
+  for (int i = 0; i < n; i++) {
+    B[i] = slots[i].n;
+    active += slots[i].n;
+  }
   long long generated = 0;
-  int active = n, pos = 0;
+  int pos = 0;
   while (pos < steps && active > 0) {
-    HIP_CHECK(hipMemcpyAsync(w->tokens, cur.data(), n * sizeof(int),
-                             hipMemcpyHostToDevice, w->stream));
-    gpu_step(w, n, pos);
-    HIP_CHECK(hipMemcpyAsync(next.data(), w->next, n * sizeof(int),
-                             hipMemcpyDeviceToHost, w->stream));
-    HIP_CHECK(hipStreamSynchronize(w->stream));
+    for (int i = 0; i < n; i++)
+      if (B[i] > 0) {
+        HIP_CHECK(hipSetDevice(g.m[i]->device));
+        HIP_CHECK(hipMemcpyAsync(g.m[i]->tokens, slots[i].cur.data(), B[i] * sizeof(int),
+                                 hipMemcpyHostToDevice, g.m[i]->stream));
+      }
+    gpu_step_group(g, B.data(), pos);
+    for (int i = 0; i < n; i++)
+      if (B[i] > 0) {
+        HIP_CHECK(hipSetDevice(g.m[i]->device));
+        HIP_CHECK(hipMemcpyAsync(slots[i].next.data(), g.m[i]->next, B[i] * sizeof(int),
+                                 hipMemcpyDeviceToHost, g.m[i]->stream));
+      }
+    for (int i = 0; i < n; i++) {
+      HIP_CHECK(hipSetDevice(g.m[i]->device));
+      HIP_CHECK(hipStreamSynchronize(g.m[i]->stream));
+    }
     pos++;
-    for (int b = 0; b < n; b++) {
-      if (done[b])
-        continue;
-      const int np = (int)prompts[b].size();
-      int *out = get_tok_gen_ptr(req, first + b);
-      int token;
-      if (pos < np) {
-        token = prompts[b][pos];
-      } else {
-        token = next[b];
-        out[pos - np] = token;
+    for (int i = 0; i < n; i++) {
+      WaveSlot &ws = slots[i];
+      for (int b = 0; b < ws.n; b++) {
+        if (ws.done[b])
+          continue;
+        const int np = (int)ws.prompts[b].size();
+        int *out = get_tok_gen_ptr(req, ws.first + b);
+        int token;
+        if (pos < np) {
+          token = ws.prompts[b][pos];
+        } else {
+          token = ws.next[b];
+          out[pos - np] = token;
+        }
+        if (token == 199999 || token == 200002) {
+          ws.done[b] = 1;
+          active--;
+          if (pos - np + 1 >= 0)
+            out[pos - np + 1] = -1;
+          generated += pos - np + 1;
+        }
+        ws.cur[b] = token;
       }
-      if (token == 199999 || token == 200002) {
-        done[b] = 1;
-        active--;
-        if (pos - np + 1 >= 0)
-          out[pos - np + 1] = -1;
-        generated += pos - np + 1;
-      }
-      cur[b] = token;
     }
   }
-  for (int b = 0; b < n; b++) {
-    if (done[b])
-      continue;
-    const int np = (int)prompts[b].size();
-    if (pos - np + 1 >= 0)
-      get_tok_gen_ptr(req, first + b)[pos - np + 1] = -1;
-    generated += pos - np + 1;
+  for (int i = 0; i < n; i++) {
+    WaveSlot &ws = slots[i];
+    for (int b = 0; b < ws.n; b++) {
+      if (ws.done[b])
+        continue;
+      const int np = (int)ws.prompts[b].size();
+      if (pos - np + 1 >= 0)
+        get_tok_gen_ptr(req, ws.first + b)[pos - np + 1] = -1;
+      generated += pos - np + 1;
+    }
   }
   return generated;
+}
+
+// GCDs per group: GPTOSS_EP, or 2 when the weights would fill more than 60 %
+// of one GCD's memory.
+static int gpu_group_size(int n_dev) {
+  int ep = env_int("GPTOSS_EP", 0);
+  if (ep <= 0) {
+    size_t free_b = 0, total_b = 0;
+    HIP_CHECK(hipSetDevice(0));
+    HIP_CHECK(hipMemGetInfo(&free_b, &total_b));
+    ep = g_hf.st.total_bytes > total_b * 6 / 10 ? 2 : 1;
+  }
+  if (ep != 1 && ep != 2) {
+    fprintf(stderr, "getp: GPTOSS_EP must be 1 or 2\n");
+    exit(EXIT_FAILURE);
+  }
+  if (n_dev % ep != 0) {
+    fprintf(stderr, "getp: %d GPUs cannot be split into groups of %d\n", n_dev, ep);
+    exit(EXIT_FAILURE);
+  }
+  return ep;
 }
 
 static void gpu_warm_up(const Transformer *t) {
   int n_dev = 0;
   HIP_CHECK(hipGetDeviceCount(&n_dev));
   const bool exact = env_int("GPTOSS_EXACT", 0) != 0;
-  const int batch = env_int("GPTOSS_BATCH", GPU_DEFAULT_BATCH);
   const int max_pos = std::min(env_int("GPTOSS_MAX_POS", GPU_DEFAULT_MAX_POS),
                                t->config.seq_len);
+  const int ep = gpu_group_size(n_dev);
+  const int E = t->config.n_experts;
+  if (E % ep != 0) {
+    fprintf(stderr, "getp: %d experts cannot be split %d ways\n", E, ep);
+    exit(EXIT_FAILURE);
+  }
   g_workers.assign(n_dev, nullptr);
   std::vector<std::thread> threads;
   for (int d = 0; d < n_dev; d++)
-    threads.emplace_back([&, d] { g_workers[d] = gpu_create_worker(d, t, exact, batch, max_pos); });
+    threads.emplace_back([&, d] {
+      const int rank = d % ep;
+      g_workers[d] = gpu_new_worker(d, t, exact, rank * (E / ep), E / ep);
+    });
   for (auto &th : threads)
     th.join();
-  printf("getp: %s path, %d GPU(s), %d requests per GPU per wave, KV cache for %d positions\n",
-         exact ? "exact" : "fast", n_dev, g_workers[0]->batch, max_pos);
+  threads.clear();
+
+  // the same batch on every GCD, as large as the fullest one allows
+  int batch = env_int("GPTOSS_BATCH", GPU_DEFAULT_BATCH);
+  for (GpuWorker *w : g_workers)
+    batch = std::min(batch, gpu_fit_batch(w, batch, max_pos));
+  for (int d = 0; d < n_dev; d++)
+    threads.emplace_back([&, d] {
+      HIP_CHECK(hipSetDevice(d));
+      gpu_alloc_state(g_workers[d], batch, max_pos);
+    });
+  for (auto &th : threads)
+    th.join();
+
+  g_groups.assign(n_dev / ep, GpuGroup());
+  for (int d = 0; d < n_dev; d++)
+    g_groups[d / ep].m.push_back(g_workers[d]);
+  if (ep == 2)
+    for (GpuGroup &g : g_groups)
+      gpu_pair(g.m[0], g.m[1]);
+  printf("getp: %s path, %d GPU(s) in %d group(s) of %d, %d requests per GPU per wave, "
+         "KV cache for %d positions\n",
+         exact ? "exact" : "fast", n_dev, n_dev / ep, ep, batch, max_pos);
   fflush(stdout);
 }
 
 static long long gpu_inference(Tokenizer *tok, Requests *req) {
-  const int n_dev = (int)g_workers.size();
+  const int n_groups = (int)g_groups.size();
   const int steps = req->max_seq_len;
-  const int per_dev = (req->num_reqs + n_dev - 1) / n_dev;
-  std::vector<long long> generated(n_dev, 0);
+  const int per_group = (req->num_reqs + n_groups - 1) / n_groups;
+  std::vector<long long> generated(n_groups, 0);
   std::vector<std::thread> threads;
-  for (int d = 0; d < n_dev; d++) {
-    threads.emplace_back([&, d] {
-      GpuWorker *w = g_workers[d];
-      HIP_CHECK(hipSetDevice(w->device));
-      if (steps > w->max_pos) { // KV cache too short for -n: grow it
-        const int batch = w->batch;
-        gpu_free_state(w);
-        gpu_alloc_state(w, batch, steps);
+  for (int gi = 0; gi < n_groups; gi++) {
+    threads.emplace_back([&, gi] {
+      GpuGroup &g = g_groups[gi];
+      const int n = (int)g.m.size();
+      for (GpuWorker *w : g.m)
+        if (steps > w->max_pos) { // KV cache too short for -n: grow it
+          HIP_CHECK(hipSetDevice(w->device));
+          const int batch = w->batch;
+          gpu_free_state(w);
+          gpu_alloc_state(w, batch, steps);
+        }
+      const int begin = std::min(gi * per_group, req->num_reqs);
+      const int end = std::min(begin + per_group, req->num_reqs);
+      const int per_wave = g.m[0]->batch * n;
+      for (int first = begin; first < end; first += per_wave) {
+        const int count = std::min(per_wave, end - first);
+        std::vector<WaveSlot> slots(n);
+        int f = first;
+        for (int i = 0; i < n; i++) { // split the wave as evenly as possible
+          const int ni = count / n + (i < count % n ? 1 : 0);
+          wave_slot_init(slots[i], tok, req, g.m[i]->cfg, f, ni);
+          f += ni;
+        }
+        generated[gi] += gpu_run_wave(g, slots, req, steps);
       }
-      const int begin = std::min(d * per_dev, req->num_reqs);
-      const int end = std::min(begin + per_dev, req->num_reqs);
-      for (int first = begin; first < end; first += w->batch)
-        generated[d] += gpu_run_wave(w, tok, req, first,
-                                     std::min(w->batch, end - first), steps);
     });
   }
   for (auto &th : threads)
     th.join();
   long long total = 0;
-  for (long long g : generated)
-    total += g;
+  for (long long x : generated)
+    total += x;
   return total;
 }
 
@@ -473,8 +712,11 @@ static void gpu_finish() {
     gpu_free_state(w);
     for (void *p : w->weight_allocs)
       HIP_CHECK(hipFree(p));
+    HIP_CHECK(hipEventDestroy(w->ev_routed));
+    HIP_CHECK(hipEventDestroy(w->ev_experts));
     HIP_CHECK(hipStreamDestroy(w->stream));
     delete w;
   }
   g_workers.clear();
+  g_groups.clear();
 }
