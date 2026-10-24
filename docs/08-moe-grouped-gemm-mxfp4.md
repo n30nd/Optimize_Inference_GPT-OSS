@@ -21,6 +21,10 @@ The new kernel feeds the matrix cores straight from the 4-bit weights and shares
 among the GPU's compute units. It is **15× faster than the simple version** and 1.5–3.3× faster
 than calling the vendor's matrix library once per expert (with 4× larger 16-bit weights).
 
+A second step (section 7) stores the 4-bit weights once, while the model loads, in the order the
+kernel reads them. That made each call another **7–25 % faster** (most for gpt-oss-120b, whose
+experts get few rows), with exactly the same results.
+
 ## An everyday comparison
 
 A print shop with very fast presses (the matrix cores). The paper arrives vacuum-packed to save
@@ -33,6 +37,11 @@ job at the end.
 It turned out the presses were not the limit at first: the **corridor to the warehouse** was. Each
 press sent a runner for every small bundle, and the corridor lets only so many runners through per
 second. The big win came from sending fewer runners with bigger loads.
+
+Then the warehouse itself was re-shelved. The bundles were stored in the supplier's order, so for
+one step of work a runner had to visit 256 different shelves and take a small packet from each.
+Now, once, before the shop opens, a clerk puts the 256 packets that one step needs side by side on
+one shelf, in the order the press uses them. The runner grabs one armful.
 
 ## The words
 
@@ -66,6 +75,16 @@ second. The big win came from sending fewer runners with bigger loads.
 - **barrier** — a point where every wavefront of a block waits until all of them have arrived.
 - **atomic add** — an add to a memory word that the hardware does for one thread at a time, so many
   threads can each take a unique ticket from one counter.
+- **layout** — the order in which numbers sit in memory.
+- **contiguous** — sitting right next to each other in memory, with no gaps.
+- **repack** — copy numbers once into a new order. Here it happens while the model loads
+  (`warm_up`, not timed), so it costs nothing when answering.
+- **buffer descriptor** — a small record (a start address and a length) that a GPU load
+  instruction uses to find its data; a load that asks for bytes past the length gets zeros back
+  and never touches memory.
+- **staging buffer** — a temporary piece of GPU memory that the raw bytes pass through before
+  they are rearranged.
+- **bit-identical** — exactly the same bits: not even the last digit of any number changes.
 
 ## How it works
 
@@ -144,22 +163,27 @@ K (2,880) is walked in 23 steps of 128. One step, for one wavefront:
 
 ```
  time ───────────────────────────────────────────────────────────────────────────►
- issue loads: A of step p+1 (→ registers), weights of step p+2 (→ registers)
+ issue loads: A of step p+1 (→ registers), weights of step p+1 (→ registers)
              unpack weights of step p ─┬─ 8 × (read A from LDS, 8 MFMAs) ─┬─ A of step p+1 → LDS ─ barrier
                                        └── loads travel meanwhile ────────┘
 ```
 
 Two LDS buffers (16 KB each) alternate: the MFMAs read one while the next A slice is written into
-the other. Two register sets for the weights alternate, so their loads start two steps early. 32 KB
-of LDS per block means 2 blocks (16 wavefronts, 4 per SIMD) fit on one CU.
+the other. The weights of the next step are loaded while the current one is unpacked (the first
+version loaded them two steps early, in two register sets; with the packed weights of section 7
+one step is enough and 1.5–3 % faster). 32 KB of LDS per block means 2 blocks (16 wavefronts, 4
+per SIMD) fit on one CU.
 
 ### 5. The scales: once per item, not once per step
 
-The 256 columns' scale bytes are 256 × 90 = 23 KB that sit **next to each other** in memory. At the
-start of an item the block copies them into LDS with large loads (3 per thread), every thread
-picks out the 23 bytes it will need (one per step) into 6 registers, and then the same LDS is used
-for A. Before this, every step loaded each scale byte on its own: one cache-line request for 1 useful
-byte, as many requests as for the weights themselves.
+Each thread needs one scale byte per step for each of its two columns: 23 bytes per column for
+K = 2,880. It loads them all at the start of an item into 6 registers (4 bytes each) and shifts one
+byte out per step. With the packed layout of section 7 these 24 bytes already sit next to each
+other in memory, so a thread fetches them with 2 loads (16 + 8 bytes). The first version read the
+checkpoint's 23 KB of scale bytes for the item's 256 columns into LDS and let every thread pick out
+its bytes, with two barriers; the direct loads are 1–4 % faster. (Before either, every step loaded
+each scale byte on its own: one cache-line request for 1 useful byte, as many requests as for the
+weights themselves.)
 
 ### 6. Uneven experts: one queue
 
@@ -181,6 +205,122 @@ kernel decides on the GPU:
   they start at the same time and the second one finds the weights in the L2 cache.
 - Biggest experts first: the last items handed out are small, so blocks finish at nearly the same time.
 
+### 7. Weights stored in reading order (the packed layout)
+
+**The problem.** The checkpoint stores the weights of one output column (2,880 numbers, 1,440 bytes
+of codes) as one long row. But a block does not read a column from start to end. In each step it
+needs the next 64 bytes of each of its 256 columns, and in the checkpoint order those 256 pieces
+lie 1,440 bytes apart:
+
+```
+ checkpoint order, one expert (mlp1: 5,760 columns x 1,440 bytes = 8.3 MB of codes)
+
+   column n0     [ step0 | step1 | step2 | ... | step22 ]      1,440 bytes
+   column n0+1   [ step0 | step1 | step2 | ... | step22 ]      the next 1,440 bytes
+   ...
+   column n0+255 [ step0 | step1 | step2 | ... | step22 ]
+                     ^
+   one step of a block = this 64-byte piece of each of the 256 rows:
+   256 small reads spread over 368 KB. 1,440 is not a multiple of 64, so for every
+   other column the piece starts in the middle of a 64-byte cache line: 2 lines for 1.
+```
+
+Memory chips are fastest when neighbouring bytes are asked for together (they open a stretch of
+1–2 KB at a time); scattered 64-byte reads waste most of each opened stretch. A test that only
+reads the 32 mlp1 experts (265 MB) measured 855 GB/s in this pattern and 1,296 GB/s when the same
+bytes are read contiguously.
+
+**The fix.** While the model loads, a small GPU kernel (`moe_pack_mxfp4`) copies every expert's
+codes into a new order: for each 256-column tile and each step of 128 k, the 16 KB that the block
+will read are put side by side, in exactly the order the threads ask for them.
+
+```
+ packed order, one expert, tile t (256 columns = 16 pieces of 16 columns), K = 2,880
+
+   tile t: [ step 0: 16 KB ][ step 1: 16 KB ] ... [ step 21: 16 KB ][ step 22: 8 KB ]
+
+   one step (16 KB), ordered by thread group kq, then piece c, then column j:
+     kq=0 [ c0 | c1 | ... | c15 ]  kq=1 [ c0 | ... | c15 ]  kq=2 [ ... ]  kq=3 [ ... ]
+     each [ c ] = 16 columns x 16 bytes = 256 bytes
+
+   thread (j, kq) of the wavefront that owns piece c gets 16 bytes = the 32 codes of
+   column 256t + 16c + j, k = 128p + 32kq ... 128p + 32kq + 31   (the same bytes as before)
+   one load instruction of a wavefront = 4 full runs of 256 bytes; one step of the
+   block = one contiguous 16 KB
+```
+
+The packed codes take the same space as the checkpoint's (the column count is only rounded up to a
+multiple of 16, which 5,760 and 2,880 already are); the packed scales take 96 bytes per column
+instead of 90, 0.4 % more for a whole expert. The 120b split still fits 512 requests per GCD.
+
+**The last half step.** 2,880 is 22.5 steps of 128. Because kq comes first inside a step, a half
+step is simply the first half (kq 0 and 1, 8 KB). The threads with kq 2 and 3 ask for bytes past
+the end of the tile; the buffer descriptor of each work item is made to end exactly there, so those
+loads return zero codes (zero weights) without memory traffic. The first version had to replace
+those codes by zeros with an extra instruction per register.
+
+**The scales too.** Each thread's 24 scale bytes per column (one per step, section 5) are stored
+together:
+
+```
+ packed scales, per piece of 16 columns: 1,536 bytes
+   bytes    0 .. 1,023: thread l's steps 0..15  at 16*l .. 16*l+15    (one 16-byte load)
+   bytes 1,024 .. 1,535: thread l's steps 16..23 at 1,024 + 8*l .. +7  (one 8-byte load)
+   (steps past K hold 0)
+```
+
+**The same numbers, bit for bit.** Only the place of each byte in memory changes. Every thread
+ends up with exactly the same bytes in the same registers as with the checkpoint layout, so every
+product and every addition is the same. Checked three ways: the packer against a host version of
+the layout, byte by byte; the old kernel on the checkpoint layout against the new kernel on the
+packed layout, 1.45 billion outputs of real and synthetic routings, none different; and the
+end-to-end output hashes of `./run` (20b `ccfc732a4a25`, 120b `836592181c82`, unchanged).
+
+**In the engine.** `gpu_upload_weights` (`getp-csrc/engine/gpu_engine.hpp:152`, `:195`, `:197`)
+copies each layer's checkpoint bytes into one staging buffer on the GPU, packs them into the final
+buffers with `moe_pack_mxfp4` and frees the staging buffer at the end. The exact path, and any
+shape the fast kernel does not take (`moe_mfma_ok`), keep the checkpoint layout. Warm-up time did
+not change measurably (20b about 5 s, 120b 26–34 s, both dominated by reading the files).
+
+**Results.** µs per call, mean of 40 calls (two rounds agree within 1 %), one GCD of mv-mi250-02,
+same routings as below; "before" = the first matrix-core kernel on the checkpoint layout:
+
+| model | shape | B | before | packed | change | TFLOP/s after |
+|---|---|---:|---:|---:|---:|---:|
+| 20b | mlp1 | 512 | 852 | **717** | −15.9 % | 95 |
+| 20b | mlp2 | 512 | 471 | **405** | −14.1 % | 84 |
+| 20b | mlp1 | 1024 | 1,378 | **1,235** | −10.4 % | 110 |
+| 20b | mlp2 | 1024 | 749 | **685** | −8.6 % | 99 |
+| 20b | mlp1 | 2048 | 2,477 | **2,281** | −7.9 % | 119 |
+| 20b | mlp2 | 2048 | 1,327 | **1,232** | −7.1 % | 110 |
+| 120b | mlp1 | 512 | 1,122 | **845** | −24.7 % | 78 |
+| 120b | mlp2 | 512 | 598 | **475** | −20.6 % | 70 |
+| 120b | mlp1 | 1024 | 1,661 | **1,372** | −17.4 % | 98 |
+| 120b | mlp2 | 1024 | 892 | **753** | −15.6 % | 89 |
+| 120b | mlp1 | 2048 | 2,838 | **2,504** | −11.8 % | 113 |
+| 120b | mlp2 | 2048 | 1,504 | **1,340** | −10.9 % | 105 |
+
+The fused mlp1 entry points the engine calls: 20b gather + mlp1 + SwiGLU 801 → 718 µs (B=512) and
+1,358 → 1,256 µs (B=1024); 120b mlp1 + SwiGLU 1,046 → 828 µs (B=512) and 1,607 → 1,370 µs
+(B=1024). Every expert with only 16 rows (where the weights matter most): 487 → 313 µs (−36 %).
+
+Where the gain comes from (20b mlp1, B=512; each version timed back to back with the one before it
+on the same GPU):
+
+| change | µs per call |
+|---|---:|
+| first matrix-core kernel, checkpoint layout | 862 |
+| codes packed (scales still through LDS) | 764 |
+| scales packed, 2 direct loads per thread | 750 |
+| weights loaded one step ahead instead of two | 734 |
+| no forced register copy before the unpacking (see Pitfalls) | 722 |
+
+Hardware counters (rocprofv3, same call): requests to the L2 cache 14.3 → 9.3 million per call,
+matrix cores busy 53 → 70 % of the time (120b mlp1 B=512: 17.6 → 10.5 million, 48 → 64 %).
+
+Whole program, 64 prompts × 128 tokens (`./run … -n 128`, mv-mi250-02): 20b on one GCD 2,743 →
+**3,315 tok/s** (+21 %), 120b on a GCD pair 1,433 → **1,755 tok/s** (+22 %), same output hashes.
+
 ## What was limiting it: requests to the L2 cache
 
 The previous draft of this kernel (64 × 128 items, 4 wavefronts, steps of 64 k, one scale byte loaded
@@ -195,14 +335,15 @@ showed the matrix cores busy only 38 % of the time. The telling number:
 Per item it asked for 64 rows of A (5,760 lines), 128 columns of weights at 32 bytes per line and
 step (5,760 lines), and a whole line for each 1-byte scale (5,760 lines). The new layout needs fewer:
 
-| per item | draft (64 × 128) | new (64 × 256) |
-|---|---:|---:|
-| A lines | 5,760 | 5,760 (but for twice the columns) |
-| weight lines | 5,760 | 8,832 (for twice the columns: 16 bytes per thread; odd columns straddle two lines) |
-| scale lines | 5,760 | 360 |
-| lines per 1,000 multiply-adds | 0.73 | 0.32 |
+| per item | draft (64 × 128) | new (64 × 256) | packed (section 7) |
+|---|---:|---:|---:|
+| A lines | 5,760 | 5,760 (but for twice the columns) | 5,760 |
+| weight lines | 5,760 | 8,832 (for twice the columns: 16 bytes per thread; odd columns straddle two lines) | 5,760 (every line read whole) |
+| scale lines | 5,760 | 360 | 384 |
+| lines per 1,000 multiply-adds | 0.73 | 0.32 | 0.25 |
 
-Measured: **14.2 million requests per call (11.4 per tick), matrix cores busy 59 %**.
+Measured: **14.2 million requests per call (11.4 per tick), matrix cores busy 59 %**; with the
+packed weights 9.3 million and 70 %.
 
 Two compiler details mattered as much (both visible only in the generated machine code, kept in
 the build with `-save-temps`):
@@ -216,10 +357,12 @@ the build with `-save-temps`):
   their latency, and pulled the A reordering right after its own load. Two
   `__builtin_amdgcn_sched_barrier(0)` markers keep the loads at the start and the reordering at the end.
 
-What is left (test builds that skip one part, so their results are wrong but their time tells the
-cost of that part): without the barrier and A copy the time does not drop (871 µs vs 845–857 µs);
-without the unpacking it drops 3 %; without the weight loads, 17 % (and 42 % when every expert has
-only 16 rows).
+What was left before section 7 (test builds that skip one part, so their results are wrong but their
+time tells the cost of that part): without the barrier and A copy the time does not drop (871 µs vs
+845–857 µs); without the unpacking it drops 3 %; without the weight loads, 17 % (and 42 % when every
+expert has only 16 rows). With the packed weights (before the last two changes of section 7):
+without the weight loads −11 % (−17 % at 16 rows per expert), without the A loads −10 % (no change
+at 16 rows per expert).
 So the weight traffic is still the main cost, and the register file is full (128 per thread), which
 is why deeper prefetch did not help (see below).
 
@@ -232,7 +375,8 @@ synthetic routing with the same unevenness. "Library" = the vendor library (hipB
 PyTorch, bf16 weights, so 4× the weight bytes) called once per expert on the same routing, all calls
 of one grouped multiply captured in one HIP graph so launch costs are small
 (`getp-csrc/bench/moe_torch_lib.py`, mv-mi250-02); "library est." = the sum over experts of the
-single-call library time for that expert's row count (`yardsticks/gemm_bench.json`). µs per call:
+single-call library time for that expert's row count (`yardsticks/gemm_bench.json`). µs per call,
+before the packed layout (section 7 has the current numbers):
 
 | model | shape | B | simple | draft | **new** | new TFLOP/s | library | library est. | new vs library |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -269,42 +413,47 @@ In the lead's profile after the dense-GEMM change (477 ms per step, 96 % in this
 ≈ 9.5 ms per call), the new kernel's ≈ 1.3 ms per mlp1 + mlp2 pair brings the expert multiplies from
 ≈ 456 ms to ≈ 32 ms per step.
 
-**One more step, ready but not yet used by the engine:** `gemm_grouped_mxfp4_gather_swiglu` does the
+**One more step, now used by the engine:** `gemm_grouped_mxfp4_gather_swiglu` does the
 gather (copying each token's row into expert order), mlp1 and SwiGLU in one kernel, so the
 fp32 mlp1 output (47 MB per layer at B=512) is never written and read back. Measured (mlp1, same
 setup): 20b B=512 947 → 802 µs, B=1024 1,560 → 1,342 µs, B=2048 2,823 → 2,471 µs, 120b B=512
 1,208 → 1,036 µs (−12 to −15 %), bit-identical to the three separate kernels
 (`MOE_FUSED=1 ./moe_gemm_bench …`).
 
-**What would come next: weights stored in reading order.** In the checkpoint layout a block reads,
-per step, 256 separate 64-byte pieces 1,440 bytes apart. A separate test that only reads the 32 mlp1
-experts (265 MB) this way takes 311 µs (855 GB/s); reading the same bytes contiguously takes 205 µs
-(1,296 GB/s); padding the rows to a multiple of 64 bytes does not help (309 µs). Rearranging each
-expert's codes once at load time, so that every (256-column tile, step of 128 k) is one contiguous
-16 KB piece, would make the weight stream about 1.5× faster — the main remaining cost, most of all
-for small experts (gpt-oss-120b). It changes the weight layout the kernel takes, so it is an engine
-decision.
+**Weights stored in reading order** (section 7): another 7–25 % per call; 64 prompts × 128 tokens
+20b 2,743 → 3,315 tok/s, 120b 1,433 → 1,755 tok/s.
+
+**What could come next.** The A loads now cost about as much as the weight loads (−10 % each when
+skipped): each 64-byte line of A is asked for by two load instructions of 32 bytes each. Experts
+with 16 rows are limited by the unpacking (about 145 plain instructions per step against 16 MFMAs).
 
 ## Where it is in our code
 
 All in `getp-csrc/kernels/fast_moe_gemm.hpp`:
 
-- `:104` `fp4_tables`, `:124` `fp4x8_to_bf16` — unpacking MXFP4 to bf16 with `v_perm_b32`.
-- `:151` `MoeSmem` — the 32 KB of LDS (two A buffers; at item start, the scale bytes).
-- `:176` `moe_tile_prefix`, `:227` `moe_find_rank` — counting each expert's row tiles, biggest first,
+- `:39` the packed layout, described at the top of the file; `:122` `moe_packed_blocks_bytes`,
+  `:125` `moe_packed_scales_bytes` — its size per expert.
+- `:604` `moe_pack_blocks_kernel`, `:626` `moe_pack_scales_kernel`, `:651` `moe_pack_mxfp4` —
+  the repacking, run once at load time.
+- `:138` `fp4_tables`, `:158` `fp4x8_to_bf16` — unpacking MXFP4 to bf16 with `v_perm_b32`.
+- `:184` `MoeSmem` — the 32 KB of LDS (two A buffers).
+- `:208` `moe_tile_prefix`, `:259` `moe_find_rank` — counting each expert's row tiles, biggest first,
   and finding the item of a ticket.
-- `:241` `moe_store_a` — A into LDS in the "even k first" order.
-- `:284` `moe_step` — one step of 128 k: loads (`:316` keeps them at the start), unpacking, 64 MFMAs
-  (`:339`), A into the other buffer (`:346`), barrier.
-- `:357` `moe_item` — one work item: scales into registers (`:377`, `:388`), per-thread addresses
-  (`:407`), the step loop (`:444`), the bias add and stores (`:452`).
-- `:494` `gemm_grouped_mxfp4_mfma_kernel` — the persistent loop: ticket (`:512`), made uniform
-  (`:518`), the 1–4 row-tile variants (`:543`), queue reset (`:562`).
-- `:684` `gemm_grouped_mxfp4` — the entry point the engine calls
-  (`getp-csrc/engine/gpu_engine.hpp:334` and `:338`); `:630` the simple version, still used for shapes
-  the fast kernel does not take (`:661` `moe_mfma_ok`).
-- `:702` `gemm_grouped_mxfp4_swiglu`, `:716` `gemm_grouped_mxfp4_gather_swiglu` — optional fused
-  versions for mlp1 (not used by the engine yet), equal bit for bit to the separate kernels.
+- `:273` `moe_store_a` — A into LDS in the "even k first" order.
+- `:322` `moe_step` — one step of 128 k: loads of the next step (`:349` the weights, `:353` keeps
+  them at the start), unpacking, 64 MFMAs (`:376`), A into the other buffer (`:384`), barrier.
+- `:395` `moe_item` — one work item: the tile's packed buffer descriptor (`:420`), per-thread
+  offsets (`:430`), the scale loads (`:441`), the step loop (`:475`), the bias add and stores (`:483`).
+- `:525` `gemm_grouped_mxfp4_mfma_kernel` — the persistent loop: ticket (`:543`), made uniform
+  (`:549`), the 1–4 row-tile variants (`:574`), queue reset (`:593`).
+- `:780` `gemm_grouped_mxfp4` — the entry point for mlp2 (`getp-csrc/engine/gpu_engine.hpp:456`);
+  `:723` the simple version, still used (on the checkpoint layout) for shapes the fast kernel does
+  not take (`:756` `moe_mfma_ok`).
+- `:798` `gemm_grouped_mxfp4_swiglu` (120b split, `gpu_engine.hpp:446`), `:813`
+  `gemm_grouped_mxfp4_gather_swiglu` (20b, `gpu_engine.hpp:438`) — the fused mlp1 versions, equal
+  bit for bit to the separate kernels.
+- `getp-csrc/engine/gpu_engine.hpp:152` — the `experts` helper of `gpu_upload_weights` that stages
+  and packs each layer's expert weights (`:195` mlp1, `:197` mlp2).
 
 Tests and measurements: `getp-csrc/tests/moe_gemm_test.cpp` (unit test),
 `getp-csrc/bench/moe_gemm_bench.cpp` (speed, `MOE_UNIFORM=64` for even routing, `MOE_ONLY=…` for
@@ -320,6 +469,14 @@ one configuration), `getp-csrc/bench/moe_torch_lib.py` (library yardstick, separ
 - Unpacking: one-hot rows of A turn the output into the weights themselves: all 16 codes × scale
   bytes 2..252 are bit-exact.
 - The fused SwiGLU variants: bit-identical to the separate kernels on 5.9 million outputs.
+- The packer: every byte of the packed copy where the layout says, against a host version (mlp1
+  shape and two odd shapes with a half step and N not a multiple of 16 or 256).
+- Packed against checkpoint layout: the kernel before section 7 (checkpoint layout) and the current
+  one (packed) give the same bits on 1.45 billion outputs — real routings of 11 layer-steps each at
+  B=512 and 1,024, synthetic 120b routings at B=512 to 2,048, 16 rows per expert, tile-edge row
+  counts, 128 experts, small odd shapes — for the plain multiply and both fused versions.
+- End-to-end output hashes unchanged by section 7: 20b `ccfc732a4a25` (one GCD), 120b
+  `836592181c82` (GCD pair), 64 prompts × 128 tokens.
 - End to end, 64 prompts × 128 tokens: 49 of 64 answers identical to the reference, 88.6 % of tokens
   before the first difference (simple kernel: 43 / 64, 80.9 %). The order of additions changed, so
   some answers drift later, as with every bf16 change (doc 10).
@@ -336,6 +493,9 @@ one configuration), `getp-csrc/bench/moe_torch_lib.py` (library yardstick, separ
 | weights prefetched 3 steps ahead | 848 → 1,022 µs | 13 spills inside the loop (128-register limit) |
 | 3 rotating weight registers, reload right after unpacking | ≈ 850 → 1,199 µs | 34 spills |
 | skip the arithmetic of wavefronts whose columns are all past N | within noise | the branch made the compiler wait for all loads at every loop turn |
+| packed, but one load instruction = 1 KB contiguous (piece first, kq second; K padded to whole steps) | 749 → 755 µs; 120b 878 → 886 µs; 16 rows 329 → 324 µs | no gain over 4 runs of 256 bytes, and 2.2 % more memory for the padding |
+| packed, weights still loaded two steps ahead (two register sets) | 734 → 751 µs (all 8 shapes 1.5–2.8 % slower) | one step is enough once the weights stream contiguously; the second set only takes registers |
+| packed, the decode reads a forced copy of the loaded registers | 722 → 734 µs | 8 more instructions per step; without it the compiler alternates two register sets by itself |
 
 ## Pitfalls
 
@@ -345,8 +505,18 @@ one configuration), `getp-csrc/bench/moe_torch_lib.py` (library yardstick, separ
 - **The smallest scale bytes do not fit.** For scale byte 1, 0.5 × 2^(1−127) is below the smallest
   normal bf16; we do not build that pattern. Scale bytes 2..252 are exact; the checkpoint uses 115..136.
 - **The last half step.** 2,880 is not a multiple of 128: in the last step the threads whose 32 k lie
-  past the end read the next column's bytes; their codes are replaced by zeros. The A values they
-  meet belong to the next row (finite numbers), so they add exactly 0.
+  past the end ask for bytes past the end of the tile's buffer descriptor and get zero codes. The A
+  values they meet belong to the next row (finite numbers), so they add exactly 0. This relies on
+  the hardware's range check counting the per-step offset that sits in a scalar register, not only
+  the per-thread offset; a small test confirmed it on gfx90a (voffset + soffset ≥ length → 0).
+- **The engine and the kernel must agree on the layout.** The fast entry points take packed
+  weights exactly when `moe_mfma_ok` holds; the engine packs under the same condition and never on
+  the exact path, whose kernels read the checkpoint layout. Handing checkpoint bytes to the fast
+  kernel gives plausible-looking garbage, not a crash.
+- **Register moves at the end of the loop.** Whether the loaded weights land in the registers the
+  next step reads is up to the compiler. In one version it loaded into other registers and copied
+  them back at the end of every loop turn, after waiting for all loads in flight (`s_waitcnt
+  vmcnt(0)` followed by 8 `v_mov_b32`). Check the inner loop of the `.s` file after every change.
 - **Look at the machine code.** Both big slowdowns found here (a per-load loop from a value the
   compiler thought could differ per thread, and loads moved to the end of the step) were invisible in
   the source and in the results; they show in the `.s` file and in the `s_waitcnt` (wait for memory)

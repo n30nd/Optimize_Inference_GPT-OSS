@@ -11,7 +11,12 @@
 // The dump file holds lines "B pos layer offsets[0] .. offsets[E]" (real
 // routing of gpt-oss-20b); without it only synthetic routings are tested.
 //
+// The weights are made in the checkpoint layout and repacked on the GPU with
+// moe_pack_mxfp4, as the engine does at load time.
+//
 // Checks:
+//  0. pack: moe_pack_mxfp4 writes every byte where the layout at the top of
+//     kernels/fast_moe_gemm.hpp says (host reference, odd shapes included);
 //  1. decode: one-hot A rows make C equal the decoded weights, which must be
 //     bit-identical to LUT[code] * 2^(scale - 127), for all 16 codes and all
 //     scale bytes 2 .. 252 (scale 1 makes 0.5 * 2^-126, below bf16's normal range);
@@ -72,6 +77,73 @@ static float wval(const uint8_t *blk, const uint8_t *scl, int K, int n, int k) {
   const uint8_t byte = blk[g * 16 + (k % 32) / 2];
   const int code = (k & 1) ? byte >> 4 : byte & 15;
   return kLut[code] * ldexpf(1.0f, (int)scl[g] - 127);
+}
+
+// The fast kernels read packed weights whenever moe_mfma_ok: replaces the
+// checkpoint-layout device buffers dB, dS by their packed copies.
+static void pack_on_gpu(uint8_t *&dB, uint8_t *&dS, int E, int N, int K) {
+  if (!moe_mfma_ok(E, N, K))
+    return;
+  uint8_t *pb, *ps;
+  CHECK(hipMalloc(&pb, (size_t)E * moe_packed_blocks_bytes(N, K)));
+  CHECK(hipMalloc(&ps, (size_t)E * moe_packed_scales_bytes(N, K)));
+  moe_pack_mxfp4(0, dB, dS, E, N, K, pb, ps);
+  CHECK(hipGetLastError());
+  CHECK(hipDeviceSynchronize());
+  CHECK(hipFree(dB));
+  CHECK(hipFree(dS));
+  dB = pb;
+  dS = ps;
+}
+
+// moe_pack_mxfp4 against a host version of the documented layout, byte for
+// byte (padding bytes must be 0).
+static int pack_test(int E, int N, int K) {
+  const int kg = K / 32, n16 = (N + 15) / 16;
+  std::mt19937 rng(5 + N + K);
+  std::vector<uint8_t> blk((size_t)E * N * K / 2), scl((size_t)E * N * kg);
+  for (auto &b : blk)
+    b = rng() & 0xff;
+  for (auto &x : scl)
+    x = 1 + rng() % 254;
+  const size_t pbb = moe_packed_blocks_bytes(N, K), psb = moe_packed_scales_bytes(N, K);
+  std::vector<uint8_t> wb((size_t)E * pbb, 0), ws((size_t)E * psb, 0);
+  for (int e = 0; e < E; e++)
+    for (int n = 0; n < N; n++) {
+      const int t = n / 256, c = (n % 256) / 16, j = n % 16;
+      const int nc = std::min(16, n16 - 16 * t);
+      for (int g = 0; g < kg; g++) {
+        const int p = g / 4, kq = g % 4;
+        const size_t off = (size_t)e * pbb + (size_t)t * 256 * (K / 2) +
+                           (size_t)p * nc * 1024 + (size_t)(kq * nc + c) * 256 + 16 * j;
+        memcpy(&wb[off], &blk[(((size_t)e * N + n) * kg + g) * 16], 16);
+        const int lane = 16 * kq + j, P = n / 16;
+        const size_t soff = (size_t)e * psb + (size_t)P * MOE_SPIECE +
+                            (p < 16 ? 16 * lane + p : 1024 + 8 * lane + (p - 16));
+        ws[soff] = scl[((size_t)e * N + n) * kg + g];
+      }
+    }
+  uint8_t *dB, *dS;
+  CHECK(hipMalloc(&dB, blk.size()));
+  CHECK(hipMalloc(&dS, scl.size()));
+  CHECK(hipMemcpy(dB, blk.data(), blk.size(), hipMemcpyHostToDevice));
+  CHECK(hipMemcpy(dS, scl.data(), scl.size(), hipMemcpyHostToDevice));
+  pack_on_gpu(dB, dS, E, N, K);
+  std::vector<uint8_t> gb(wb.size()), gs(ws.size());
+  CHECK(hipMemcpy(gb.data(), dB, gb.size(), hipMemcpyDeviceToHost));
+  CHECK(hipMemcpy(gs.data(), dS, gs.size(), hipMemcpyDeviceToHost));
+  long long bad = 0;
+  for (size_t i = 0; i < wb.size(); i++)
+    bad += wb[i] != gb[i];
+  for (size_t i = 0; i < ws.size(); i++)
+    bad += ws[i] != gs[i];
+  char name[64];
+  snprintf(name, sizeof name, "pack E=%d N=%d K=%d", E, N, K);
+  printf("%-34s %lld of %zu packed bytes differ  %s\n", name, bad, wb.size() + ws.size(),
+         bad ? "FAIL" : "ok");
+  CHECK(hipFree(dB));
+  CHECK(hipFree(dS));
+  return bad ? 1 : 0;
 }
 
 struct Case {
@@ -153,6 +225,7 @@ static int run_case(const Case &cs, bool verbose = true) {
   CHECK(hipMemcpy(dOff, off.data(), off.size() * 4, hipMemcpyHostToDevice));
   CHECK(hipMemcpy(dB, blk.data(), blk.size(), hipMemcpyHostToDevice));
   CHECK(hipMemcpy(dS, scl.data(), scl.size(), hipMemcpyHostToDevice));
+  pack_on_gpu(dB, dS, E, N, K);
   CHECK(hipMemcpy(dBias, bias.data(), bias.size() * 4, hipMemcpyHostToDevice));
   CHECK(hipMemset(dC, 0xff, (size_t)std::max(R, 1) * N * 4)); // NaN: unwritten rows show
   gemm_grouped_mxfp4(0, dA, dOff, max_rows, E, dB, dS, dBias, dC, N, K);
@@ -237,6 +310,7 @@ static int decode_test() {
   CHECK(hipMemcpy(dOff, off.data(), 8, hipMemcpyHostToDevice));
   CHECK(hipMemcpy(dB, blk.data(), blk.size(), hipMemcpyHostToDevice));
   CHECK(hipMemcpy(dS, scl.data(), scl.size(), hipMemcpyHostToDevice));
+  pack_on_gpu(dB, dS, 1, N, K);
   gemm_grouped_mxfp4(0, dA, dOff, R, 1, dB, dS, nullptr, dC, N, K);
   CHECK(hipGetLastError());
   std::vector<float> C((size_t)R * N);
@@ -329,6 +403,7 @@ static int fused_test(int E, int B) {
   CHECK(hipMemcpy(dRp, row_pair.data(), row_pair.size() * 4, hipMemcpyHostToDevice));
   CHECK(hipMemcpy(dB, blk.data(), blk.size(), hipMemcpyHostToDevice));
   CHECK(hipMemcpy(dS, scl.data(), scl.size(), hipMemcpyHostToDevice));
+  pack_on_gpu(dB, dS, E, N, K);
   CHECK(hipMemcpy(dBias, bias.data(), bias.size() * 4, hipMemcpyHostToDevice));
   gemm_grouped_mxfp4(0, dA, dOff, max_rows, E, dB, dS, dBias, dC, N, K);
   swiglu_bf16_kernel<<<((size_t)R * I + 255) / 256, 256>>>(dC, dG[0], R, I, limit);
@@ -359,7 +434,8 @@ static int fused_test(int E, int B) {
 }
 
 int main(int argc, char **argv) {
-  int fails = decode_test();
+  int fails = pack_test(2, 5760, 2880) + pack_test(3, 200, 192) + pack_test(2, 520, 256);
+  fails += decode_test();
   fails += fused_test(32, 512);
   fails += fused_test(128, 512);
   std::vector<Case> cases;
@@ -406,8 +482,10 @@ int main(int argc, char **argv) {
     cases.push_back({p + " tile-edge row counts", 32, N, K, std::vector<int>(odd, odd + 32)});
   }
   cases.push_back({"mlp1 20b B=2048 skewed", 32, 5760, 2880, random_routing(32, 2048, 9, 1.0)});
-  // Small shapes: N not a multiple of the 128-column tile, one expert.
+  // Small shapes: N not a multiple of the 256-column tile or of 16, one
+  // expert, a last half step of 64 k.
   cases.push_back({"N=200 K=128 small", 3, 200, 128, {5, 0, 70}});
+  cases.push_back({"N=200 K=192 half step", 3, 200, 192, {5, 0, 70}});
   cases.push_back({"N=64 K=64 single row", 1, 64, 64, {1}});
   for (const Case &cs : cases)
     fails += run_case(cs);

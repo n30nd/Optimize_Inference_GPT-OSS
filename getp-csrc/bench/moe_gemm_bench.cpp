@@ -21,6 +21,9 @@
 // synthetic (2 * B tokens picking 4 of 128 experts, the first 64 kept), with
 // the same unevenness as the measured 20b one.
 //
+// The fast kernel reads the weights repacked by moe_pack_mxfp4 (done once,
+// not timed), the simple version the checkpoint layout.
+//
 // Per configuration it prints the mean time over `iters` calls (after 3
 // warm-up calls), the useful work in TFLOP/s (2 * rows * N * K per call), the
 // bytes per second (weights of the experts that got rows + A + C), and the
@@ -263,6 +266,11 @@ int main(int argc, char **argv) {
       for (int s = 0; s < nsets; s++)
         CHECK(hipMemcpy(dOff + s * (E + 1), cf.sets[s].data(), (E + 1) * 4,
                         hipMemcpyHostToDevice));
+      uint8_t *dPB, *dPS; // packed copies for the fast kernel
+      CHECK(hipMalloc(&dPB, (size_t)E * moe_packed_blocks_bytes(N, K)));
+      CHECK(hipMalloc(&dPS, (size_t)E * moe_packed_scales_bytes(N, K)));
+      moe_pack_mxfp4(0, dB, dS, E, N, K, dPB, dPS);
+      CHECK(hipDeviceSynchronize());
 
       // Per-call averages of the work done.
       double lib = 0, bytes = 0;
@@ -280,7 +288,7 @@ int main(int argc, char **argv) {
       const double flops = 2.0 * R_avg * N * K;
 
       auto call_new = [&](int s) {
-        gemm_grouped_mxfp4(0, dA, dOff + s * (E + 1), cf.max_rows, E, dB, dS, dBias, dC, N, K);
+        gemm_grouped_mxfp4(0, dA, dOff + s * (E + 1), cf.max_rows, E, dPB, dPS, dBias, dC, N, K);
       };
       auto call_old = [&](int s) {
         gemm_grouped_mxfp4_simple(0, dA, dOff + s * (E + 1), cf.max_rows, E, dB, dS, dBias, dC, N, K);
@@ -314,15 +322,15 @@ int main(int argc, char **argv) {
           rows[s] = cf.sets[s][E];
         auto call_sep = [&](int s) {
           gather_bf16_kernel<<<rows[s], 256, 0, 0>>>(dX, dRp, topk, dA, K);
-          gemm_grouped_mxfp4(0, dA, dOff + s * (E + 1), cf.max_rows, E, dB, dS, dBias, dC, N, K);
+          gemm_grouped_mxfp4(0, dA, dOff + s * (E + 1), cf.max_rows, E, dPB, dPS, dBias, dC, N, K);
           swiglu_bf16_kernel<<<((size_t)rows[s] * I + 255) / 256, 256, 0, 0>>>(dC, dG, rows[s], I, 7.0f);
         };
         auto call_fused = [&](int s) {
           gemm_grouped_mxfp4_gather_swiglu(0, dX, dRp, topk, dOff + s * (E + 1), cf.max_rows, E,
-                                           dB, dS, dBias, dG, 7.0f, N, K);
+                                           dPB, dPS, dBias, dG, 7.0f, N, K);
         };
         auto call_swiglu = [&](int s) {
-          gemm_grouped_mxfp4_swiglu(0, dA, dOff + s * (E + 1), cf.max_rows, E, dB, dS, dBias, dG,
+          gemm_grouped_mxfp4_swiglu(0, dA, dOff + s * (E + 1), cf.max_rows, E, dPB, dPS, dBias, dG,
                                     7.0f, N, K);
         };
         const Timing ts = time_calls(call_sep, nsets, iters);
@@ -337,6 +345,8 @@ int main(int argc, char **argv) {
       }
       CHECK(hipFree(dB));
       CHECK(hipFree(dS));
+      CHECK(hipFree(dPB));
+      CHECK(hipFree(dPS));
       CHECK(hipFree(dA));
       CHECK(hipFree(dBias));
       CHECK(hipFree(dC));

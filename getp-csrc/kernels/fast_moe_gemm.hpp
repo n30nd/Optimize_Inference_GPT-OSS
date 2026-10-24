@@ -9,8 +9,9 @@
 // and adds the 16x16 result into fp32 accumulators.
 //
 // What limits this kernel is the number of requests to the L2 cache (one per
-// 64-byte line; the L2 answers about one per channel per clock), more than
-// the MFMA rate or the HBM bandwidth. The tile shape is chosen to need few:
+// 64-byte line; the L2 answers about one per channel per clock) and the rate
+// at which the weights stream in from memory, more than the MFMA rate. The
+// tile shape and the weight layout are chosen for both.
 //
 // Tile layout
 // -----------
@@ -31,10 +32,34 @@
 // straight from global memory into registers, decodes them to bf16 and feeds
 // them to the MFMA: 8 MFMA k-steps of 16 per step. The A slice of the next
 // step goes through registers into the other LDS buffer while the current
-// one is multiplied; the weight bytes are loaded two steps ahead (two
-// register sets). The scale bytes of the item's 256 columns (256 x K/32
-// bytes, contiguous in memory) are copied once per item through LDS into
-// registers, instead of one tiny load per step.
+// one is multiplied, and the weight bytes of the next step are loaded into
+// registers meanwhile. Each lane loads the scale bytes it needs for the whole
+// item (one per step and column tile) into registers once, at the item's start.
+//
+// Packed weights (moe_pack_mxfp4)
+// -------------------------------
+// The kernel does not read the checkpoint layout (one row of K/2 code bytes
+// per column) but a copy repacked once at load time, in which every (256-
+// column tile, step of 128 k) is one contiguous run of 16 KB, in the order
+// the lanes read it. Per expert, with nc = 16-column pieces in the tile (16,
+// fewer only in the last tile; columns are padded with zeros to a multiple
+// of 16):
+//
+//   codes:  tile t, step p, lane group kq, piece c, column j of the piece:
+//           offset 256t * K/2 + p * nc * 1024 + (kq * nc + c) * 256 + 16 * j
+//           = the 16 code bytes of column 256t + 16c + j, group 4p + kq
+//   scales: piece P = n / 16 (1536 bytes each); lane (j, kq) owns 24 bytes,
+//           byte i = scale of column 16P + j, group 4i + kq (0 past K):
+//           bytes 0..15 at P * 1536 + 16 * lane, 16..23 at P * 1536 + 1024 + 8 * lane
+//
+// So the codes of one load instruction of a wavefront are 4 runs of 256
+// bytes, and each lane gets its 6 scale registers with 2 loads. With kq
+// outermost, a last half step (K % 128 == 64) is the first half of a full
+// one, so a tile still takes 8 * K bytes per 16 columns, as in the
+// checkpoint: lanes kq = 2, 3 read past the end of the tile's buffer
+// descriptor there and get zero codes without memory traffic. The bytes
+// that reach each register are the same as with the checkpoint layout, so
+// the results are bit for bit the same.
 //
 // MFMA operand layout (16x16x16): lane l holds 4 consecutive k values of row
 // (l % 16) of the A tile and of column (l % 16) of the W tile; lanes 0-15 hold
@@ -91,6 +116,15 @@
 #define MOE_THREADS (MOE_WAVES * 64)
 #define MOE_SREGS 6                   // scale registers per column tile: K <= 4 * 6 * 128
 #define MOE_MAX_E 256                 // largest expert count supported
+#define MOE_SPIECE (64 * 4 * MOE_SREGS) // packed scale bytes per 16 columns (1536)
+
+// Bytes of one expert's packed codes and scales (moe_pack_mxfp4).
+__host__ __device__ inline size_t moe_packed_blocks_bytes(int N, int K) {
+  return (size_t)((N + 15) / 16) * 8 * K;
+}
+__host__ __device__ inline size_t moe_packed_scales_bytes(int N, int K) {
+  return (size_t)((N + 15) / 16) * MOE_SPIECE;
+}
 
 typedef short moe_bf16x4 __attribute__((ext_vector_type(4)));
 typedef float moe_f32x4 __attribute__((ext_vector_type(4)));
@@ -146,11 +180,9 @@ __device__ inline moe_bf16x4 as_bf16x4(uint32_t lo, uint32_t hi) {
 
 // LDS of one block, 32 KB, so 2 blocks (16 wavefronts) fit in a CU's 64 KB.
 // a[buffer][t][kq][row] holds the 4 bf16 that lane (row % 16, kq) feeds to
-// the MFMA at k-step t of a step of 128. At the start of an item the same
-// bytes first hold the item's scale bytes (`stage`).
-union MoeSmem {
+// the MFMA at k-step t of a step of 128.
+struct MoeSmem {
   uint2 a[2][8][4][MOE_MT];
-  uint4 stage[2 * 8 * 4 * MOE_MT / 2];
 };
 
 // Work queue of the persistent kernel: [0] next item, [1] blocks finished.
@@ -267,36 +299,41 @@ __device__ inline uint4 moe_load16(__amdgpu_buffer_rsrc_t r, uint32_t voff, uint
   return make_uint4(x[0], x[1], x[2], x[3]);
 }
 
+__device__ inline uint2 moe_load8(__amdgpu_buffer_rsrc_t r, uint32_t voff, uint32_t soff) {
+  const auto x = __builtin_amdgcn_raw_buffer_load_b64(r, voff, soff, 0);
+  return make_uint2(x[0], x[1]);
+}
+
 // Per-lane load state of one work item.
 struct MoeLanes {
   __amdgpu_buffer_rsrc_t a_rsrc, w_rsrc;
   uint32_t a_off;         // byte offset of this thread's 32 A bytes in step 0
   uint32_t w_off[MOE_NS]; // byte offset of this lane's 16 code bytes in step 0
+  uint32_t w_step;        // bytes of one step of the item's packed tile
 };
 
 // One step of 128 k. Decodes the weights of step p from wq with the scale
 // in the low byte of sc (then shifts sc down by one byte), refills wq with
-// step p+2, loads the A slice of step p+1 and, after the 8 MFMA k-steps,
+// step p+1, loads the A slice of step p+1 and, after the 8 MFMA k-steps,
 // stores it into the other LDS buffer. Past the last step the loads re-read
 // the last one: with no branch in the loop body the compiler waits for
 // exactly the loads each use needs (behind a branch it waited for all).
 template <int MSA>
-__device__ __forceinline__ void moe_step(MoeSmem &sm, int p, int np, int K,
+__device__ __forceinline__ void moe_step(MoeSmem &sm, int p, int np,
                                          uint4 (&wq)[MOE_NS],
                                          uint32_t (&sc)[MOE_NS][MOE_SREGS],
                                          const MoeLanes &ln, int arow, int apart,
                                          int j, int kq,
                                          moe_f32x4 (&acc)[MSA][MOE_NS]) {
   const int buf = p & 1;
-  const bool live = MOE_KS * p + 32 * kq < K; // false only in a last, partial step
   uint32_t q[MOE_NS][4];
   Fp4Tables tb[MOE_NS];
 #pragma unroll
   for (int jn = 0; jn < MOE_NS; jn++) {
-    q[jn][0] = live ? wq[jn].x : 0u;
-    q[jn][1] = live ? wq[jn].y : 0u;
-    q[jn][2] = live ? wq[jn].z : 0u;
-    q[jn][3] = live ? wq[jn].w : 0u;
+    q[jn][0] = wq[jn].x;
+    q[jn][1] = wq[jn].y;
+    q[jn][2] = wq[jn].z;
+    q[jn][3] = wq[jn].w;
     tb[jn] = fp4_tables(sc[jn][0] & 0xffu);
 #pragma unroll
     for (int r = 0; r + 1 < MOE_SREGS; r++)
@@ -304,12 +341,12 @@ __device__ __forceinline__ void moe_step(MoeSmem &sm, int p, int np, int K,
     sc[jn][MOE_SREGS - 1] >>= 8;
   }
 
-  const int pa = min(p + 1, np - 1), pw = min(p + 2, np - 1);
-  const uint4 x0 = moe_load16(ln.a_rsrc, ln.a_off, pa * MOE_KS * 2);
-  const uint4 x1 = moe_load16(ln.a_rsrc, ln.a_off + 16, pa * MOE_KS * 2);
+  const int pn = min(p + 1, np - 1);
+  const uint4 x0 = moe_load16(ln.a_rsrc, ln.a_off, pn * MOE_KS * 2);
+  const uint4 x1 = moe_load16(ln.a_rsrc, ln.a_off + 16, pn * MOE_KS * 2);
 #pragma unroll
   for (int jn = 0; jn < MOE_NS; jn++)
-    wq[jn] = moe_load16(ln.w_rsrc, ln.w_off[jn], pw * MOE_KS / 2);
+    wq[jn] = moe_load16(ln.w_rsrc, ln.w_off[jn], pn * ln.w_step);
   // Keep the loads here, at the start of the step: left alone, the compiler
   // moves them to the end (to free registers), where the A loads' latency
   // is no longer hidden behind the MFMAs.
@@ -351,8 +388,9 @@ __device__ __forceinline__ void moe_step(MoeSmem &sm, int p, int np, int K,
 // One work item: rows m0 .. m0+mv-1 (mv <= 64) of expert e (C, G and gather
 // already offset to the expert's first row), columns n0 .. n0+255. A holds
 // the expert's rows, or, when gather is set, is the token matrix and row r of
-// the expert is token gather[r] / topk. MSA = number of 16-row tiles that
-// hold valid rows (1 .. 4).
+// the expert is token gather[r] / topk. wblocks and wscales point to the
+// expert's packed weights. MSA = number of 16-row tiles that hold valid rows
+// (1 .. 4).
 template <int MSA>
 __device__ void moe_item(MoeSmem &sm, const bf16_t *__restrict__ A,
                          const uint8_t *__restrict__ wblocks,
@@ -365,58 +403,49 @@ __device__ void moe_item(MoeSmem &sm, const bf16_t *__restrict__ A,
   const int lane = tid & 63, wave = tid >> 6;
   const int j = lane & 15, kq = lane >> 4;
   const int np = (K + MOE_KS - 1) / MOE_KS;
-  const int kg = K / 32;
+  const int nc = min(16, (N + 15) / 16 - n0 / 16); // 16-column pieces in this tile
 
-  // 1. The scale bytes of columns n0 .. n0+255 are 256 * kg contiguous bytes
-  //    (23 KB for K = 2880): one 16-byte load per thread and round, into LDS.
-  {
-    const uint32_t base = (uint32_t)n0 * kg, bytes = MOE_NT * kg;
-    const __amdgpu_buffer_rsrc_t s_rsrc = moe_rsrc(wscales, (uint32_t)N * kg);
-    if ((((uintptr_t)wscales + base) & 15) == 0) {
-      for (uint32_t v = tid; v < bytes / 16; v += MOE_THREADS)
-        sm.stage[v] = moe_load16(s_rsrc, base + 16 * v, 0);
-    } else {
-      uint8_t *st = (uint8_t *)&sm;
-      for (uint32_t b = tid; b < bytes; b += MOE_THREADS)
-        st[b] = __builtin_amdgcn_raw_buffer_load_b8(s_rsrc, base + b, 0, 0);
-    }
-  }
-  __syncthreads();
-  // 2. Lane (j, kq) keeps the scales of groups 4p + kq, p = 0, 1, ..., of
-  //    its column of each tile, 4 per register, step 0 in the low byte.
-  //    (Bytes past the column's kg are never used.)
-  uint32_t sc[MOE_NS][MOE_SREGS];
-  {
-    const uint8_t *st = (const uint8_t *)&sm;
-#pragma unroll
-    for (int jn = 0; jn < MOE_NS; jn++) {
-      const uint8_t *col = st + (wave * 32 + jn * 16 + j) * kg + kq;
-#pragma unroll
-      for (int r = 0; r < MOE_SREGS; r++)
-        sc[jn][r] = (uint32_t)col[16 * r] | ((uint32_t)col[16 * r + 4] << 8) |
-                    ((uint32_t)col[16 * r + 8] << 16) | ((uint32_t)col[16 * r + 12] << 24);
-    }
-  }
-  __syncthreads();
-
-  // 3. Thread (arow, apart) copies 16 A values of row m0 + arow per step
+  // 1. Thread (arow, apart) copies 16 A values of row m0 + arow per step
   //    (rows past mv repeat the last one; their results are never stored).
   //    In a wavefront, lanes 2i and 2i+1 read the two halves of one 64-byte
-  //    line. Lane (j, kq) reads, per column tile, the 16 code bytes of group
-  //    4p + kq of its column.
+  //    line. Lane (j, kq) of column tile jn reads piece c = 2 * wave + jn of
+  //    the packed tile; pieces past nc read zeros (an offset past the end of
+  //    the buffer: no memory traffic).
   const int arow = ((lane >> 1) & 31) + 32 * (wave & 1);
   const int apart = 2 * (wave >> 1) + (lane & 1);
   MoeLanes ln;
   const int r = m0 + min(arow, mv - 1);
   ln.a_rsrc = moe_rsrc(A, gather ? 0xffffffffu : (uint32_t)(m0 + mv) * K * 2);
   ln.a_off = (uint32_t)(gather ? gather[r] / topk : r) * K * 2 + 32 * apart;
-  ln.w_rsrc = moe_rsrc(wblocks, (uint32_t)N * K / 2);
+  ln.w_rsrc = moe_rsrc(wblocks + (size_t)n0 * (K / 2), (uint32_t)nc * 8 * K);
+  ln.w_step = (uint32_t)nc * 1024;
+  const __amdgpu_buffer_rsrc_t s_rsrc =
+      moe_rsrc(wscales + (size_t)(n0 / 16) * MOE_SPIECE, (uint32_t)nc * MOE_SPIECE);
   int ncol[MOE_NS];
+  uint32_t s_off[MOE_NS];
 #pragma unroll
   for (int jn = 0; jn < MOE_NS; jn++) {
-    ncol[jn] = n0 + wave * 32 + jn * 16 + j;
-    // columns past N read past the end of the buffer: zeros, no memory traffic
-    ln.w_off[jn] = ncol[jn] < N ? (uint32_t)ncol[jn] * (K / 2) + 16 * kq : 0x80000000u;
+    const int c = wave * MOE_NS + jn;
+    ncol[jn] = n0 + 16 * c + j;
+    ln.w_off[jn] = c < nc ? (uint32_t)(kq * nc + c) * 256 + 16 * j : 0x80000000u;
+    s_off[jn] = (uint32_t)c * MOE_SPIECE;
+  }
+
+  // 2. Lane (j, kq) keeps the scales of groups 4p + kq, p = 0, 1, ..., of
+  //    its column of each tile, 4 per register, step 0 in the low byte:
+  //    24 contiguous bytes of the packed scales.
+  static_assert(MOE_SREGS == 6, "the scale loads below fill 6 registers");
+  uint32_t sc[MOE_NS][MOE_SREGS];
+#pragma unroll
+  for (int jn = 0; jn < MOE_NS; jn++) {
+    const uint4 s0 = moe_load16(s_rsrc, s_off[jn] + 16 * lane, 0);
+    const uint2 s1 = moe_load8(s_rsrc, s_off[jn] + 1024 + 8 * lane, 0);
+    sc[jn][0] = s0.x;
+    sc[jn][1] = s0.y;
+    sc[jn][2] = s0.z;
+    sc[jn][3] = s0.w;
+    sc[jn][4] = s1.x;
+    sc[jn][5] = s1.y;
   }
 
   moe_f32x4 acc[MSA][MOE_NS];
@@ -426,27 +455,29 @@ __device__ void moe_item(MoeSmem &sm, const bf16_t *__restrict__ A,
     for (int jn = 0; jn < MOE_NS; jn++)
       acc[i][jn] = moe_f32x4{0.0f, 0.0f, 0.0f, 0.0f};
 
-  // Two weight register sets, used for even and odd steps.
-  uint4 wq0[MOE_NS], wq1[MOE_NS];
+  // The weights of step 0; then each step loads those of the next one.
+  uint4 wq[MOE_NS];
   {
     const uint4 x0 = moe_load16(ln.a_rsrc, ln.a_off, 0);
     const uint4 x1 = moe_load16(ln.a_rsrc, ln.a_off + 16, 0);
 #pragma unroll
-    for (int jn = 0; jn < MOE_NS; jn++) {
-      wq0[jn] = moe_load16(ln.w_rsrc, ln.w_off[jn], 0);
-      wq1[jn] = moe_load16(ln.w_rsrc, ln.w_off[jn], min(1, np - 1) * MOE_KS / 2);
-    }
+    for (int jn = 0; jn < MOE_NS; jn++)
+      wq[jn] = moe_load16(ln.w_rsrc, ln.w_off[jn], 0);
     moe_store_a(sm, 0, arow, apart, x0, x1);
   }
   __syncthreads();
 
+  // Two steps per turn, so that the LDS buffer of each step is a constant;
+  // the compiler then also alternates two register sets for wq. (Check the
+  // machine code: a loop turn must not end with moves into wq after an
+  // s_waitcnt vmcnt(0), which would wait for the loads of the next step.)
   int p = 0;
   for (; p + 1 < np; p += 2) {
-    moe_step<MSA>(sm, p, np, K, wq0, sc, ln, arow, apart, j, kq, acc);
-    moe_step<MSA>(sm, p + 1, np, K, wq1, sc, ln, arow, apart, j, kq, acc);
+    moe_step<MSA>(sm, p, np, wq, sc, ln, arow, apart, j, kq, acc);
+    moe_step<MSA>(sm, p + 1, np, wq, sc, ln, arow, apart, j, kq, acc);
   }
   if (p < np)
-    moe_step<MSA>(sm, p, np, K, wq0, sc, ln, arow, apart, j, kq, acc);
+    moe_step<MSA>(sm, p, np, wq, sc, ln, arow, apart, j, kq, acc);
 
   // Lane (j, kq) holds rows 4*kq + 0..3 of column j of each 16x16 tile.
   if (G == nullptr) {
@@ -501,7 +532,7 @@ void gemm_grouped_mxfp4_mfma_kernel(
   const int n_tiles = (N + MOE_NT - 1) / MOE_NT;
   const MoeTiles tiles = moe_tile_prefix(offsets, n_experts, (int *)&sm);
   const int total = tiles.total * n_tiles;
-  const size_t wsize = (size_t)N * K / 2, ssize = (size_t)N * (K / 32);
+  const size_t wsize = moe_packed_blocks_bytes(N, K), ssize = moe_packed_scales_bytes(N, K);
   // The item number goes from thread 0 to the block through the last LDS
   // word, which is free between items (it is first written again at the end
   // of the next item's first step, after everyone has read it).
@@ -564,6 +595,68 @@ void gemm_grouped_mxfp4_mfma_kernel(
       atomicExch(&g_moe_queue[1], 0u);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Repacking the checkpoint layout (blocks (E, N, K/32, 16), scales (E, N, K/32))
+// into the packed layout described at the top. One thread per group of 32
+// codes (16 bytes), over the columns padded to a multiple of 16.
+__global__ void moe_pack_blocks_kernel(const uint8_t *__restrict__ src,
+                                       uint8_t *__restrict__ dst, int E, int N, int K) {
+  const int kg = K / 32, n16 = (N + 15) / 16;
+  const size_t per_e = (size_t)n16 * 16 * kg;
+  const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (size_t)E * per_e)
+    return;
+  const int e = (int)(idx / per_e);
+  const size_t rem = idx % per_e;
+  const int n = (int)(rem / kg), g = (int)(rem % kg);
+  const int piece = n / 16, j = n % 16, t = piece / 16, c = piece % 16;
+  const int nc = min(16, n16 - 16 * t);
+  const int p = g / 4, kq = g % 4;
+  const size_t off = (size_t)e * moe_packed_blocks_bytes(N, K) + (size_t)t * 128 * K +
+                     (size_t)p * nc * 1024 + (size_t)(kq * nc + c) * 256 + 16 * j;
+  uint4 v = make_uint4(0u, 0u, 0u, 0u);
+  if (n < N)
+    v = *(const uint4 *)(src + (((size_t)e * N + n) * kg + g) * 16);
+  *(uint4 *)(dst + off) = v;
+}
+
+// One thread per (expert, 16-column piece, lane): that lane's 24 scale bytes.
+__global__ void moe_pack_scales_kernel(const uint8_t *__restrict__ src,
+                                       uint8_t *__restrict__ dst, int E, int N, int K) {
+  const int kg = K / 32, n16 = (N + 15) / 16;
+  const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (size_t)E * n16 * 64)
+    return;
+  const int lane = (int)(idx % 64);
+  const size_t piece = idx / 64; // e * n16 + P
+  const int e = (int)(piece / n16), n = (int)(piece % n16) * 16 + lane % 16;
+  const int kq = lane / 16;
+  uint8_t *d = dst + piece * MOE_SPIECE;
+  for (int i = 0; i < 4 * MOE_SREGS; i++) {
+    const int g = 4 * i + kq;
+    const uint8_t v = n < N && g < kg ? src[((size_t)e * N + n) * kg + g] : 0;
+    if (i < 16)
+      d[16 * lane + i] = v;
+    else
+      d[1024 + 8 * lane + (i - 16)] = v;
+  }
+}
+
+// Writes the packed copy of n_experts experts' MXFP4 weights (blocks and
+// scales in the checkpoint layout) to pblocks (n_experts *
+// moe_packed_blocks_bytes(N, K) bytes) and pscales (n_experts *
+// moe_packed_scales_bytes(N, K) bytes). Needs moe_mfma_ok(n_experts, N, K).
+static void moe_pack_mxfp4(hipStream_t s, const uint8_t *blocks, const uint8_t *scales,
+                           int n_experts, int N, int K, uint8_t *pblocks,
+                           uint8_t *pscales) {
+  const size_t nb = (size_t)n_experts * ((N + 15) / 16) * 16 * (K / 32);
+  const size_t ns = (size_t)n_experts * ((N + 15) / 16) * 64;
+  moe_pack_blocks_kernel<<<(unsigned)((nb + 255) / 256), 256, 0, s>>>(blocks, pblocks,
+                                                                     n_experts, N, K);
+  moe_pack_scales_kernel<<<(unsigned)((ns + 255) / 256), 256, 0, s>>>(scales, pscales,
+                                                                     n_experts, N, K);
 }
 
 // ---------------------------------------------------------------------------
@@ -656,11 +749,13 @@ static int moe_mfma_grid(int max_items) {
 }
 
 // The MFMA kernel needs K a multiple of 64 and at most 4 * MOE_SREGS * 128
-// (the scale registers), at most MOE_MAX_E experts, and one expert's weight
-// bytes below 2^31 (offsets from 2^31 up serve as "past the end").
+// (the scale registers), at most MOE_MAX_E experts, and one expert's packed
+// weight bytes below 2^31 (offsets from 2^31 up serve as "past the end").
+// The fast entry points take the packed weights (moe_pack_mxfp4) exactly
+// when this holds, and the checkpoint layout otherwise (simple version).
 static bool moe_mfma_ok(int n_experts, int N, int K) {
   return K % 64 == 0 && K <= 4 * MOE_SREGS * MOE_KS && n_experts <= MOE_MAX_E &&
-         (long long)N * K / 2 < 0x80000000ll;
+         moe_packed_blocks_bytes(N, K) < 0x80000000ull;
 }
 
 static void gemm_grouped_mxfp4_launch(hipStream_t s, const bf16_t *A,
@@ -680,7 +775,8 @@ static void gemm_grouped_mxfp4_launch(hipStream_t s, const bf16_t *A,
 // Rows offsets[e] .. offsets[e+1] of A times expert e's MXFP4 weight, plus its
 // bias, into the same rows of C. offsets: device array of n_experts+1 ints.
 // A (R, K) bf16 row-major; C (R, N) fp32; bias (n_experts, N) fp32.
-// max_rows bounds any expert's row count.
+// max_rows bounds any expert's row count. blocks / scales: packed by
+// moe_pack_mxfp4 when moe_mfma_ok(n_experts, N, K), else the checkpoint layout.
 static void gemm_grouped_mxfp4(hipStream_t s, const bf16_t *A,
                                const int *offsets, int max_rows, int n_experts,
                                const uint8_t *blocks, const uint8_t *scales,
@@ -698,7 +794,7 @@ static void gemm_grouped_mxfp4(hipStream_t s, const bf16_t *A,
 // then gpt-oss's SwiGLU on each (gate, up) column pair, written as bf16 to
 // G (R, N/2) — what gemm_grouped_mxfp4 followed by swiglu_bf16_kernel
 // produce, bit for bit, without writing and re-reading the fp32 (R, N) C.
-// Needs moe_mfma_ok(n_experts, N, K) and N even.
+// Needs moe_mfma_ok(n_experts, N, K), N even and packed weights.
 static void gemm_grouped_mxfp4_swiglu(hipStream_t s, const bf16_t *A,
                                       const int *offsets, int max_rows,
                                       int n_experts, const uint8_t *blocks,
@@ -712,7 +808,8 @@ static void gemm_grouped_mxfp4_swiglu(hipStream_t s, const bf16_t *A,
 // SwiGLU in one kernel. X (B, K) bf16 holds one row per token; row r of the
 // grouped order is token row_pair[r] / topk (moe_group_kernel's row_pair).
 // Equal, bit for bit, to gather_bf16_kernel + gemm_grouped_mxfp4 +
-// swiglu_bf16_kernel. Needs moe_mfma_ok(n_experts, N, K) and N even.
+// swiglu_bf16_kernel. Needs moe_mfma_ok(n_experts, N, K), N even and packed
+// weights.
 static void gemm_grouped_mxfp4_gather_swiglu(hipStream_t s, const bf16_t *X,
                                              const int *row_pair, int topk,
                                              const int *offsets, int max_rows,

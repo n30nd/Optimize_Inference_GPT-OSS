@@ -53,7 +53,8 @@
 struct GpuLayer {
   const uint16_t *w_qkv, *w_o, *w_router;
   const float *b_qkv, *b_o, *b_router, *sinks, *rms_attn, *rms_ffn;
-  // this GCD's experts only: e_count of them, starting at e_begin
+  // this GCD's experts only: e_count of them, starting at e_begin; on the
+  // fast path packed by moe_pack_mxfp4 when moe_mfma_ok
   const uint8_t *mlp1_blocks, *mlp1_scales, *mlp2_blocks, *mlp2_scales;
   const float *b_mlp1, *b_mlp2;
   float *kc, *vc;      // exact path KV cache (batch, slots, kv_dim)
@@ -126,7 +127,6 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
   const size_t H = c.hidden_dim, E = c.n_experts, I = c.intermediate_dim;
   const size_t QKV = (size_t)c.head_dim * (c.n_attn_heads + 2 * c.n_kv_heads);
   const size_t e0 = w->e_begin, ne = w->e_count;
-  const size_t g1 = 2 * I * (H / 32), g2 = H * (I / 32); // scale groups per expert
   auto &own = w->weight_allocs;
   auto raw = [&](const std::string &name) -> const StTensor & {
     auto it = g_hf.st.tensors.find(name);
@@ -146,6 +146,36 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
   auto f32 = [&](const float *src, size_t n) {
     return (const float *)gpu_upload<float>(own, src, n);
   };
+  // Expert weights: the fast path's matrix-core kernel reads them repacked
+  // (moe_pack_mxfp4); the checkpoint bytes pass through a staging buffer.
+  uint8_t *stage = nullptr;
+  size_t stage_bytes = 0;
+  auto experts = [&](const std::string &name, int N, int K, const uint8_t *&blocks,
+                     const uint8_t *&scales) {
+    const size_t gr = (size_t)N * (K / 32); // scale groups per expert
+    if (w->exact || !moe_mfma_ok((int)ne, N, K)) {
+      blocks = bytes(name + ".blocks", e0 * gr * 16, ne * gr * 16);
+      scales = bytes(name + ".scales", e0 * gr, ne * gr);
+      return;
+    }
+    if (ne * gr * 17 > stage_bytes) {
+      if (stage)
+        HIP_CHECK(hipFree(stage));
+      stage_bytes = ne * gr * 17;
+      HIP_CHECK(hipMalloc(&stage, stage_bytes));
+    }
+    HIP_CHECK(hipMemcpy(stage, raw(name + ".blocks").data + e0 * gr * 16, ne * gr * 16,
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(stage + ne * gr * 16, raw(name + ".scales").data + e0 * gr, ne * gr,
+                        hipMemcpyHostToDevice));
+    uint8_t *pb = gpu_alloc<uint8_t>(own, ne * moe_packed_blocks_bytes(N, K));
+    uint8_t *ps = gpu_alloc<uint8_t>(own, ne * moe_packed_scales_bytes(N, K));
+    moe_pack_mxfp4(0, stage, stage + ne * gr * 16, (int)ne, N, K, pb, ps);
+    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipDeviceSynchronize());
+    blocks = pb;
+    scales = ps;
+  };
 
   w->emb = bf16("embedding.weight");
   w->unemb = bf16("unembedding.weight");
@@ -163,13 +193,13 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
     g.rms_ffn = f32(tw.rms_ffn_w + l * H, H);
     g.w_router = bf16(b + "mlp.gate.weight");
     g.b_router = f32(tw.b_router + l * E, E);
-    g.mlp1_blocks = bytes(b + "mlp.mlp1_weight.blocks", e0 * g1 * 16, ne * g1 * 16);
-    g.mlp1_scales = bytes(b + "mlp.mlp1_weight.scales", e0 * g1, ne * g1);
+    experts(b + "mlp.mlp1_weight", (int)(2 * I), (int)H, g.mlp1_blocks, g.mlp1_scales);
     g.b_mlp1 = f32(tw.b_mlp1 + (l * E + e0) * 2 * I, ne * 2 * I);
-    g.mlp2_blocks = bytes(b + "mlp.mlp2_weight.blocks", e0 * g2 * 16, ne * g2 * 16);
-    g.mlp2_scales = bytes(b + "mlp.mlp2_weight.scales", e0 * g2, ne * g2);
+    experts(b + "mlp.mlp2_weight", (int)H, (int)I, g.mlp2_blocks, g.mlp2_scales);
     g.b_mlp2 = f32(tw.b_mlp2 + (l * E + e0) * H, ne * H);
   }
+  if (stage)
+    HIP_CHECK(hipFree(stage));
 }
 
 static size_t gpu_state_bytes(const GpuWorker *w, int batch, int max_pos) {
