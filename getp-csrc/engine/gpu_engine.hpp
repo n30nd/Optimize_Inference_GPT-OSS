@@ -79,7 +79,7 @@ struct GpuWorker {
   float *cos_tab = nullptr, *sin_tab = nullptr; // (max_pos, head_dim / 2)
   int *tokens = nullptr, *next = nullptr;
   float *x, *t, *qkv, *att, *proj, *router, *topk_w, *Xg, *Yg, *Gg, *Zg, *logits;
-  int *topk_e, *offsets, *row_pair, *own_row, *peer_row;
+  int *topk_e, *counts, *offsets, *row_pair, *own_row, *peer_row;
   bf16_t *t16, *att16, *Xg16, *Gg16; // fast path matrix-multiply inputs
   std::vector<void *> weight_allocs, state_allocs;
 };
@@ -192,7 +192,7 @@ static size_t gpu_state_bytes(const GpuWorker *w, int batch, int max_pos) {
                  + R * (H + c.intermediate_dim) * act      // Xg Gg
                  + B * (size_t)c.vocab_size * 4            // logits
                  + 2 * (size_t)max_pos * c.head_dim / 2 * 4; // cos, sin
-  return bytes + (B * K * 3 + R) * sizeof(int);
+  return bytes + (B * K * 3 + R + w->e_count) * sizeof(int);
 }
 
 static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
@@ -229,6 +229,7 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
   w->router = gpu_alloc<float>(own, B * c.n_experts);
   w->topk_w = gpu_alloc<float>(own, B * K);
   w->topk_e = gpu_alloc<int>(own, B * K);
+  w->counts = gpu_alloc<int>(own, w->e_count);
   w->offsets = gpu_alloc<int>(own, w->e_count + 1);
   w->row_pair = gpu_alloc<int>(own, R);
   w->own_row = gpu_alloc<int>(own, B * K);
@@ -386,9 +387,11 @@ static void layer_experts(GpuWorker *w, int l, int B, int B_peer) {
   GpuLayer &g = w->layers[l];
   hipStream_t s = w->stream;
   GpuWorker *p = w->peer;
-  moe_group_ep_kernel<<<1, std::max(64, ((w->e_count + 63) / 64) * 64), 0, s>>>(
+  moe_count_ep_kernel<<<w->e_count, MOE_GROUP_THREADS, 0, s>>>(
+      w->topk_e, B * K, p ? p->topk_e : nullptr, B_peer * K, w->e_begin, w->counts);
+  moe_place_ep_kernel<<<w->e_count, MOE_GROUP_THREADS, 0, s>>>(
       w->topk_e, B * K, p ? p->topk_e : nullptr, B_peer * K, w->e_begin, w->e_count,
-      w->offsets, w->row_pair, w->own_row, w->peer_row);
+      w->counts, w->offsets, w->row_pair, w->own_row, w->peer_row);
   if (w->exact) {
     moe_gather_ep_kernel<float><<<R, 256, 0, s>>>(w->t, p ? p->t : nullptr, w->row_pair,
                                                   w->offsets, w->e_count, K, w->Xg, H);

@@ -15,60 +15,99 @@
 #include "fast_common.hpp"
 #include "moe.hpp"
 
-// Groups the rows for experts e_begin .. e_begin+e_count-1: own pairs first,
+// Grouping the rows for experts e_begin .. e_begin+e_count-1: own pairs first,
 // then the partner's, each in pair order. offsets (e_count + 1) are local.
 // own_row[p] / peer_row[p]: row of that pair in this GCD's grouped buffers,
-// or -1 if another GCD owns the expert. One block of at least e_count threads.
-__global__ void moe_group_ep_kernel(const int *__restrict__ topk_own, int n_own,
-                                    const int *__restrict__ topk_peer, int n_peer,
-                                    int e_begin, int e_count,
-                                    int *__restrict__ offsets,
-                                    int *__restrict__ row_pair,
-                                    int *__restrict__ own_row,
-                                    int *__restrict__ peer_row) {
-  __shared__ int start[1025];
-  const int e = threadIdx.x;
-  const int ge = e_begin + e;
-  if (e < e_count) {
-    int count = 0;
-    for (int p = 0; p < n_own; p++)
-      count += topk_own[p] == ge;
-    for (int p = 0; p < n_peer; p++)
-      count += topk_peer[p] == ge;
-    start[e + 1] = count;
+// or -1 if another GCD owns the expert. Two kernels, one 256-thread block per
+// local expert: moe_count_ep_kernel, then moe_place_ep_kernel.
+
+#define MOE_GROUP_THREADS 256
+
+// counts[e] = number of own and partner pairs that chose local expert e.
+__global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_count_ep_kernel(
+    const int *__restrict__ topk_own, int n_own, const int *__restrict__ topk_peer,
+    int n_peer, int e_begin, int *__restrict__ counts) {
+  __shared__ int part[MOE_GROUP_THREADS / 64];
+  const int ge = e_begin + blockIdx.x;
+  int c = 0;
+  for (int p = threadIdx.x; p < n_own; p += MOE_GROUP_THREADS)
+    c += topk_own[p] == ge;
+  for (int p = threadIdx.x; p < n_peer; p += MOE_GROUP_THREADS)
+    c += topk_peer[p] == ge;
+  for (int off = 32; off > 0; off >>= 1)
+    c += __shfl_down(c, off);
+  if (threadIdx.x % 64 == 0)
+    part[threadIdx.x / 64] = c;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int total = 0;
+    for (int w = 0; w < MOE_GROUP_THREADS / 64; w++)
+      total += part[w];
+    counts[blockIdx.x] = total;
   }
-  for (int p = threadIdx.x; p < n_own; p += blockDim.x) {
+}
+
+// Writes the rows of the pairs in topk[0..n) that chose expert `ge`, in pair
+// order, from row *base on (partner pairs are stored in row_pair as -(p + 1)).
+__device__ inline void moe_place_pairs(const int *__restrict__ topk, int n, int ge,
+                                       bool partner, int *__restrict__ row_pair,
+                                       int *__restrict__ rows, int *base) {
+  __shared__ int wave_count[MOE_GROUP_THREADS / 64];
+  const int lane = threadIdx.x % 64, wave = threadIdx.x / 64;
+  for (int c0 = 0; c0 < n; c0 += MOE_GROUP_THREADS) {
+    const int p = c0 + threadIdx.x;
+    const bool hit = p < n && topk[p] == ge;
+    const unsigned long long mask = __ballot(hit);
+    if (lane == 0)
+      wave_count[wave] = __popcll(mask);
+    __syncthreads();
+    int before = *base;
+    for (int w = 0; w < wave; w++)
+      before += wave_count[w];
+    if (hit) {
+      const int row = before + __popcll(mask & ((1ull << lane) - 1));
+      row_pair[row] = partner ? -(p + 1) : p;
+      rows[p] = row;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+      for (int w = 0; w < MOE_GROUP_THREADS / 64; w++)
+        *base += wave_count[w];
+    __syncthreads();
+  }
+}
+
+// Local expert blockIdx.x starts after the rows of all lower experts. Each
+// block also marks its share of the pairs whose expert another GCD holds.
+__global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_place_ep_kernel(
+    const int *__restrict__ topk_own, int n_own, const int *__restrict__ topk_peer,
+    int n_peer, int e_begin, int e_count, const int *__restrict__ counts,
+    int *__restrict__ offsets, int *__restrict__ row_pair, int *__restrict__ own_row,
+    int *__restrict__ peer_row) {
+  __shared__ int base;
+  const int e = blockIdx.x, ge = e_begin + e;
+  if (threadIdx.x == 0) {
+    int start = 0;
+    for (int i = 0; i < e; i++)
+      start += counts[i];
+    base = start;
+    offsets[e] = start;
+    if (e == e_count - 1)
+      offsets[e_count] = start + counts[e];
+  }
+  for (int p = e * MOE_GROUP_THREADS + threadIdx.x; p < n_own; p += e_count * MOE_GROUP_THREADS) {
     const int x = topk_own[p] - e_begin;
     if (x < 0 || x >= e_count)
       own_row[p] = -1;
   }
-  for (int p = threadIdx.x; p < n_peer; p += blockDim.x) {
+  for (int p = e * MOE_GROUP_THREADS + threadIdx.x; p < n_peer; p += e_count * MOE_GROUP_THREADS) {
     const int x = topk_peer[p] - e_begin;
     if (x < 0 || x >= e_count)
       peer_row[p] = -1;
   }
   __syncthreads();
-  if (e == 0) {
-    start[0] = 0;
-    for (int i = 1; i <= e_count; i++)
-      start[i] += start[i - 1];
-    for (int i = 0; i <= e_count; i++)
-      offsets[i] = start[i];
-  }
-  __syncthreads();
-  if (e < e_count) {
-    int row = start[e];
-    for (int p = 0; p < n_own; p++)
-      if (topk_own[p] == ge) {
-        row_pair[row] = p;
-        own_row[p] = row++;
-      }
-    for (int p = 0; p < n_peer; p++)
-      if (topk_peer[p] == ge) {
-        row_pair[row] = -(p + 1);
-        peer_row[p] = row++;
-      }
-  }
+  moe_place_pairs(topk_own, n_own, ge, false, row_pair, own_row, &base);
+  moe_place_pairs(topk_peer, n_peer, ge, true, row_pair, peer_row, &base);
 }
 
 // Xg[row, :] = the normed activations of the row's token, from this GCD's
