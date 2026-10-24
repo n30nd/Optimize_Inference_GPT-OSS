@@ -4,6 +4,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include "fast_attention.hpp"
 #include "fast_common.hpp"
 #include "misc.hpp"
 
@@ -30,7 +31,8 @@ __global__ void rmsnorm_bf16_kernel(const float *__restrict__ x,
 }
 
 // RoPE on the query and key heads of each fp32 qkv row, then the rotated key
-// and the value are stored as bf16 in the cache at `slot`.
+// and the value are stored as bf16 in the cache at `slot`, in the chunk64
+// layout of fast_attention.hpp (slots a multiple of 64, head_dim 64).
 __global__ void rope_kv_bf16_kernel(float *__restrict__ qkv, int row_stride,
                                     const float *__restrict__ cosv,
                                     const float *__restrict__ sinv,
@@ -44,7 +46,6 @@ __global__ void rope_kv_bf16_kernel(float *__restrict__ qkv, int row_stride,
   float *row = qkv + (size_t)b * row_stride;
   float *k = row + n_q_heads * head_dim;
   const float *v = k + kv_dim;
-  const size_t dst = ((size_t)b * slots + slot) * kv_dim;
   for (int idx = threadIdx.x; idx < (n_q_heads + n_kv_heads) * half; idx += blockDim.x) {
     const int h = idx / half, i = idx % half;
     float *xh = row + h * head_dim;
@@ -55,12 +56,12 @@ __global__ void rope_kv_bf16_kernel(float *__restrict__ qkv, int row_stride,
     xh[half + i] = o2;
     if (h >= n_q_heads) {
       const int kh = h - n_q_heads;
-      kc[dst + kh * head_dim + i] = f32_to_bf16(o1);
-      kc[dst + kh * head_dim + half + i] = f32_to_bf16(o2);
+      kc[kv_index_chunk64(b, slot, kh, i, slots, kv_dim)] = f32_to_bf16(o1);
+      kc[kv_index_chunk64(b, slot, kh, half + i, slots, kv_dim)] = f32_to_bf16(o2);
     }
   }
   for (int i = threadIdx.x; i < kv_dim; i += blockDim.x)
-    vc[dst + i] = f32_to_bf16(v[i]);
+    vc[kv_index_chunk64(b, slot, i / head_dim, i % head_dim, slots, kv_dim)] = f32_to_bf16(v[i]);
 }
 
 // SwiGLU of gpt-oss on rows of mlp1 output (gate/up interleaved) into bf16.

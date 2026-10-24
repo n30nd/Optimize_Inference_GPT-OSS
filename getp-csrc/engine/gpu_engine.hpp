@@ -57,8 +57,9 @@ struct GpuLayer {
   const uint8_t *mlp1_blocks, *mlp1_scales, *mlp2_blocks, *mlp2_scales;
   const float *b_mlp1, *b_mlp2;
   float *kc, *vc;      // exact path KV cache (batch, slots, kv_dim)
-  bf16_t *kc16, *vc16; // fast path KV cache, same layout
-  int slots;           // positions kept: max_pos, or the sliding window
+  bf16_t *kc16, *vc16; // fast path KV cache, chunk64 layout (fast_attention.hpp)
+  int slots;           // positions kept: max_pos or the sliding window (fast path:
+                       // rounded up to a multiple of 64)
   int window;          // 0 for full attention
 };
 
@@ -178,10 +179,11 @@ static size_t gpu_state_bytes(const GpuWorker *w, int batch, int max_pos) {
   const size_t ATT = (size_t)c.head_dim * c.n_attn_heads;
   const size_t KVD = (size_t)c.head_dim * c.n_kv_heads;
   size_t kv_positions = 0;
-  for (int l = 0; l < c.n_layers; l++)
-    kv_positions += (c.sliding_window > 0 && l % 2 == 0)
-                        ? std::min(c.sliding_window, max_pos)
-                        : max_pos;
+  for (int l = 0; l < c.n_layers; l++) {
+    int slots = (c.sliding_window > 0 && l % 2 == 0) ? std::min(c.sliding_window, max_pos)
+                                                      : max_pos;
+    kv_positions += w->exact ? slots : (slots + 63) / 64 * 64;
+  }
   const size_t act = w->exact ? 4 : 2; // bytes per KV / matrix-input element
   size_t bytes = 2 * B * kv_positions * KVD * act          // KV cache
                  + B * (H + QKV + H + c.n_experts + K) * 4 // x qkv proj router topk_w
@@ -207,6 +209,8 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
     GpuLayer &g = w->layers[l];
     g.window = (c.sliding_window > 0 && l % 2 == 0) ? c.sliding_window : 0;
     g.slots = g.window > 0 ? std::min(g.window, max_pos) : max_pos;
+    if (!w->exact)
+      g.slots = (g.slots + 63) / 64 * 64;
     g.kc = g.vc = nullptr;
     g.kc16 = g.vc16 = nullptr;
     if (w->exact) {
@@ -346,8 +350,9 @@ static void layer_attention(GpuWorker *w, int l, int B, int pos) {
     gemm_bf16(s, w->t16, B, g.w_qkv, g.b_qkv, w->qkv, QKV, H);
     rope_kv_bf16_kernel<<<B, 256, 0, s>>>(w->qkv, QKV, cosv, sinv, c.n_attn_heads,
                                           c.n_kv_heads, D, g.kc16, g.vc16, g.slots, kv_slot);
-    attention_bf16(s, w->qkv, QKV, g.kc16, g.vc16, g.slots, KVD, c.n_attn_heads,
-                   c.n_attn_heads / c.n_kv_heads, g.sinks, w->att16, ATT, B, pos, g.window);
+    attention_bf16_chunk64(s, w->qkv, QKV, g.kc16, g.vc16, g.slots, KVD, c.n_attn_heads,
+                           c.n_attn_heads / c.n_kv_heads, g.sinks, w->att16, ATT, B, pos,
+                           g.window);
     gemm_bf16(s, w->att16, B, g.w_o, g.b_o, w->proj, H, ATT);
   }
   add_inplace_kernel<<<((size_t)B * H + 255) / 256, 256, 0, s>>>(w->x, w->proj, (size_t)B * H);

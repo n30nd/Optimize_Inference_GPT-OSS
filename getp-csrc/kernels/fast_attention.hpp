@@ -414,17 +414,15 @@ static void attention_bf16(hipStream_t s, const float *qkv, int row_stride,
       window);
 }
 
-// ---- Proposed cache layout, not used by the engine yet (docs/09) ----------
+// ---- The cache layout of the fast path (docs/09) -------------------------
 // "chunk64": each sequence's cache is cut into chunks of 64 slots, and inside
 // a chunk every key/value head keeps its 64 slots together (8 KB):
 //   element (b, slot, g, i) at  b * slots64 * kv_dim + (slot / 64) * 64 * kv_dim
 //                               + g * 64 * 64 + (slot % 64) * 64 + i
 // slots64 = slots rounded up to a multiple of 64. A workgroup then reads whole
 // 8 KB blocks instead of 128 bytes out of every 1 KB row; attn_bench measures
-// 1,100-1,170 GB/s against ~870 for the current layout. To adopt it, the cache
-// writer (rope_kv_bf16_kernel) stores head kh of slot `slot` at
-// kv_index_chunk64(b, slot, kh, 0, slots64, kv_dim) and the engine calls
-// attention_bf16_chunk64 with slots = slots64.
+// 1,100-1,170 GB/s against ~870 for the row-major layout that attention_bf16
+// reads. rope_kv_bf16_kernel writes this layout.
 __host__ __device__ inline size_t kv_index_chunk64(int b, int slot, int g, int i, int slots64,
                                                    int kv_dim) {
   return ((size_t)b * slots64 + (size_t)(slot & ~63)) * kv_dim + (size_t)g * 64 * 64 +
