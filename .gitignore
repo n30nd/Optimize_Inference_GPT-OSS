@@ -30,3 +30,6 @@ build/
 # Binaries
 *.safetensors
 *.bin
+
+# Benchmark results written by tools/bench.py
+results/
