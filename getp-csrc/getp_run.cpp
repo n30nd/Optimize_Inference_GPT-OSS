@@ -5,23 +5,23 @@
 #define GETP_RUN
 
 #include "engine/cli_modes.hpp"
+#include "engine/gpu_engine.hpp"
+
+// getp runs on the GPUs when the weights come from a Hugging Face folder;
+// GPTOSS_CPU=1 keeps it on the CPU reference path instead.
+static bool use_gpu() {
+  const char *cpu = getenv("GPTOSS_CPU");
+  return g_hf.loaded && !(cpu && *cpu && strcmp(cpu, "0") != 0);
+}
 
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
-  // Do not inference here
-  // You should handle the warm-up process
-  // TODO:
-  // - Memory allocation
-  // - Load model
-  // - ...
+  if (use_gpu())
+    gpu_warm_up(transformer);
 }
 
 void finish(Transformer *transformer, Tokenizer *tokenizer) {
-  // Do not inference here
-  // You should handle the finish process
-  // TODO:
-  // - Memory deallocation
-  // - Unload model
-  // - ...
+  if (!g_workers.empty())
+    gpu_finish();
 }
 
 long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
@@ -110,6 +110,8 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
 
 long long inference(Transformer *transformer, Tokenizer *tokenizer,
                     Sampler *sampler, Requests *requests) {
+  if (!g_workers.empty())
+    return gpu_inference(tokenizer, requests);
   long long num_token_out = 0;
   for (int idx = 0; idx < requests->num_reqs; ++idx) {
     const char *input_seq = get_str_req_ptr(requests, idx);
