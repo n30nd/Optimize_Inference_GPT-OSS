@@ -39,7 +39,7 @@ int main(int argc, char **argv) {
     prompts.push_back(buf);
   }
 
-  GpuWorker *w = gpu_create_worker(0, &base, n, steps);
+  GpuWorker *w = gpu_create_worker(0, &base, true, n, steps);
   std::vector<Transformer> cpu(n, base);
   for (auto &t : cpu)
     malloc_run_state(&t.state, &t.config);

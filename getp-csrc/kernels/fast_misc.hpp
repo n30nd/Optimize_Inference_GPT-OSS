@@ -1,0 +1,103 @@
+// Fast-path elementwise and per-row kernels: fp32 math, bf16 where the result
+// feeds a matrix multiply or the KV cache.
+#pragma once
+
+#include <hip/hip_runtime.h>
+
+#include "fast_common.hpp"
+#include "misc.hpp"
+
+// RMSNorm of fp32 rows into bf16 rows. One block (256 threads) per row.
+__global__ void rmsnorm_bf16_kernel(const float *__restrict__ x,
+                                    const float *__restrict__ weight,
+                                    bf16_t *__restrict__ out, int H) {
+  __shared__ float part[256];
+  const int b = blockIdx.x;
+  const float *xr = x + (size_t)b * H;
+  float ss = 0.0f;
+  for (int j = threadIdx.x; j < H; j += blockDim.x)
+    ss = fmaf(xr[j], xr[j], ss);
+  part[threadIdx.x] = ss;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s)
+      part[threadIdx.x] += part[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(part[0] / H + 1e-5f);
+  for (int j = threadIdx.x; j < H; j += blockDim.x)
+    out[(size_t)b * H + j] = f32_to_bf16(weight[j] * (inv * xr[j]));
+}
+
+// RoPE on the query and key heads of each fp32 qkv row, then the rotated key
+// and the value are stored as bf16 in the cache at `slot`.
+__global__ void rope_kv_bf16_kernel(float *__restrict__ qkv, int row_stride,
+                                    const float *__restrict__ cosv,
+                                    const float *__restrict__ sinv,
+                                    int n_q_heads, int n_kv_heads, int head_dim,
+                                    bf16_t *__restrict__ kc,
+                                    bf16_t *__restrict__ vc, int slots,
+                                    int slot) {
+  const int b = blockIdx.x;
+  const int half = head_dim / 2;
+  const int kv_dim = n_kv_heads * head_dim;
+  float *row = qkv + (size_t)b * row_stride;
+  float *k = row + n_q_heads * head_dim;
+  const float *v = k + kv_dim;
+  const size_t dst = ((size_t)b * slots + slot) * kv_dim;
+  for (int idx = threadIdx.x; idx < (n_q_heads + n_kv_heads) * half; idx += blockDim.x) {
+    const int h = idx / half, i = idx % half;
+    float *xh = row + h * head_dim;
+    const float x1 = xh[i], x2 = xh[half + i];
+    const float c = cosv[i], s = sinv[i];
+    const float o1 = x1 * c - x2 * s, o2 = x2 * c + x1 * s;
+    xh[i] = o1;
+    xh[half + i] = o2;
+    if (h >= n_q_heads) {
+      const int kh = h - n_q_heads;
+      kc[dst + kh * head_dim + i] = f32_to_bf16(o1);
+      kc[dst + kh * head_dim + half + i] = f32_to_bf16(o2);
+    }
+  }
+  for (int i = threadIdx.x; i < kv_dim; i += blockDim.x)
+    vc[dst + i] = f32_to_bf16(v[i]);
+}
+
+// SwiGLU of gpt-oss on rows of mlp1 output (gate/up interleaved) into bf16.
+__global__ void swiglu_bf16_kernel(const float *__restrict__ Y,
+                                   bf16_t *__restrict__ G, size_t R, int I,
+                                   float limit) {
+  const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= R * I)
+    return;
+  const size_t r = idx / I, j = idx % I;
+  float val = fminf(Y[r * 2 * I + 2 * j], limit);
+  float up = fminf(fmaxf(Y[r * 2 * I + 2 * j + 1], -limit), limit);
+  val = val / (1.0f + __expf(-1.702f * val));
+  G[idx] = f32_to_bf16(val * (up + 1.0f));
+}
+
+// Xg[row, :] = t[row_pair[row] / k, :] for bf16 rows.
+__global__ void gather_bf16_kernel(const bf16_t *__restrict__ t,
+                                   const int *__restrict__ row_pair, int k,
+                                   bf16_t *__restrict__ Xg, int H) {
+  const int row = blockIdx.x;
+  const bf16_t *src = t + (size_t)(row_pair[row] / k) * H;
+  for (int i = threadIdx.x; i < H; i += blockDim.x)
+    Xg[(size_t)row * H + i] = src[i];
+}
+
+// x[b, :] += sum_j topk_w[b, j] * Z[pair_row[b, j], :].
+__global__ void moe_combine_kernel(float *__restrict__ x,
+                                   const float *__restrict__ Z,
+                                   const int *__restrict__ pair_row,
+                                   const float *__restrict__ topk_w, int k,
+                                   int H) {
+  const int b = blockIdx.x;
+  for (int i = threadIdx.x; i < H; i += blockDim.x) {
+    float acc = 0.0f;
+    for (int j = 0; j < k; j++)
+      acc = fmaf(Z[(size_t)pair_row[b * k + j] * H + i], topk_w[b * k + j], acc);
+    x[(size_t)b * H + i] += acc;
+  }
+}
