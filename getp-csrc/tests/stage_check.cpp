@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
   const int D = c.head_dim, ATT = D * c.n_attn_heads, KVD = D * c.n_kv_heads;
   const int QKV = ATT + 2 * KVD, V = c.vocab_size;
   HIP_CHECK(hipSetDevice(0));
-  GpuWorker *gw = gpu_create_worker(0, &t, 1, 64);
+  GpuWorker *gw = gpu_create_worker(0, &t, true, 1, 64);
   const GpuLayer &g = gw->layers[0];
   int bad = 0;
 

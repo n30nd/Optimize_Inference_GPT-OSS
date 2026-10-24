@@ -4,9 +4,13 @@
 // batching); finished requests stay in the batch until the wave ends.
 //
 // Weights: bf16 for the dense matrices, MXFP4 for the experts, fp32 for norms,
-// biases and sinks, exactly as stored in the checkpoint. Activations and the
-// KV cache are fp32. All kernels are the *_exact versions, so a GPU step
-// reproduces hf_cpu_forward() bit for bit (tests/gpu_vs_cpu.cpp).
+// biases and sinks, exactly as stored in the checkpoint.
+//
+// Two paths:
+// - exact (GPTOSS_EXACT=1): fp32 activations and KV cache, *_exact kernels; a
+//   step reproduces hf_cpu_forward() bit for bit (tests/gpu_vs_cpu.cpp).
+// - fast (default): bf16 inputs to every matrix multiply and a bf16 KV cache,
+//   fp32 residual stream and accumulation (kernels/fast_*.hpp).
 #pragma once
 
 #include <stdlib.h>
@@ -17,6 +21,10 @@
 #include <vector>
 
 #include "../kernels/attention.hpp"
+#include "../kernels/fast_attention.hpp"
+#include "../kernels/fast_gemm.hpp"
+#include "../kernels/fast_moe_gemm.hpp"
+#include "../kernels/fast_misc.hpp"
 #include "../kernels/gemm.hpp"
 #include "../kernels/misc.hpp"
 #include "../kernels/moe.hpp"
@@ -40,13 +48,15 @@ struct GpuLayer {
   const float *b_qkv, *b_o, *b_router, *sinks, *rms_attn, *rms_ffn;
   const uint8_t *mlp1_blocks, *mlp1_scales, *mlp2_blocks, *mlp2_scales;
   const float *b_mlp1, *b_mlp2;
-  float *kc, *vc; // KV cache (batch, slots, kv_dim)
-  int slots;      // positions kept: max_pos, or the sliding window
+  float *kc, *vc;     // exact path KV cache (batch, slots, kv_dim)
+  bf16_t *kc16, *vc16; // fast path KV cache, same layout
+  int slots;          // positions kept: max_pos, or the sliding window
   int window;     // 0 for full attention
 };
 
 struct GpuWorker {
   int device = 0;
+  bool exact = false;
   hipStream_t stream;
   Config cfg;
   int batch = 0;   // requests per wave
@@ -58,6 +68,7 @@ struct GpuWorker {
   int *tokens = nullptr, *next = nullptr;
   float *x, *t, *qkv, *att, *proj, *router, *topk_w, *Xg, *Yg, *Gg, *Zg, *logits;
   int *topk_e, *offsets, *row_pair, *pair_row;
+  bf16_t *t16, *att16, *Xg16, *Gg16; // fast path matrix-multiply inputs
   std::vector<void *> weight_allocs, state_allocs;
 };
 
@@ -136,7 +147,7 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
   }
 }
 
-static size_t gpu_state_bytes(const Config &c, int batch, int max_pos) {
+static size_t gpu_state_bytes(const Config &c, bool exact, int batch, int max_pos) {
   const size_t B = batch, H = c.hidden_dim, K = c.experts_per_token;
   const size_t QKV = (size_t)c.head_dim * (c.n_attn_heads + 2 * c.n_kv_heads);
   const size_t ATT = (size_t)c.head_dim * c.n_attn_heads;
@@ -146,12 +157,15 @@ static size_t gpu_state_bytes(const Config &c, int batch, int max_pos) {
     kv_positions += (c.sliding_window > 0 && l % 2 == 0)
                         ? std::min(c.sliding_window, max_pos)
                         : max_pos;
-  size_t floats = 2 * B * kv_positions * KVD                  // KV cache
-                  + B * (2 * H + QKV + ATT + H + c.n_experts) // x t qkv att proj router
-                  + B * K * (1 + H + 2 * c.intermediate_dim + c.intermediate_dim + H)
-                  + B * (size_t)c.vocab_size                  // logits
-                  + 2 * (size_t)max_pos * c.head_dim / 2;     // cos, sin
-  return floats * sizeof(float) + B * K * 3 * sizeof(int);
+  const size_t act = exact ? 4 : 2; // bytes per KV / matrix-input element
+  size_t bytes = 2 * B * kv_positions * KVD * act                       // KV cache
+                 + B * (H + QKV + H + c.n_experts) * 4                  // x qkv proj router
+                 + B * (H + ATT) * act                                  // t att
+                 + B * K * (1 + 2 * c.intermediate_dim + H) * 4         // topk_w Yg Zg
+                 + B * K * (H + c.intermediate_dim) * act               // Xg Gg
+                 + B * (size_t)c.vocab_size * 4                         // logits
+                 + 2 * (size_t)max_pos * c.head_dim / 2 * 4;            // cos, sin
+  return bytes + B * K * 3 * sizeof(int);
 }
 
 static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
@@ -167,15 +181,20 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
     GpuLayer &g = w->layers[l];
     g.window = (c.sliding_window > 0 && l % 2 == 0) ? c.sliding_window : 0;
     g.slots = g.window > 0 ? std::min(g.window, max_pos) : max_pos;
-    g.kc = gpu_alloc<float>(own, B * g.slots * KVD);
-    g.vc = gpu_alloc<float>(own, B * g.slots * KVD);
+    g.kc = g.vc = nullptr;
+    g.kc16 = g.vc16 = nullptr;
+    if (w->exact) {
+      g.kc = gpu_alloc<float>(own, B * g.slots * KVD);
+      g.vc = gpu_alloc<float>(own, B * g.slots * KVD);
+    } else {
+      g.kc16 = gpu_alloc<bf16_t>(own, B * g.slots * KVD);
+      g.vc16 = gpu_alloc<bf16_t>(own, B * g.slots * KVD);
+    }
   }
   w->tokens = gpu_alloc<int>(own, B);
   w->next = gpu_alloc<int>(own, B);
   w->x = gpu_alloc<float>(own, B * H);
-  w->t = gpu_alloc<float>(own, B * H);
   w->qkv = gpu_alloc<float>(own, B * QKV);
-  w->att = gpu_alloc<float>(own, B * ATT);
   w->proj = gpu_alloc<float>(own, B * H);
   w->router = gpu_alloc<float>(own, B * c.n_experts);
   w->topk_w = gpu_alloc<float>(own, B * K);
@@ -183,10 +202,21 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
   w->offsets = gpu_alloc<int>(own, c.n_experts + 1);
   w->row_pair = gpu_alloc<int>(own, B * K);
   w->pair_row = gpu_alloc<int>(own, B * K);
-  w->Xg = gpu_alloc<float>(own, B * K * H);
   w->Yg = gpu_alloc<float>(own, B * K * 2 * c.intermediate_dim);
-  w->Gg = gpu_alloc<float>(own, B * K * c.intermediate_dim);
   w->Zg = gpu_alloc<float>(own, B * K * H);
+  w->t = w->att = w->Xg = w->Gg = nullptr;
+  w->t16 = w->att16 = w->Xg16 = w->Gg16 = nullptr;
+  if (w->exact) {
+    w->t = gpu_alloc<float>(own, B * H);
+    w->att = gpu_alloc<float>(own, B * ATT);
+    w->Xg = gpu_alloc<float>(own, B * K * H);
+    w->Gg = gpu_alloc<float>(own, B * K * c.intermediate_dim);
+  } else {
+    w->t16 = gpu_alloc<bf16_t>(own, B * H);
+    w->att16 = gpu_alloc<bf16_t>(own, B * ATT);
+    w->Xg16 = gpu_alloc<bf16_t>(own, B * K * H);
+    w->Gg16 = gpu_alloc<bf16_t>(own, B * K * c.intermediate_dim);
+  }
   w->logits = gpu_alloc<float>(own, B * c.vocab_size);
 
   // RoPE angles from run.cpp's own compute_cos_sin(), one row per position.
@@ -206,26 +236,25 @@ static void gpu_free_state(GpuWorker *w) {
   w->state_allocs.clear();
 }
 
-static GpuWorker *gpu_create_worker(int device, const Transformer *t, int batch,
-                                    int max_pos) {
+static GpuWorker *gpu_create_worker(int device, const Transformer *t, bool exact,
+                                    int batch, int max_pos) {
   HIP_CHECK(hipSetDevice(device));
   GpuWorker *w = new GpuWorker();
   w->device = device;
+  w->exact = exact;
   w->cfg = t->config;
   HIP_CHECK(hipStreamCreate(&w->stream));
   gpu_upload_weights(w, t);
   size_t free_b = 0, total_b = 0;
   HIP_CHECK(hipMemGetInfo(&free_b, &total_b));
   const size_t reserve = (size_t)1 << 30;
-  while (batch > 1 && gpu_state_bytes(w->cfg, batch, max_pos) + reserve > free_b)
+  while (batch > 1 && gpu_state_bytes(w->cfg, exact, batch, max_pos) + reserve > free_b)
     batch /= 2;
   gpu_alloc_state(w, batch, max_pos);
   return w;
 }
 
-// One decode step for rows 0..B-1 at position `pos`: tokens in w->tokens,
-// greedy next tokens to w->next. Logits stay in w->logits.
-static void gpu_step(GpuWorker *w, int B, int pos) {
+static void gpu_step_exact(GpuWorker *w, int B, int pos) {
   const Config &c = w->cfg;
   const int H = c.hidden_dim, E = c.n_experts, K = c.experts_per_token;
   const int I = c.intermediate_dim, D = c.head_dim, V = c.vocab_size;
@@ -270,6 +299,58 @@ static void gpu_step(GpuWorker *w, int B, int pos) {
   rmsnorm_exact<<<B, 256, H * sizeof(float), s>>>(w->x, w->rms_out, w->t, H);
   gemm_bf16_exact(s, w->t, B, w->unemb, nullptr, w->logits, V, H);
   argmax_kernel<<<B, 256, 0, s>>>(w->logits, V, w->next);
+}
+
+static void gpu_step_fast(GpuWorker *w, int B, int pos) {
+  const Config &c = w->cfg;
+  const int H = c.hidden_dim, E = c.n_experts, K = c.experts_per_token;
+  const int I = c.intermediate_dim, D = c.head_dim, V = c.vocab_size;
+  const int ATT = D * c.n_attn_heads, KVD = D * c.n_kv_heads;
+  const int QKV = ATT + 2 * KVD;
+  const int half = D / 2;
+  const int R = B * K;
+  hipStream_t s = w->stream;
+
+  embed_kernel<<<B, 256, 0, s>>>(w->emb, w->tokens, w->x, H);
+  for (int l = 0; l < c.n_layers; l++) {
+    GpuLayer &g = w->layers[l];
+    rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, g.rms_attn, w->t16, H);
+    gemm_bf16(s, w->t16, B, g.w_qkv, g.b_qkv, w->qkv, QKV, H);
+    const int slot = g.window > 0 ? pos % g.window : pos;
+    rope_kv_bf16_kernel<<<B, 256, 0, s>>>(w->qkv, QKV, w->cos_tab + (size_t)pos * half,
+                                          w->sin_tab + (size_t)pos * half, c.n_attn_heads,
+                                          c.n_kv_heads, D, g.kc16, g.vc16, g.slots, slot);
+    attention_bf16(s, w->qkv, QKV, g.kc16, g.vc16, g.slots, KVD, c.n_attn_heads,
+                   c.n_attn_heads / c.n_kv_heads, g.sinks, w->att16, ATT, B, pos, g.window);
+    gemm_bf16(s, w->att16, B, g.w_o, g.b_o, w->proj, H, ATT);
+    add_inplace_kernel<<<((size_t)B * H + 255) / 256, 256, 0, s>>>(w->x, w->proj, (size_t)B * H);
+
+    rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, g.rms_ffn, w->t16, H);
+    gemm_bf16(s, w->t16, B, g.w_router, g.b_router, w->router, E, H);
+    router_topk_exact<<<(B + 63) / 64, 64, 0, s>>>(w->router, E, K, w->topk_w, w->topk_e, B);
+    moe_group_kernel<<<1, ((E + 63) / 64) * 64, 0, s>>>(w->topk_e, R, E, w->offsets,
+                                                       w->row_pair, w->pair_row);
+    gather_bf16_kernel<<<R, 256, 0, s>>>(w->t16, w->row_pair, K, w->Xg16, H);
+    gemm_grouped_mxfp4(s, w->Xg16, w->offsets, B, E, g.mlp1_blocks, g.mlp1_scales,
+                       g.b_mlp1, w->Yg, 2 * I, H);
+    swiglu_bf16_kernel<<<((size_t)R * I + 255) / 256, 256, 0, s>>>(w->Yg, w->Gg16, R, I,
+                                                                   c.swiglu_limit);
+    gemm_grouped_mxfp4(s, w->Gg16, w->offsets, B, E, g.mlp2_blocks, g.mlp2_scales,
+                       g.b_mlp2, w->Zg, H, I);
+    moe_combine_kernel<<<B, 256, 0, s>>>(w->x, w->Zg, w->pair_row, w->topk_w, K, H);
+  }
+  rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, w->rms_out, w->t16, H);
+  gemm_bf16(s, w->t16, B, w->unemb, nullptr, w->logits, V, H);
+  argmax_kernel<<<B, 256, 0, s>>>(w->logits, V, w->next);
+}
+
+// One decode step for rows 0..B-1 at position `pos`: tokens in w->tokens,
+// greedy next tokens to w->next. Logits stay in w->logits.
+static void gpu_step(GpuWorker *w, int B, int pos) {
+  if (w->exact)
+    gpu_step_exact(w, B, pos);
+  else
+    gpu_step_fast(w, B, pos);
   HIP_CHECK(hipGetLastError());
 }
 
@@ -341,17 +422,18 @@ static long long gpu_run_wave(GpuWorker *w, Tokenizer *tok, Requests *req,
 static void gpu_warm_up(const Transformer *t) {
   int n_dev = 0;
   HIP_CHECK(hipGetDeviceCount(&n_dev));
+  const bool exact = env_int("GPTOSS_EXACT", 0) != 0;
   const int batch = env_int("GPTOSS_BATCH", GPU_DEFAULT_BATCH);
   const int max_pos = std::min(env_int("GPTOSS_MAX_POS", GPU_DEFAULT_MAX_POS),
                                t->config.seq_len);
   g_workers.assign(n_dev, nullptr);
   std::vector<std::thread> threads;
   for (int d = 0; d < n_dev; d++)
-    threads.emplace_back([&, d] { g_workers[d] = gpu_create_worker(d, t, batch, max_pos); });
+    threads.emplace_back([&, d] { g_workers[d] = gpu_create_worker(d, t, exact, batch, max_pos); });
   for (auto &th : threads)
     th.join();
-  printf("getp: %d GPU(s), %d requests per GPU per wave, KV cache for %d positions\n",
-         n_dev, g_workers[0]->batch, max_pos);
+  printf("getp: %s path, %d GPU(s), %d requests per GPU per wave, KV cache for %d positions\n",
+         exact ? "exact" : "fast", n_dev, g_workers[0]->batch, max_pos);
   fflush(stdout);
 }
 
