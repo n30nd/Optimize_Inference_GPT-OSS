@@ -51,6 +51,65 @@ __global__ void router_topk_exact(const float *__restrict__ logits, int E,
   }
 }
 
+// Same result as router_topk_exact, bit for bit, with one 64-lane wave per
+// row: lane l holds experts l, l + 64, ... (E <= 256); k rounds of a wave
+// arg-max (ties: lower expert), then lane 0 does the same softmax.
+#define TOPK_WAVES 4
+__global__ __launch_bounds__(64 * TOPK_WAVES) void router_topk_wave_kernel(
+    const float *__restrict__ logits, int E, int k, float *__restrict__ topk_w,
+    int *__restrict__ topk_e, int B) {
+  const int lane = threadIdx.x % 64;
+  const int b = blockIdx.x * TOPK_WAVES + threadIdx.x / 64;
+  if (b >= B)
+    return;
+  const float *r = logits + (size_t)b * E;
+  float v[4];
+  for (int j = 0; j < 4; j++)
+    v[j] = lane + 64 * j < E ? r[lane + 64 * j] : 0.0f;
+  unsigned taken = 0;
+  int chosen[MOE_MAX_TOPK];
+  float val[MOE_MAX_TOPK];
+  for (int round = 0; round < k; round++) {
+    float bv = 0.0f;
+    int be = 0x7fffffff;
+    for (int j = 0; j < 4; j++) {
+      const int e = lane + 64 * j;
+      if (e < E && !(taken & (1u << j)) && (be == 0x7fffffff || v[j] > bv)) {
+        bv = v[j];
+        be = e;
+      }
+    }
+    for (int off = 32; off > 0; off >>= 1) {
+      const float ov = __shfl_xor(bv, off);
+      const int oe = __shfl_xor(be, off);
+      if (oe != 0x7fffffff &&
+          (be == 0x7fffffff || ov > bv || (ov == bv && oe < be))) {
+        bv = ov;
+        be = oe;
+      }
+    }
+    if (be % 64 == lane)
+      taken |= 1u << (be / 64);
+    chosen[round] = be;
+    val[round] = bv;
+  }
+  if (lane != 0)
+    return;
+  double max_val = val[0];
+  for (int j = 1; j < k; j++)
+    if (val[j] > max_val)
+      max_val = val[j];
+  double sum = 0.0;
+  for (int j = 0; j < k; j++) {
+    val[j] = expf_cpu((float)__dsub_rn((double)val[j], max_val));
+    sum = __dadd_rn(sum, (double)val[j]);
+  }
+  for (int j = 0; j < k; j++) {
+    topk_w[(size_t)b * k + j] = (float)__ddiv_rn((double)val[j], sum);
+    topk_e[(size_t)b * k + j] = chosen[j];
+  }
+}
+
 // Groups the n_pairs (token, choice) pairs by expert, in pair order within an
 // expert: rows offsets[e] .. offsets[e+1] belong to expert e, row_pair[row]
 // is the pair index (token * k + choice), pair_row is its inverse.

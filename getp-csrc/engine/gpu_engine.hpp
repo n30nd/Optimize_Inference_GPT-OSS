@@ -374,7 +374,11 @@ static void layer_route(GpuWorker *w, int l, int B) {
     rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, g.rms_ffn, w->t16, H);
     gemm_bf16(s, w->t16, B, g.w_router, g.b_router, w->router, E, H);
   }
-  router_topk_exact<<<(B + 63) / 64, 64, 0, s>>>(w->router, E, K, w->topk_w, w->topk_e, B);
+  if (E <= 256)
+    router_topk_wave_kernel<<<(B + TOPK_WAVES - 1) / TOPK_WAVES, 64 * TOPK_WAVES, 0, s>>>(
+        w->router, E, K, w->topk_w, w->topk_e, B);
+  else
+    router_topk_exact<<<(B + 63) / 64, 64, 0, s>>>(w->router, E, K, w->topk_w, w->topk_e, B);
 }
 
 // This GCD's experts on every row (own and partner's) that chose them -> Zg.
