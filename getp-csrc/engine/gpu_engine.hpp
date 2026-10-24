@@ -401,12 +401,28 @@ static void layer_experts(GpuWorker *w, int l, int B, int B_peer) {
     gemm_grouped_mxfp4_exact(s, w->Gg, w->offsets, B + B_peer, w->e_count, g.mlp2_blocks,
                              g.mlp2_scales, g.b_mlp2, w->Zg, H, I);
   } else {
-    moe_gather_ep_kernel<bf16_t><<<R, 256, 0, s>>>(w->t16, p ? p->t16 : nullptr, w->row_pair,
-                                                   w->offsets, w->e_count, K, w->Xg16, H);
-    gemm_grouped_mxfp4(s, w->Xg16, w->offsets, B + B_peer, w->e_count, g.mlp1_blocks,
-                       g.mlp1_scales, g.b_mlp1, w->Yg, 2 * I, H);
-    swiglu_bf16_kernel<<<((size_t)R * I + 255) / 256, 256, 0, s>>>(w->Yg, w->Gg16, R, I,
-                                                                   c.swiglu_limit);
+    // mlp1 and SwiGLU in one kernel when it applies (same bits as the three
+    // separate steps); without a partner it also gathers the rows itself.
+    const bool fused = moe_mfma_ok(w->e_count, 2 * I, H);
+    if (fused && !p) {
+      gemm_grouped_mxfp4_gather_swiglu(s, w->t16, w->row_pair, K, w->offsets, B,
+                                       w->e_count, g.mlp1_blocks, g.mlp1_scales,
+                                       g.b_mlp1, w->Gg16, c.swiglu_limit, 2 * I, H);
+    } else {
+      moe_gather_ep_kernel<bf16_t><<<R, 256, 0, s>>>(w->t16, p ? p->t16 : nullptr,
+                                                     w->row_pair, w->offsets, w->e_count, K,
+                                                     w->Xg16, H);
+      if (fused) {
+        gemm_grouped_mxfp4_swiglu(s, w->Xg16, w->offsets, B + B_peer, w->e_count,
+                                  g.mlp1_blocks, g.mlp1_scales, g.b_mlp1, w->Gg16,
+                                  c.swiglu_limit, 2 * I, H);
+      } else {
+        gemm_grouped_mxfp4(s, w->Xg16, w->offsets, B + B_peer, w->e_count, g.mlp1_blocks,
+                           g.mlp1_scales, g.b_mlp1, w->Yg, 2 * I, H);
+        swiglu_bf16_kernel<<<((size_t)R * I + 255) / 256, 256, 0, s>>>(w->Yg, w->Gg16, R, I,
+                                                                       c.swiglu_limit);
+      }
+    }
     gemm_grouped_mxfp4(s, w->Gg16, w->offsets, B + B_peer, w->e_count, g.mlp2_blocks,
                        g.mlp2_scales, g.b_mlp2, w->Zg, H, I);
   }

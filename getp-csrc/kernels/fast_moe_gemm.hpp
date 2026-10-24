@@ -694,7 +694,7 @@ static void gemm_grouped_mxfp4(hipStream_t s, const bf16_t *A,
                             blocks, scales, bias, C, nullptr, 0.0f, N, K);
 }
 
-// Optional fusion for mlp1 (not used by the engine yet): the same multiply,
+// Fusion for mlp1: the same multiply,
 // then gpt-oss's SwiGLU on each (gate, up) column pair, written as bf16 to
 // G (R, N/2) — what gemm_grouped_mxfp4 followed by swiglu_bf16_kernel
 // produce, bit for bit, without writing and re-reading the fp32 (R, N) C.
@@ -708,7 +708,7 @@ static void gemm_grouped_mxfp4_swiglu(hipStream_t s, const bf16_t *A,
                             blocks, scales, bias, nullptr, G, limit, N, K);
 }
 
-// Optional fusion for mlp1 (not used by the engine yet): gather, multiply and
+// Fusion for mlp1 without a partner GCD: gather, multiply and
 // SwiGLU in one kernel. X (B, K) bf16 holds one row per token; row r of the
 // grouped order is token row_pair[r] / topk (moe_group_kernel's row_pair).
 // Equal, bit for bit, to gather_bf16_kernel + gemm_grouped_mxfp4 +
