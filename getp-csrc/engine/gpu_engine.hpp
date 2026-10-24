@@ -81,6 +81,7 @@ struct GpuWorker {
   float *x, *t, *qkv, *att, *proj, *router, *topk_w, *Xg, *Yg, *Gg, *Zg, *logits;
   int *topk_e, *counts, *offsets, *row_pair, *own_row, *peer_row;
   bf16_t *t16, *att16, *Xg16, *Gg16; // fast path matrix-multiply inputs
+  float *S = nullptr; // fast path, split experts: partial sums for the partner's tokens
   std::vector<void *> weight_allocs, state_allocs;
 };
 
@@ -192,6 +193,8 @@ static size_t gpu_state_bytes(const GpuWorker *w, int batch, int max_pos) {
                  + R * (H + c.intermediate_dim) * act      // Xg Gg
                  + B * (size_t)c.vocab_size * 4            // logits
                  + 2 * (size_t)max_pos * c.head_dim / 2 * 4; // cos, sin
+  if (!w->exact && w->e_count < c.n_experts)
+    bytes += B * H * 4; // S
   return bytes + (B * K * 3 + R + w->e_count) * sizeof(int);
 }
 
@@ -250,6 +253,8 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
     w->Gg16 = gpu_alloc<bf16_t>(own, R * c.intermediate_dim);
   }
   w->logits = gpu_alloc<float>(own, B * c.vocab_size);
+  if (!w->exact && w->e_count < c.n_experts)
+    w->S = gpu_alloc<float>(own, B * H);
 
   // RoPE angles from run.cpp's own compute_cos_sin(), one row per position.
   const int half = c.head_dim / 2;
@@ -429,6 +434,9 @@ static void layer_experts(GpuWorker *w, int l, int B, int B_peer) {
     }
     gemm_grouped_mxfp4(s, w->Gg16, w->offsets, B + B_peer, w->e_count, g.mlp2_blocks,
                        g.mlp2_scales, g.b_mlp2, w->Zg, H, I);
+    if (p && B_peer > 0)
+      moe_partial_ep_kernel<<<B_peer, 256, 0, s>>>(w->S, w->Zg, w->peer_row, p->topk_w,
+                                                   p->topk_e, w->e_begin, w->e_count, K, H);
   }
 }
 
@@ -443,6 +451,10 @@ static void layer_combine(GpuWorker *w, int l, int B) {
   if (w->exact)
     moe_combine_ep_kernel<true><<<B, 256, 0, w->stream>>>(
         w->x, w->Zg, w->own_row, Zp, rows_p, w->topk_w, w->topk_e, w->e_begin, w->e_count,
+        c.experts_per_token, c.hidden_dim);
+  else if (p)
+    moe_combine_partial_kernel<<<B, 256, 0, w->stream>>>(
+        w->x, w->Zg, w->own_row, p->S, w->topk_w, w->topk_e, w->e_begin, w->e_count,
         c.experts_per_token, c.hidden_dim);
   else
     moe_combine_ep_kernel<false><<<B, 256, 0, w->stream>>>(

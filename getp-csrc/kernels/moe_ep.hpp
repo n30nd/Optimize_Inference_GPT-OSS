@@ -178,3 +178,81 @@ __global__ void moe_combine_ep_kernel(float *__restrict__ x,
     }
   }
 }
+
+// Fast path with a partner: for each of the partner's tokens, the weighted
+// sum of the expert outputs this GCD computed for it (its choices of this
+// GCD's experts, in choice order), so the partner reads one row per token
+// instead of each expert row. S (B_peer, H) fp32; H a multiple of 4.
+__global__ void moe_partial_ep_kernel(float *__restrict__ S,
+                                      const float *__restrict__ Z_own,
+                                      const int *__restrict__ peer_row,
+                                      const float *__restrict__ topk_w_peer,
+                                      const int *__restrict__ topk_e_peer,
+                                      int e_begin, int e_count, int k, int H) {
+  const int b = blockIdx.x;
+  const float4 *rows[MOE_MAX_TOPK];
+  float wgt[MOE_MAX_TOPK];
+  int n = 0;
+  for (int j = 0; j < k; j++) {
+    const int p = b * k + j;
+    const int e = topk_e_peer[p] - e_begin;
+    if (e >= 0 && e < e_count) {
+      rows[n] = (const float4 *)(Z_own + (size_t)peer_row[p] * H);
+      wgt[n++] = topk_w_peer[p];
+    }
+  }
+  float4 *out = (float4 *)(S + (size_t)b * H);
+  for (int i = threadIdx.x; i < H / 4; i += blockDim.x) {
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int j = 0; j < n; j++) {
+      const float4 z = rows[j][i];
+      acc.x = fmaf(z.x, wgt[j], acc.x);
+      acc.y = fmaf(z.y, wgt[j], acc.y);
+      acc.z = fmaf(z.z, wgt[j], acc.z);
+      acc.w = fmaf(z.w, wgt[j], acc.w);
+    }
+    out[i] = acc;
+  }
+}
+
+// Fast path with a partner: x[b, :] += the weighted sum of b's outputs from
+// this GCD's experts (choice order) + the partner's partial sum S_peer[b, :].
+__global__ void moe_combine_partial_kernel(float *__restrict__ x,
+                                           const float *__restrict__ Z_own,
+                                           const int *__restrict__ own_row,
+                                           const float *__restrict__ S_peer,
+                                           const float *__restrict__ topk_w,
+                                           const int *__restrict__ topk_e,
+                                           int e_begin, int e_count, int k, int H) {
+  const int b = blockIdx.x;
+  const float4 *rows[MOE_MAX_TOPK];
+  float wgt[MOE_MAX_TOPK];
+  int n = 0;
+  for (int j = 0; j < k; j++) {
+    const int p = b * k + j;
+    const int e = topk_e[p] - e_begin;
+    if (e >= 0 && e < e_count) {
+      rows[n] = (const float4 *)(Z_own + (size_t)own_row[p] * H);
+      wgt[n++] = topk_w[p];
+    }
+  }
+  float4 *xr = (float4 *)(x + (size_t)b * H);
+  const float4 *sp = (const float4 *)(S_peer + (size_t)b * H);
+  for (int i = threadIdx.x; i < H / 4; i += blockDim.x) {
+    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int j = 0; j < n; j++) {
+      const float4 z = rows[j][i];
+      acc.x = fmaf(z.x, wgt[j], acc.x);
+      acc.y = fmaf(z.y, wgt[j], acc.y);
+      acc.z = fmaf(z.z, wgt[j], acc.z);
+      acc.w = fmaf(z.w, wgt[j], acc.w);
+    }
+    const float4 s = sp[i];
+    float4 v = xr[i];
+    v.x += acc.x + s.x;
+    v.y += acc.y + s.y;
+    v.z += acc.z + s.z;
+    v.w += acc.w + s.w;
+    xr[i] = v;
+  }
+}
