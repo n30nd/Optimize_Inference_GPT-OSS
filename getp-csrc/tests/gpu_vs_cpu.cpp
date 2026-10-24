@@ -1,12 +1,16 @@
-// Runs the first n prompts of a getp input file on one GPU (gpu_step) and on
+// Runs the first n prompts of a getp input file on the GPU exact path and on
 // the CPU (hf_cpu_forward), feeding both the same tokens, and compares the
 // logits of every sequence at every step bit for bit.
+//
+// EP=2 splits the experts between GPUs 0 and 1 (as getp does for 120b) and the
+// prompts between them; otherwise GPU 0 holds the whole model.
+// LAYERS=L runs only the first L layers on both sides, to find where they part.
 //
 // Build from the repo root:
 //   hipcc --std=c++17 -O3 -fopenmp -march=native --offload-arch=gfx90a \
 //     getp-csrc/tests/gpu_vs_cpu.cpp tokenizer.cpp -o gpu_vs_cpu
 // Run (needs tokenizer.bin in the current folder):
-//   tools/gpulock.sh <hip id> -- ./gpu_vs_cpu <model folder> [n=4] [steps=32] [input=evaluation/input.txt]
+//   tools/gpulock.sh <hip id(s)> -- ./gpu_vs_cpu <model folder> [n=4] [steps=32] [input=evaluation/input.txt]
 #define TESTING
 #include "../../run.cpp"
 
@@ -20,6 +24,7 @@ int main(int argc, char **argv) {
   const int n = argc > 2 ? atoi(argv[2]) : 4;
   const int steps = argc > 3 ? atoi(argv[3]) : 32;
   const char *input = argc > 4 ? argv[4] : "evaluation/input.txt";
+  const int ep = env_int("EP", 1);
 
   Transformer base;
   hf_build_transformer(&base, argv[1]);
@@ -39,15 +44,26 @@ int main(int argc, char **argv) {
     prompts.push_back(buf);
   }
 
-  GpuWorker *w = gpu_create_worker(0, &base, true, n, steps);
+  // member i serves sequences first[i] .. first[i] + count[i] - 1
+  GpuGroup g;
+  std::vector<int> first(ep), count(ep);
+  for (int i = 0; i < ep; i++) {
+    count[i] = n / ep + (i < n % ep ? 1 : 0);
+    first[i] = i == 0 ? 0 : first[i - 1] + count[i - 1];
+    GpuWorker *w = gpu_new_worker(i, &base, true, i * (c.n_experts / ep), c.n_experts / ep);
+    gpu_alloc_state(w, std::max(count[i], 1), steps);
+    g.m.push_back(w);
+  }
+  if (ep == 2)
+    gpu_pair(g.m[0], g.m[1]);
   std::vector<Transformer> cpu(n, base);
   for (auto &t : cpu)
     malloc_run_state(&t.state, &t.config);
-  // LAYERS=L runs only the first L layers on both sides, to find where they part.
   if (getenv("LAYERS")) {
-    w->cfg.n_layers = atoi(getenv("LAYERS"));
+    for (GpuWorker *w : g.m)
+      w->cfg.n_layers = atoi(getenv("LAYERS"));
     for (auto &t : cpu)
-      t.config.n_layers = w->cfg.n_layers;
+      t.config.n_layers = atoi(getenv("LAYERS"));
   }
 
   std::vector<int> cur(n), next(n);
@@ -56,11 +72,20 @@ int main(int argc, char **argv) {
   std::vector<float> gpu_logits((size_t)n * c.vocab_size);
   long long total_diff = 0;
   for (int pos = 0; pos < steps; pos++) {
-    HIP_CHECK(hipMemcpy(w->tokens, cur.data(), n * sizeof(int), hipMemcpyHostToDevice));
-    gpu_step(w, n, pos);
-    HIP_CHECK(hipMemcpy(gpu_logits.data(), w->logits, gpu_logits.size() * sizeof(float),
-                        hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(next.data(), w->next, n * sizeof(int), hipMemcpyDeviceToHost));
+    for (int i = 0; i < ep; i++) {
+      HIP_CHECK(hipSetDevice(g.m[i]->device));
+      HIP_CHECK(hipMemcpy(g.m[i]->tokens, &cur[first[i]], count[i] * sizeof(int),
+                          hipMemcpyHostToDevice));
+    }
+    gpu_step_group(g, count.data(), pos);
+    for (int i = 0; i < ep; i++) {
+      HIP_CHECK(hipSetDevice(g.m[i]->device));
+      HIP_CHECK(hipMemcpy(&gpu_logits[(size_t)first[i] * c.vocab_size], g.m[i]->logits,
+                          (size_t)count[i] * c.vocab_size * sizeof(float),
+                          hipMemcpyDeviceToHost));
+      HIP_CHECK(hipMemcpy(&next[first[i]], g.m[i]->next, count[i] * sizeof(int),
+                          hipMemcpyDeviceToHost));
+    }
     int step_diff = 0, argmax_diff = 0;
     float max_abs = 0.0f;
     for (int b = 0; b < n; b++) {
@@ -72,46 +97,6 @@ int main(int argc, char **argv) {
           max_abs = fmaxf(max_abs, fabsf(cl[i] - gl[i]));
         }
       argmax_diff += sample_argmax((float *)cl, c.vocab_size) != next[b];
-      if (getenv("LAYERS")) { // attention output of the last layer run
-        const int ATT = c.head_dim * c.n_attn_heads;
-        std::vector<float> ga(ATT);
-        HIP_CHECK(hipMemcpy(ga.data(), w->att + (size_t)b * ATT, ATT * 4, hipMemcpyDeviceToHost));
-        int ad = 0;
-        for (int i = 0; i < ATT; i++)
-          ad += memcmp(&ga[i], &cpu[b].state.tb[i], 4) != 0;
-        printf("  seq %d: attention output differing %d / %d\n", b, ad, ATT);
-        { // o-proj (CPU recomputed from its own attention output) and ffn norm
-          const int H = c.hidden_dim, Kk = c.experts_per_token;
-          const int L = w->cfg.n_layers - 1;
-          std::vector<float> proj(H), gp(H), gt(H);
-          matmul(proj.data(), cpu[b].state.tb, cpu[b].weights.w_o + (size_t)L * H * ATT, ATT, H);
-          for (int i = 0; i < H; i++)
-            proj[i] += cpu[b].weights.b_o[(size_t)L * H + i];
-          HIP_CHECK(hipMemcpy(gp.data(), w->proj + (size_t)b * H, H * 4, hipMemcpyDeviceToHost));
-          int pair_row0;
-          HIP_CHECK(hipMemcpy(&pair_row0, w->pair_row + (size_t)b * Kk, 4, hipMemcpyDeviceToHost));
-          HIP_CHECK(hipMemcpy(gt.data(), w->Xg + (size_t)pair_row0 * H, H * 4, hipMemcpyDeviceToHost));
-          int pd = 0, td = 0;
-          for (int i = 0; i < H; i++) {
-            pd += memcmp(&proj[i], &gp[i], 4) != 0;
-            td += memcmp(&cpu[b].state.t[i], &gt[i], 4) != 0;
-          }
-          printf("  o-proj differing %d / %d, ffn-norm output differing %d / %d\n", pd, H, td, H);
-        }
-        const int E = c.n_experts, K = c.experts_per_token;
-        std::vector<float> gr(E), gw(K);
-        std::vector<int> ge(K);
-        HIP_CHECK(hipMemcpy(gr.data(), w->router + (size_t)b * E, E * 4, hipMemcpyDeviceToHost));
-        HIP_CHECK(hipMemcpy(gw.data(), w->topk_w + (size_t)b * K, K * 4, hipMemcpyDeviceToHost));
-        HIP_CHECK(hipMemcpy(ge.data(), w->topk_e + (size_t)b * K, K * 4, hipMemcpyDeviceToHost));
-        int rd = 0;
-        for (int i = 0; i < E; i++)
-          rd += memcmp(&gr[i], &cpu[b].state.router_score[i], 4) != 0;
-        printf("  router scores differing %d / %d; experts cpu/gpu:", rd, E);
-        for (int j = 0; j < K; j++)
-          printf(" %d:%.9g/%d:%.9g", cpu[b].state.topk_i[j], cpu[b].state.topk_v[j], ge[j], gw[j]);
-        printf("\n");
-      }
     }
     printf("pos %3d: logits differing %d / %d, max |diff| %g, argmax differing %d\n",
            pos, step_diff, n * c.vocab_size, max_abs, argmax_diff);
