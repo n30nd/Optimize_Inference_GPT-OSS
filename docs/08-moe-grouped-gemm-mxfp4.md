@@ -1,0 +1,370 @@
+# 08 — The expert matrix multiply on the matrix cores, straight from 4-bit weights
+
+## The problem in plain words
+
+Every layer of gpt-oss sends each token to 4 of its experts (doc 06). After the tokens are sorted
+by expert, each expert multiplies "its" rows of numbers by its own big table of weights. With the
+first, simple version of this multiply, it was the single largest cost of a decode step (one step
+makes one new token for every request): **68 %** of the step at first, and 96 % once the other big
+multiplies were made fast.
+
+Three things made the simple version slow:
+
+1. It did the arithmetic one number at a time on the ordinary calculators, not on the matrix
+   cores, which are about 8 times faster at exactly this job.
+2. The weights are stored in a 4-bit format (MXFP4). The matrix cores cannot read that format, so
+   the weights must be unpacked on the way, and unpacking costs time too.
+3. The experts get very different numbers of rows: in real steps of gpt-oss-20b with 512 tokens, the
+   busiest expert got up to 473 of the 512 tokens and 10 % of the experts got none.
+
+The new kernel feeds the matrix cores straight from the 4-bit weights and shares the work fairly
+among the GPU's compute units. It is **15× faster than the simple version** and 1.5–3.3× faster
+than calling the vendor's matrix library once per expert (with 4× larger 16-bit weights).
+
+## An everyday comparison
+
+A print shop with very fast presses (the matrix cores). The paper arrives vacuum-packed to save
+truck space (the 4-bit weights). The old shop had no presses: clerks copied every page by hand. The
+new shop unpacks each bundle right next to the press, just before it is needed. Orders are uneven:
+one customer wants 400 copies, another none. Each press takes the next job from one shared queue
+the moment it is free, and the biggest orders are handed out first so no press is left with a big
+job at the end.
+
+It turned out the presses were not the limit at first: the **corridor to the warehouse** was. Each
+press sent a runner for every small bundle, and the corridor lets only so many runners through per
+second. The big win came from sending fewer runners with bigger loads.
+
+## The words
+
+- **kernel** — a small program that runs on the GPU.
+- **thread / wavefront / block** — a thread is one calculator's job; the GPU runs threads in groups
+  of 64 that move in lockstep (a *wavefront*); a *block* is a few wavefronts that run on the same
+  compute unit and can share fast memory. Here a block is 8 wavefronts (512 threads).
+- **CU (compute unit)** — a group of calculators with its own fast scratch memory; one GCD (one of
+  the two halves of an MI250 card, seen by the software as one GPU) has 104. Each CU has 4 **SIMDs**,
+  the actual calculator rows; each SIMD takes turns among the wavefronts that live on it.
+- **register** — the tiny, fastest storage inside each thread (4 bytes each). A SIMD has 512 of them
+  for each of its 64 thread positions; if 4 wavefronts share a SIMD, each thread may use at most 128.
+- **spill** — when a kernel needs more registers than it may use, the compiler parks some values in
+  slow memory and fetches them back; inside a hot loop that is very costly.
+- **LDS (local data share)** — 64 KB of fast scratch memory per CU, shared by a block.
+- **HBM (high-bandwidth memory)** — the GPU's main memory: big (64 GB) but far away (about a
+  microsecond per trip).
+- **L2 cache** — an 8 MB store between the compute units and HBM that keeps recently read data. It is
+  split into 16 channels; each channel answers about one request per clock tick, and a request
+  brings one 64-byte piece (a **cache line**).
+- **MFMA (matrix fused multiply-add)** — one matrix-core instruction. The one we use,
+  `v_mfma_f32_16x16x16bf16_1k`, multiplies a 16×16 block of numbers by another 16×16 block and adds
+  the 16×16 result into 32-bit totals, in 32 clock ticks.
+- **bf16 (brain float 16)** — a 16-bit number format: the same range as a normal 32-bit float but
+  fewer digits. The matrix cores take bf16 inputs.
+- **MXFP4** — the 4-bit weight format of the checkpoint (explained below).
+- **GEMM (general matrix multiply)** — the "rows times table of weights" operation; a **grouped
+  GEMM** does many independent ones (one per expert) in one kernel.
+- **TFLOP/s** — trillions of arithmetic operations per second (a multiply and an add count as 2).
+- **prefetch** — asking memory for data a while before it is needed, so it has arrived by then.
+- **barrier** — a point where every wavefront of a block waits until all of them have arrived.
+- **atomic add** — an add to a memory word that the hardware does for one thread at a time, so many
+  threads can each take a unique ticket from one counter.
+
+## How it works
+
+### 1. The MXFP4 format
+
+Each weight row is cut into groups of 32 numbers. Every group stores 32 four-bit codes (16
+bytes, two codes per byte, **low half of the byte first**) and one shared scale byte `s`.
+
+```
+ one group of 32 weights = 16 bytes of codes + 1 scale byte
+ byte j:  [ code 2j+1 | code 2j ]          code = sign | 2 exponent bits | 1 mantissa bit
+            high 4 bits  low 4 bits
+
+ code (low 3 bits) : 0    1    2    3    4    5    6    7
+ magnitude         : 0   0.5   1   1.5   2    3    4    6        (bit 3 = minus sign)
+
+ weight = magnitude[code] × 2^(s − 127)
+```
+
+A weight costs 4.25 bits instead of 16 in bf16: **3.8× fewer bytes** to read. Every MXFP4 value
+times its scale is exactly a bf16 number (it has at most 2 significant bits), so unpacking loses
+nothing.
+
+For our shapes, one expert's mlp1 weight (5,760 rows × 2,880) is 8.3 MB of codes + 0.5 MB of scales;
+mlp2 (2,880 × 2,880) is half that.
+
+### 2. Unpacking 4 codes with one instruction
+
+A bf16 number is two bytes. For one group we build two small tables of 8 bytes each in registers:
+the high byte and the low byte of `magnitude[i] × 2^(s−127)` for i = 0..7. The instruction
+`v_perm_b32` picks 4 bytes out of an 8-byte table by 4 small indices at once, which is exactly a
+4-entry table lookup:
+
+```
+ 4 codes ──mask──► 4 indices (0..7) ──v_perm_b32──► 4 high bytes ──OR sign bit──┐
+                                    └─v_perm_b32──► 4 low bytes ────────────────┴─v_perm_b32 ×2──► 4 bf16
+```
+
+About 14 instructions per 8 weights, all on registers (`fp4_tables`, `fp4x8_to_bf16`). The tables
+are built once per group of 32 weights (9 instructions).
+
+### 3. Feeding the matrix core
+
+One MFMA multiplies a 16 (rows of A) × 16 (k) block by a 16 (k) × 16 (columns) block. Each of the 64
+threads of the wavefront supplies 4 numbers of each:
+
+```
+ thread l supplies:  A[row = l % 16][4 k values]     W[column = l % 16][the same 4 k values]
+ threads  0–15 → their 4 k come from "slot 0",  16–31 → slot 1,  32–47 → slot 2,  48–63 → slot 3
+```
+
+The sum over k does not care in which order the k values arrive, as long as A and W use the same
+order. We use that freedom so that each thread reads **16 contiguous weight bytes** (one whole group
+of 32 codes) per step of 128 k:
+
+```
+ a column's 128 k of one step = 64 bytes of codes:
+   bytes  0–15 → threads 0–15 (k 0–31)     bytes 16–31 → threads 16–31 (k 32–63)
+   bytes 32–47 → threads 32–47 (k 64–95)   bytes 48–63 → threads 48–63 (k 96–127)
+ each thread's 32 k feed 8 MFMAs, 4 k each; the decoder gives "even k first, then odd k",
+ and A is placed in LDS in exactly that order
+```
+
+### 4. One work item: 64 rows × 256 columns
+
+```
+                 columns n0 … n0+255  (weights, unpacked in registers by each wavefront)
+               ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐
+ rows m0 …     │ wf 0 │ wf 1 │ wf 2 │ wf 3 │ wf 4 │ wf 5 │ wf 6 │ wf 7 │   each wavefront (wf):
+ m0+63         │32 col│      │      │      │      │      │      │      │   64 rows × 32 columns
+ (A, in LDS,   │      │      │      │      │      │      │      │      │   = 4 × 2 MFMA tiles
+  shared)      └──────┴──────┴──────┴──────┴──────┴──────┴──────┴──────┘
+```
+
+K (2,880) is walked in 23 steps of 128. One step, for one wavefront:
+
+```
+ time ───────────────────────────────────────────────────────────────────────────►
+ issue loads: A of step p+1 (→ registers), weights of step p+2 (→ registers)
+             unpack weights of step p ─┬─ 8 × (read A from LDS, 8 MFMAs) ─┬─ A of step p+1 → LDS ─ barrier
+                                       └── loads travel meanwhile ────────┘
+```
+
+Two LDS buffers (16 KB each) alternate: the MFMAs read one while the next A slice is written into
+the other. Two register sets for the weights alternate, so their loads start two steps early. 32 KB
+of LDS per block means 2 blocks (16 wavefronts, 4 per SIMD) fit on one CU.
+
+### 5. The scales: once per item, not once per step
+
+The 256 columns' scale bytes are 256 × 90 = 23 KB that sit **next to each other** in memory. At the
+start of an item the block copies them into LDS with large loads (3 per thread), every thread
+picks out the 23 bytes it will need (one per step) into 6 registers, and then the same LDS is used
+for A. Before this, every step loaded each scale byte on its own: one cache-line request for 1 useful
+byte, as many requests as for the weights themselves.
+
+### 6. Uneven experts: one queue
+
+The CPU does not know how many rows each expert got — that number lives on the GPU — so the
+kernel decides on the GPU:
+
+```
+ offsets (on GPU) ──► every wavefront counts each expert's 64-row tiles (a running sum)
+                      work items, in order: expert (biggest first) → 256-column tile → 64-row tile
+ a fixed set of blocks (as many as fit on the GPU at once: 208) loops:
+        ticket = atomic_add(queue, 1)  →  find its (expert, column tile, row tile)  →  compute
+ the last block to finish resets the queue for the next call
+```
+
+- An expert with 0 rows has no items at all.
+- A tile with fewer than 64 real rows skips the 16-row MFMA tiles that are completely empty: an
+  expert with 20 rows pays for 32 rows of arithmetic, not 64.
+- The row tiles of one expert that use the same weights are next to each other in the queue, so
+  they start at the same time and the second one finds the weights in the L2 cache.
+- Biggest experts first: the last items handed out are small, so blocks finish at nearly the same time.
+
+## What was limiting it: requests to the L2 cache
+
+The previous draft of this kernel (64 × 128 items, 4 wavefronts, steps of 64 k, one scale byte loaded
+per step) already used the matrix cores, but a hardware-counter profile (rocprofv3, 20b mlp1, B=512)
+showed the matrix cores busy only 38 % of the time. The telling number:
+
+```
+ L2 requests per call: 30.3 million in 1.88 million clock ticks = 16.1 per tick
+ the L2 has 16 channels, each answering about 1 request per tick  →  it was at its limit
+```
+
+Per item it asked for 64 rows of A (5,760 lines), 128 columns of weights at 32 bytes per line and
+step (5,760 lines), and a whole line for each 1-byte scale (5,760 lines). The new layout needs fewer:
+
+| per item | draft (64 × 128) | new (64 × 256) |
+|---|---:|---:|
+| A lines | 5,760 | 5,760 (but for twice the columns) |
+| weight lines | 5,760 | 8,832 (for twice the columns: 16 bytes per thread; odd columns straddle two lines) |
+| scale lines | 5,760 | 360 |
+| lines per 1,000 multiply-adds | 0.73 | 0.32 |
+
+Measured: **14.2 million requests per call (11.4 per tick), matrix cores busy 59 %**.
+
+Two compiler details mattered as much (both visible only in the generated machine code, kept in
+the build with `-save-temps`):
+
+- **The item number must be known to be the same in every thread** (`__builtin_amdgcn_readfirstlane`).
+  It comes from LDS, so the compiler assumed it could differ per thread; everything computed from it
+  then lived in per-thread registers, and every A load turned into a small loop over all distinct
+  values, which also made the compiler wait for *all* outstanding loads at the top of each step —
+  prefetch included.
+- **The compiler moved the loads to the end of the step** (to free registers), where nothing hides
+  their latency, and pulled the A reordering right after its own load. Two
+  `__builtin_amdgcn_sched_barrier(0)` markers keep the loads at the start and the reordering at the end.
+
+What is left (test builds that skip one part, so their results are wrong but their time tells the
+cost of that part): without the barrier and A copy the time does not drop (871 µs vs 845–857 µs);
+without the unpacking it drops 3 %; without the weight loads, 17 % (and 42 % when every expert has
+only 16 rows).
+So the weight traffic is still the main cost, and the register file is full (128 per thread), which
+is why deeper prefetch did not help (see below).
+
+## The numbers for our model
+
+One GCD of mv-mi250-03, `getp-csrc/bench/moe_gemm_bench.cpp`, mean of 40 calls (the simple kernel: 4
+calls), each call on the routing of another real layer and step (20b, dumped from `./run`). 120b: one
+GCD of a pair holds 64 of the 128 experts and gets the rows of both GCDs' tokens (≈ 4 × B rows),
+synthetic routing with the same unevenness. "Library" = the vendor library (hipBLASLt through
+PyTorch, bf16 weights, so 4× the weight bytes) called once per expert on the same routing, all calls
+of one grouped multiply captured in one HIP graph so launch costs are small
+(`getp-csrc/bench/moe_torch_lib.py`, mv-mi250-02); "library est." = the sum over experts of the
+single-call library time for that expert's row count (`yardsticks/gemm_bench.json`). µs per call:
+
+| model | shape | B | simple | draft | **new** | new TFLOP/s | library | library est. | new vs library |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 20b | mlp1 5760×2880 | 512 | 13,168 | 1,227 | **857** | 79 | 1,691 | 1,433 | 1.97× |
+| 20b | mlp2 2880×2880 | 512 | 6,745 | 616 | **472** | 72 | 1,098 | 988 | 2.33× |
+| 20b | mlp1 | 1024 | 20,815 | 1,851 | **1,377** | 99 | 2,339 | 1,901 | 1.70× |
+| 20b | mlp2 | 1024 | 10,546 | 958 | **746** | 91 | 1,457 | 1,244 | 1.95× |
+| 20b | mlp1 | 2048 | 37,340 | 3,161 | **2,476** | 110 | 3,645 | 2,990 | 1.47× |
+| 20b | mlp2 | 2048 | 18,424 | 1,666 | **1,324** | 103 | 2,350 | 1,760 | 1.78× |
+| 120b | mlp1 | 512 | 17,771 | 1,718 | **1,116** | 60 | 2,870 | 2,477 | 2.57× |
+| 120b | mlp2 | 512 | 9,065 | 953 | **602** | 55 | 1,979 | 1,729 | 3.29× |
+| 120b | mlp1 | 1024 | 25,194 | 2,427 | **1,670** | 80 | 3,517 | 2,947 | 2.11× |
+| 120b | mlp2 | 1024 | 12,706 | 1,285 | **891** | 75 | 2,281 | 2,035 | 2.56× |
+| 120b | mlp1 | 2048 | 43,561 | 3,786 | **2,819** | 100 | 4,820 | 3,998 | 1.71× |
+| 120b | mlp2 | 2048 | 21,599 | 1,997 | **1,501** | 94 | 2,994 | 2,577 | 1.99× |
+
+The goal set before the work was "beat 32 × the library time at 64 rows": 1,555 µs (mlp1) and
+1,040 µs (mlp2) at B=512. Reached: 857 and 472 µs.
+
+Peak for comparison: the matrix cores do 181 TFLOP/s at 1.7 GHz, but this kernel runs at about
+1.5 GHz (measured from the profiler's clock counter), so 160 TFLOP/s is the real ceiling; the new
+kernel reaches 34–69 % of it. Memory: the weight bytes of a 20b mlp1 call (at most 282 MB) at
+1.25 TB/s would take 225 µs, so at B=512 the kernel is neither purely memory- nor purely
+arithmetic-limited.
+
+## What it gave
+
+Per call: 15× faster than the simple kernel, 1.5–3.3× faster than the library, and 1.3–1.6× faster
+than the first matrix-core draft, on every shape.
+
+Whole program, gpt-oss-20b, 512 prompts × 128 new tokens, one GCD (an engine where the dense
+multiplies were still the simple version): 662 tok/s (simple) → 1,710 (draft) → **1,797** (new).
+In the lead's profile after the dense-GEMM change (477 ms per step, 96 % in this kernel at
+≈ 9.5 ms per call), the new kernel's ≈ 1.3 ms per mlp1 + mlp2 pair brings the expert multiplies from
+≈ 456 ms to ≈ 32 ms per step.
+
+**One more step, ready but not yet used by the engine:** `gemm_grouped_mxfp4_gather_swiglu` does the
+gather (copying each token's row into expert order), mlp1 and SwiGLU in one kernel, so the
+fp32 mlp1 output (47 MB per layer at B=512) is never written and read back. Measured (mlp1, same
+setup): 20b B=512 947 → 802 µs, B=1024 1,560 → 1,342 µs, B=2048 2,823 → 2,471 µs, 120b B=512
+1,208 → 1,036 µs (−12 to −15 %), bit-identical to the three separate kernels
+(`MOE_FUSED=1 ./moe_gemm_bench …`).
+
+**What would come next: weights stored in reading order.** In the checkpoint layout a block reads,
+per step, 256 separate 64-byte pieces 1,440 bytes apart. A separate test that only reads the 32 mlp1
+experts (265 MB) this way takes 311 µs (855 GB/s); reading the same bytes contiguously takes 205 µs
+(1,296 GB/s); padding the rows to a multiple of 64 bytes does not help (309 µs). Rearranging each
+expert's codes once at load time, so that every (256-column tile, step of 128 k) is one contiguous
+16 KB piece, would make the weight stream about 1.5× faster — the main remaining cost, most of all
+for small experts (gpt-oss-120b). It changes the weight layout the kernel takes, so it is an engine
+decision.
+
+## Where it is in our code
+
+All in `getp-csrc/kernels/fast_moe_gemm.hpp`:
+
+- `:104` `fp4_tables`, `:124` `fp4x8_to_bf16` — unpacking MXFP4 to bf16 with `v_perm_b32`.
+- `:151` `MoeSmem` — the 32 KB of LDS (two A buffers; at item start, the scale bytes).
+- `:176` `moe_tile_prefix`, `:227` `moe_find_rank` — counting each expert's row tiles, biggest first,
+  and finding the item of a ticket.
+- `:241` `moe_store_a` — A into LDS in the "even k first" order.
+- `:284` `moe_step` — one step of 128 k: loads (`:316` keeps them at the start), unpacking, 64 MFMAs
+  (`:339`), A into the other buffer (`:346`), barrier.
+- `:357` `moe_item` — one work item: scales into registers (`:377`, `:388`), per-thread addresses
+  (`:407`), the step loop (`:444`), the bias add and stores (`:452`).
+- `:494` `gemm_grouped_mxfp4_mfma_kernel` — the persistent loop: ticket (`:512`), made uniform
+  (`:518`), the 1–4 row-tile variants (`:543`), queue reset (`:562`).
+- `:684` `gemm_grouped_mxfp4` — the entry point the engine calls
+  (`getp-csrc/engine/gpu_engine.hpp:334` and `:338`); `:630` the simple version, still used for shapes
+  the fast kernel does not take (`:661` `moe_mfma_ok`).
+- `:702` `gemm_grouped_mxfp4_swiglu`, `:716` `gemm_grouped_mxfp4_gather_swiglu` — optional fused
+  versions for mlp1 (not used by the engine yet), equal bit for bit to the separate kernels.
+
+Tests and measurements: `getp-csrc/tests/moe_gemm_test.cpp` (unit test),
+`getp-csrc/bench/moe_gemm_bench.cpp` (speed, `MOE_UNIFORM=64` for even routing, `MOE_ONLY=…` for
+one configuration), `getp-csrc/bench/moe_torch_lib.py` (library yardstick, separate script).
+
+## Correctness
+
+- Unit test, against a CPU reference in double precision of the same bf16 A and the decoded
+  weights: 24 cases — real routing (first and last dumped layer), 32 / 64 / 128 experts, skewed
+  random routing, every token on the same 4 experts, one expert with all 2,048 rows, row counts
+  around 16 and 64 (1, 15, 16, 17, 63, 64, 65, …), empty experts, small odd shapes. Worst error
+  divided by Σ|A·W| (the size fp32 rounding grows with): 8.0e-7; worst relative error 2.3e-5.
+- Unpacking: one-hot rows of A turn the output into the weights themselves: all 16 codes × scale
+  bytes 2..252 are bit-exact.
+- The fused SwiGLU variants: bit-identical to the separate kernels on 5.9 million outputs.
+- End to end, 64 prompts × 128 tokens: 49 of 64 answers identical to the reference, 88.6 % of tokens
+  before the first difference (simple kernel: 43 / 64, 80.9 %). The order of additions changed, so
+  some answers drift later, as with every bf16 change (doc 10).
+
+## What did not help
+
+| idea | result (20b mlp1 B=512 unless noted) | why |
+|---|---|---|
+| draft with 64 × 256 items on 4 wavefronts | 1,040 → 5,032 µs (fastest call) | 192 registers needed: spills, 2 wavefronts per SIMD |
+| draft with 2 instead of 4 wavefronts per SIMD | 1,207 → 1,070 µs | better, but the request limit stayed; superseded |
+| draft: no branches around the prefetch loads; A prefetched 2 steps ahead | no change (1,247 → 1,262 / 1,272 µs) | the limit was the L2 requests, not latency |
+| scales from a fixed byte (steps unrolled by 4) | 856 → 901 µs | 9 % fewer instructions but twice the code |
+| zero codes in the last half step by an out-of-range address instead of a select | 845 → 864 µs | more instructions in the end (compiler) |
+| weights prefetched 3 steps ahead | 848 → 1,022 µs | 13 spills inside the loop (128-register limit) |
+| 3 rotating weight registers, reload right after unpacking | ≈ 850 → 1,199 µs | 34 spills |
+| skip the arithmetic of wavefronts whose columns are all past N | within noise | the branch made the compiler wait for all loads at every loop turn |
+
+## Pitfalls
+
+- **A and W must use the same k order.** The matrix core happily multiplies mismatched pairs and the
+  result still looks like plausible numbers. The one-hot test turns the output into the decoded
+  weights, so any mix-up shows up as a wrong weight, not as a small error.
+- **The smallest scale bytes do not fit.** For scale byte 1, 0.5 × 2^(1−127) is below the smallest
+  normal bf16; we do not build that pattern. Scale bytes 2..252 are exact; the checkpoint uses 115..136.
+- **The last half step.** 2,880 is not a multiple of 128: in the last step the threads whose 32 k lie
+  past the end read the next column's bytes; their codes are replaced by zeros. The A values they
+  meet belong to the next row (finite numbers), so they add exactly 0.
+- **Look at the machine code.** Both big slowdowns found here (a per-load loop from a value the
+  compiler thought could differ per thread, and loads moved to the end of the step) were invisible in
+  the source and in the results; they show in the `.s` file and in the `s_waitcnt` (wait for memory)
+  instructions inside the loop.
+- **Registers are the wall.** At 4 wavefronts per SIMD each thread has 128 registers; every idea that
+  needed 8 more spilled and lost 20–40 %.
+- **One queue counter per GPU.** Two calls of this kernel on two streams of the same GPU at the same
+  time would share the counter and mix up their work. The engine uses one stream per GPU.
+- **Rows past an expert's end** are loaded (copies of its last row) and computed, but never stored;
+  columns past N load zeros (an address past the end of the buffer reads 0 without memory traffic).
+
+## Further reading
+
+- OCP, *Microscaling (MX) formats specification v1.0* (2023) — the MXFP4 format.
+- AMD, *CDNA2 instruction set architecture* — `v_mfma_f32_16x16x16bf16_1k` operand layout, `v_perm_b32`,
+  buffer loads. AMD's matrix instruction calculator (github.com/ROCm/amd_matrix_instruction_calculator)
+  prints which thread holds which element.
+- Doc 07 (matrix cores for the dense multiplies) — the same instructions on 16-bit weights.
+- Frantar et al., *MARLIN: mixed-precision auto-regressive parallel inference on large language
+  models* (2024) — 4-bit weights unpacked in registers right before the matrix units, on NVIDIA.
+- Gale et al., *MegaBlocks* (2022) — grouped GEMM for mixture-of-experts.
