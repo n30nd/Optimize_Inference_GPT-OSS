@@ -4,6 +4,8 @@
 #ifndef GETP_RUN
 #define GETP_RUN
 
+#include "engine/cli_modes.hpp"
+
 void warm_up(Transformer *transformer, Tokenizer *tokenizer) {
   // Do not inference here
   // You should handle the warm-up process
@@ -65,7 +67,7 @@ long long simple_getp_generate(Transformer *transformer, Tokenizer *tokenizer,
   while (pos < steps) {
 
     // forward the transformer to get logits for the next token
-    float *logits = forward(transformer, token, pos);
+    float *logits = model_forward(transformer, token, pos);
 
     // advance the state machine
     pos++;
@@ -118,5 +120,13 @@ long long inference(Transformer *transformer, Tokenizer *tokenizer,
   }
   return num_token_out;
 }
+
+// run.cpp includes this file before main(), so main()'s calls to these names
+// go to engine/cli_modes.hpp, which also accepts a Hugging Face model folder
+// as the checkpoint.
+#define build_transformer gptoss_build_transformer
+#define free_transformer gptoss_free_transformer
+#define generate gptoss_generate
+#define chat gptoss_chat
 
 #endif // GETP_RUN
