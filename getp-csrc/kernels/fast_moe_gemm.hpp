@@ -115,7 +115,7 @@
 #define MOE_NT (MOE_WAVES * 16 * MOE_NS) // columns per work item (256)
 #define MOE_THREADS (MOE_WAVES * 64)
 #define MOE_SREGS 6                   // scale registers per column tile: K <= 4 * 6 * 128
-#define MOE_MAX_E 256                 // largest expert count supported
+#define MOE_MAX_E 128                 // largest expert count supported
 #define MOE_SPIECE (64 * 4 * MOE_SREGS) // packed scale bytes per 16 columns (1536)
 
 // Bytes of one expert's packed codes and scales (moe_pack_mxfp4).
@@ -194,21 +194,23 @@ __device__ unsigned int g_moe_queue[2];
 // The work list, kept in registers by every wavefront. Experts are taken in
 // order of decreasing row count (ties: lower expert first), so the last items
 // of a call belong to the smallest experts and the cheapest tiles fill the
-// tail. Lane l of group g describes rank p = 64*g + l: expert[g] is the
-// expert of that rank and pre[g] the number of row tiles (of MOE_MT rows)
-// of all experts ranked before it.
-struct MoeTiles {
-  int expert[MOE_MAX_E / 64];
-  int pre[MOE_MAX_E / 64];
+// tail. Lane l of group g describes rank p = 64*g + l: bits 0-7 of rank[g]
+// hold the expert of that rank, bits 8-31 the number of row tiles (of
+// MOE_MT rows) of all experts ranked before it. NG = groups of 64 experts;
+// the kernel is compiled for 1 and 2. Every register this list holds is one
+// the step loop cannot use: with two registers per group and room for 256
+// experts, the calls were 1-3 % slower (and register spills appeared).
+template <int NG> struct MoeTiles {
+  int rank[NG];
   int total;
 };
 
 // `scratch` (E ints of LDS) is free before the first item; the caller puts a
 // barrier between this and the first use of LDS.
-__device__ inline MoeTiles moe_tile_prefix(const int *__restrict__ offsets,
-                                           int E, int *scratch) {
+template <int G>
+__device__ inline MoeTiles<G> moe_tile_prefix(const int *__restrict__ offsets, int E,
+                                              int *scratch) {
   const int lane = threadIdx.x & 63;
-  constexpr int G = MOE_MAX_E / 64;
   int rows[G], rank[G];
 #pragma unroll
   for (int g = 0; g < G; g++) {
@@ -232,13 +234,12 @@ __device__ inline MoeTiles moe_tile_prefix(const int *__restrict__ offsets,
     if (g * 64 + lane < E)
       scratch[rank[g]] = g * 64 + lane; // every wavefront writes the same
   __syncthreads();
-  MoeTiles t;
+  MoeTiles<G> t;
   int base = 0;
 #pragma unroll
   for (int g = 0; g < G; g++) {
     const int p = g * 64 + lane;
-    t.expert[g] = p < E ? scratch[p] : 0;
-    const int e = t.expert[g];
+    const int e = p < E ? scratch[p] : 0;
     const int cnt = p < E ? (offsets[e + 1] - offsets[e] + MOE_MT - 1) / MOE_MT : 0;
     int incl = cnt; // inclusive scan over the wavefront
 #pragma unroll
@@ -247,7 +248,7 @@ __device__ inline MoeTiles moe_tile_prefix(const int *__restrict__ offsets,
       if (lane >= d)
         incl += v;
     }
-    t.pre[g] = base + incl - cnt;
+    t.rank[g] = (base + incl - cnt) << 8 | e;
     base += __shfl(incl, 63, 64);
   }
   t.total = base;
@@ -256,13 +257,13 @@ __device__ inline MoeTiles moe_tile_prefix(const int *__restrict__ offsets,
 
 // The rank that owns `item`: the last rank p with pre[p] * n_tiles <= item
 // (empty experts have pre[p] == pre[p+1], so they are never picked).
-__device__ inline int moe_find_rank(const MoeTiles &t, int E, int n_tiles,
-                                    int item) {
+template <int NG>
+__device__ inline int moe_find_rank(const MoeTiles<NG> &t, int E, int n_tiles, int item) {
   const int lane = threadIdx.x & 63;
   int count = 0;
 #pragma unroll
-  for (int g = 0; g < MOE_MAX_E / 64; g++)
-    count += __popcll(__ballot(g * 64 + lane < E && t.pre[g] * n_tiles <= item));
+  for (int g = 0; g < NG; g++)
+    count += __popcll(__ballot(g * 64 + lane < E && (t.rank[g] >> 8) * n_tiles <= item));
   return count - 1;
 }
 
@@ -409,9 +410,10 @@ __device__ __forceinline__ void moe_step(MoeSmem &sm, int p, int np,
 // the expert's rows, or, when gather is set, is the token matrix and row r of
 // the expert is token gather[r] / topk. wblocks and wscales point to the
 // expert's packed weights. MSA = number of 16-row tiles that hold valid rows
-// (1 .. 4).
+// (1 .. 4). Forced inline: compiled as a called function (which the compiler
+// chose once the kernel became a template) the kernel was 3 times slower.
 template <int MSA>
-__device__ void moe_item(MoeSmem &sm, const bf16_t *__restrict__ A,
+__device__ __forceinline__ void moe_item(MoeSmem &sm, const bf16_t *__restrict__ A,
                          const uint8_t *__restrict__ wblocks,
                          const uint8_t *__restrict__ wscales,
                          const float *__restrict__ bias, float *__restrict__ C,
@@ -440,12 +442,10 @@ __device__ void moe_item(MoeSmem &sm, const bf16_t *__restrict__ A,
   ln.w_step = (uint32_t)nc * 1024;
   const __amdgpu_buffer_rsrc_t s_rsrc =
       moe_rsrc(wscales + (size_t)(n0 / 16) * MOE_SPIECE, (uint32_t)nc * MOE_SPIECE);
-  int ncol[MOE_NS];
   uint32_t s_off[MOE_NS];
 #pragma unroll
   for (int jn = 0; jn < MOE_NS; jn++) {
     const int c = wave * MOE_NS + jn;
-    ncol[jn] = n0 + 16 * c + j;
     ln.w_off[jn] = c < nc ? (uint32_t)(kq * nc + c) * 256 + 16 * j : 0x80000000u;
     s_off[jn] = (uint32_t)c * MOE_SPIECE;
   }
@@ -505,47 +505,73 @@ __device__ void moe_item(MoeSmem &sm, const bf16_t *__restrict__ A,
     moe_step<MSA>(sm, p, np, wq, sc, ln, arow, apart, j, kq, acc);
 
   // Lane (j, kq) holds rows 4*kq + 0..3 of column j of each 16x16 tile.
+  // The bias and the outputs go through buffer descriptors: the bias reads 0
+  // past N (or without a bias), and the output descriptor ends after row
+  // mv - 1 of the item, so the hardware drops the stores to the rows past mv;
+  // lanes whose column is not stored get an offset past the end. So the
+  // epilogue has no branches and no 64-bit address arithmetic. With plain
+  // pointers the compiler used flat stores, which also count as LDS
+  // operations, so every later LDS wait also waited for the stores; the
+  // epilogue took about 16 us per item instead of 3-4. The columns are
+  // computed here, not before the step loop, where they would hold two
+  // registers.
+  int ncol[MOE_NS];
+#pragma unroll
+  for (int jn = 0; jn < MOE_NS; jn++)
+    ncol[jn] = n0 + 16 * (wave * MOE_NS + jn) + j;
+  float bn[MOE_NS];
+  {
+    const __amdgpu_buffer_rsrc_t b_rsrc = moe_rsrc(bias, bias ? (uint32_t)N * 4 : 0u);
+#pragma unroll
+    for (int jn = 0; jn < MOE_NS; jn++)
+      bn[jn] = __builtin_bit_cast(
+          float, __builtin_amdgcn_raw_buffer_load_b32(b_rsrc, (uint32_t)ncol[jn] * 4, 0, 0));
+  }
   if (G == nullptr) {
+    const __amdgpu_buffer_rsrc_t c_rsrc = moe_rsrc(C + (size_t)m0 * N, (uint32_t)mv * N * 4);
 #pragma unroll
     for (int jn = 0; jn < MOE_NS; jn++) {
       const int n = ncol[jn];
-      if (n >= N)
-        continue;
-      const float bn = bias ? bias[n] : 0.0f;
+      const uint32_t off = n < N ? ((uint32_t)(4 * kq) * N + n) * 4 : 0x80000000u;
 #pragma unroll
       for (int i = 0; i < MSA; i++)
 #pragma unroll
-        for (int rr = 0; rr < 4; rr++) {
-          const int m = i * 16 + kq * 4 + rr;
-          if (m < mv)
-            C[(size_t)(m0 + m) * N + n] = acc[i][jn][rr] + bn;
-        }
+        for (int rr = 0; rr < 4; rr++)
+          __builtin_amdgcn_raw_buffer_store_b32(
+              __builtin_bit_cast(uint32_t, acc[i][jn][rr] + bn[jn]), c_rsrc, off,
+              (uint32_t)(i * 16 + rr) * N * 4, 0);
     }
     return;
   }
   // SwiGLU: columns 2q (gate) and 2q+1 (up) sit in neighbouring lanes; the
   // even lane writes G[m, q] with the same arithmetic as swiglu_bf16_kernel.
+  // The odd lanes compute the same expression on swapped inputs and store
+  // nothing.
+  const int H = N / 2;
+  const __amdgpu_buffer_rsrc_t g_rsrc = moe_rsrc(G + (size_t)m0 * H, (uint32_t)mv * H * 2);
 #pragma unroll
   for (int jn = 0; jn < MOE_NS; jn++) {
     const int n = ncol[jn];
-    const float bn = bias && n < N ? bias[n] : 0.0f;
+    const uint32_t off =
+        (j & 1) == 0 && n < N ? ((uint32_t)(4 * kq) * H + n / 2) * 2 : 0x80000000u;
 #pragma unroll
     for (int i = 0; i < MSA; i++)
 #pragma unroll
       for (int rr = 0; rr < 4; rr++) {
-        const float y = acc[i][jn][rr] + bn;
-        const float up_raw = __shfl_xor(y, 1, 64);
-        const int m = i * 16 + kq * 4 + rr;
-        if ((j & 1) == 0 && n < N && m < mv) {
-          float val = fminf(y, limit);
-          const float up = fminf(fmaxf(up_raw, -limit), limit);
-          val = val / (1.0f + __expf(-1.702f * val));
-          G[(size_t)(m0 + m) * (N / 2) + n / 2] = f32_to_bf16(val * (up + 1.0f));
-        }
+        const float y = acc[i][jn][rr] + bn[jn];
+        // the value of the neighbouring lane (lane ^ 1), by a DPP move
+        const float up_raw = __builtin_bit_cast(
+            float, __builtin_amdgcn_mov_dpp(__builtin_bit_cast(int, y), 0xB1, 0xF, 0xF, false));
+        float val = fminf(y, limit);
+        const float up = fminf(fmaxf(up_raw, -limit), limit);
+        val = val / (1.0f + __expf(-1.702f * val));
+        __builtin_amdgcn_raw_buffer_store_b16(f32_to_bf16(val * (up + 1.0f)), g_rsrc, off,
+                                              (uint32_t)(i * 16 + rr) * H * 2, 0);
       }
   }
 }
 
+template <int NG>
 __global__ __launch_bounds__(MOE_THREADS) __attribute__((amdgpu_waves_per_eu(4)))
 void gemm_grouped_mxfp4_mfma_kernel(
     const bf16_t *__restrict__ A, const int *__restrict__ offsets, int n_experts,
@@ -555,7 +581,7 @@ void gemm_grouped_mxfp4_mfma_kernel(
   __shared__ MoeSmem sm;
   const int tid = threadIdx.x;
   const int n_tiles = (N + MOE_NT - 1) / MOE_NT;
-  const MoeTiles tiles = moe_tile_prefix(offsets, n_experts, (int *)&sm);
+  const MoeTiles<NG> tiles = moe_tile_prefix<NG>(offsets, n_experts, (int *)&sm);
   const int total = tiles.total * n_tiles;
   const size_t wsize = moe_packed_blocks_bytes(N, K), ssize = moe_packed_scales_bytes(N, K);
   // The item number goes from thread 0 to the block through the last LDS
@@ -576,13 +602,12 @@ void gemm_grouped_mxfp4_mfma_kernel(
       break;
     // Items: expert (largest first), then column tile, then row tile.
     const int p = moe_find_rank(tiles, n_experts, n_tiles, item);
-    int e = 0, e_first = 0; // held by lane p % 64 of group p / 64
+    int rk = 0; // held by lane p % 64 of group p / 64
 #pragma unroll
-    for (int g = 0; g < MOE_MAX_E / 64; g++)
-      if (p / 64 == g) {
-        e = __builtin_amdgcn_readlane(tiles.expert[g], p % 64);
-        e_first = __builtin_amdgcn_readlane(tiles.pre[g], p % 64);
-      }
+    for (int g = 0; g < NG; g++)
+      if (p / 64 == g)
+        rk = __builtin_amdgcn_readlane(tiles.rank[g], p % 64);
+    const int e = rk & 0xff, e_first = rk >> 8;
     const int r0 = offsets[e];
     const int rows = offsets[e + 1] - r0;
     const int e_tiles = (rows + MOE_MT - 1) / MOE_MT;
@@ -766,7 +791,7 @@ static int moe_mfma_grid(int max_items) {
   if (cached[dev] == 0) {
     int cus = 0, per_cu = 0;
     hipDeviceGetAttribute(&cus, hipDeviceAttributeMultiprocessorCount, dev);
-    hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, gemm_grouped_mxfp4_mfma_kernel,
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, gemm_grouped_mxfp4_mfma_kernel<2>,
                                                  MOE_THREADS, 0);
     cached[dev] = std::max(1, cus * std::max(1, per_cu));
   }
@@ -793,8 +818,12 @@ static void gemm_grouped_mxfp4_launch(hipStream_t s, const bf16_t *A,
   const long long max_items = (long long)((N + MOE_NT - 1) / MOE_NT) * n_experts *
                               ((max_rows + MOE_MT - 1) / MOE_MT);
   const int grid = moe_mfma_grid((int)std::min<long long>(max_items, 1 << 30));
-  gemm_grouped_mxfp4_mfma_kernel<<<grid, MOE_THREADS, 0, s>>>(
-      A, offsets, n_experts, blocks, scales, bias, C, G, limit, row_pair, topk, N, K);
+  if (n_experts <= 64)
+    gemm_grouped_mxfp4_mfma_kernel<1><<<grid, MOE_THREADS, 0, s>>>(
+        A, offsets, n_experts, blocks, scales, bias, C, G, limit, row_pair, topk, N, K);
+  else
+    gemm_grouped_mxfp4_mfma_kernel<2><<<grid, MOE_THREADS, 0, s>>>(
+        A, offsets, n_experts, blocks, scales, bias, C, G, limit, row_pair, topk, N, K);
 }
 
 // Rows offsets[e] .. offsets[e+1] of A times expert e's MXFP4 weight, plus its

@@ -18,7 +18,11 @@
 //   - a barrier per step or not,
 //   - layout: tile-major (each item's 23 steps contiguous, the kernel's
 //     packed layout) or step-major (step p of all 23 tiles of an expert
-//     side by side, so the items of one expert read one region per step).
+//     side by side, so the items of one expert read one region per step),
+//   - what one load instruction of a wavefront reads: 4 runs of 256 bytes
+//     (the kernel) or 1 KB in one piece,
+//   - one block of 16 wavefronts per CU with 512-column items (32 KB per
+//     step) instead of 8 wavefronts and 256 columns.
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 
@@ -43,8 +47,8 @@ __device__ inline uint4 ld16(__amdgpu_buffer_rsrc_t r, uint32_t v, uint32_t s) {
   return make_uint4(x[0], x[1], x[2], x[3]);
 }
 
-template <int D, bool BAR, bool STEP_MAJOR>
-__global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(4)))
+template <int D, bool BAR, bool STEP_MAJOR, int WAVES = 8, bool CONTIG = false>
+__global__ __launch_bounds__(WAVES * 64) __attribute__((amdgpu_waves_per_eu(4)))
 void stream_kernel(const uint8_t *W, int items, int K, unsigned *sink) {
   __shared__ unsigned slot;
   const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
@@ -62,15 +66,21 @@ void stream_kernel(const uint8_t *W, int items, int K, unsigned *sink) {
     __syncthreads();
     if (it >= items)
       break;
-    const int e = it / kTiles, t = it % kTiles;
-    const uint8_t *base = STEP_MAJOR ? W + (size_t)e * kTiles * tile_bytes
-                                     : W + (size_t)it * tile_bytes;
-    const uint32_t step = STEP_MAJOR ? kTiles * kStep : kStep;
+    // WAVES = 16: one item is 512 columns (pieces 0..31), its steps of 32 KB
+    // contiguous (tile-major); the caller passes the number of such items.
+    const int tiles = kTiles * 8 / WAVES;
+    const int e = it / tiles, t = it % tiles;
+    const uint32_t ibytes = tile_bytes * WAVES / 8, istep = kStep * WAVES / 8;
+    const uint8_t *base = STEP_MAJOR ? W + (size_t)e * tiles * ibytes
+                                     : W + (size_t)it * ibytes;
+    const uint32_t step = STEP_MAJOR ? tiles * istep : istep;
     const auto r = __builtin_amdgcn_make_buffer_rsrc(
-        (void *)base, (short)0, STEP_MAJOR ? kTiles * tile_bytes : tile_bytes, 0x00020000);
+        (void *)base, (short)0, STEP_MAJOR ? tiles * ibytes : ibytes, 0x00020000);
     uint32_t off[2];
     for (int jn = 0; jn < 2; jn++)
-      off[jn] = (STEP_MAJOR ? t * kStep : 0) + (uint32_t)(16 * kq + 2 * wave + jn) * 256 + 16 * j;
+      off[jn] = (STEP_MAJOR ? t * istep : 0) +
+                (CONTIG ? (uint32_t)(2 * wave + jn) * 1024 + 16 * lane
+                        : (uint32_t)(2 * WAVES * kq + 2 * wave + jn) * 256 + 16 * j);
     uint4 w[D][2];
 #pragma unroll
     for (int d = 0; d < D; d++)
@@ -94,7 +104,7 @@ void stream_kernel(const uint8_t *W, int items, int K, unsigned *sink) {
     sink[0] = acc;
 }
 
-template <int D, bool BAR, bool STEP_MAJOR>
+template <int D, bool BAR, bool STEP_MAJOR, int WAVES = 8, bool CONTIG = false>
 static void run(const uint8_t *W, int items, unsigned *sink, double bytes, int grid) {
   hipEvent_t a, b;
   CHECK(hipEventCreate(&a));
@@ -105,7 +115,7 @@ static void run(const uint8_t *W, int items, unsigned *sink, double bytes, int g
   for (int i = 0; i < n + 2; i++) {
     CHECK(hipMemcpyToSymbol(HIP_SYMBOL(g_stream_queue), &zero, 4));
     CHECK(hipEventRecord(a));
-    stream_kernel<D, BAR, STEP_MAJOR><<<grid, 512>>>(W, items, kK, sink);
+    stream_kernel<D, BAR, STEP_MAJOR, WAVES, CONTIG><<<grid, WAVES * 64>>>(W, items, kK, sink);
     CHECK(hipEventRecord(b));
     CHECK(hipEventSynchronize(b));
     float ms;
@@ -113,8 +123,9 @@ static void run(const uint8_t *W, int items, unsigned *sink, double bytes, int g
     if (i >= 2)
       sum += ms;
   }
-  printf("grid %3d  depth %d  barrier %d  %-11s  %6.1f us  %5.0f GB/s\n", grid, D, (int)BAR,
-         STEP_MAJOR ? "step-major" : "tile-major", sum / n * 1e3, bytes / (sum / n) * 1e-6);
+  printf("grid %3d x %2d waves  depth %d  barrier %d  %-11s  %-9s  %6.1f us  %5.0f GB/s\n",
+         grid, WAVES, D, (int)BAR, STEP_MAJOR ? "step-major" : "tile-major",
+         CONTIG ? "1 KB" : "4 x 256 B", sum / n * 1e3, bytes / (sum / n) * 1e-6);
   CHECK(hipEventDestroy(a));
   CHECK(hipEventDestroy(b));
 }
@@ -135,7 +146,17 @@ int main() {
     run<1, false, false>(W, items, sink, bytes, grid);
     run<1, true, true>(W, items, sink, bytes, grid);
     run<2, true, true>(W, items, sink, bytes, grid);
+    run<1, true, false, 8, true>(W, items, sink, bytes, grid);
   }
+  // One block of 16 wavefronts per CU, 512-column items (32 KB per step):
+  // 11 such tiles per expert (5,632 of the 5,888 columns).
+  const int items16 = kExperts * (kTiles * 8 / 16);
+  const double bytes16 = (double)items16 * 256 * kK;
+  run<1, true, false, 16>(W, items16, sink, bytes16, 104);
+  run<2, true, false, 16>(W, items16, sink, bytes16, 104);
+  run<1, false, false, 16>(W, items16, sink, bytes16, 104);
+  run<1, true, true, 16>(W, items16, sink, bytes16, 104);
+  run<1, true, false, 16, true>(W, items16, sink, bytes16, 104);
   CHECK(hipFree(W));
   CHECK(hipFree(sink));
   return 0;
