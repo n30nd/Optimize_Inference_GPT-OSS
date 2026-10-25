@@ -312,6 +312,19 @@ struct MoeLanes {
   uint32_t w_step;        // bytes of one step of the item's packed tile
 };
 
+// Wave priorities (s_setprio; 0 is the default) for items of at most 32
+// rows, in the three phases of a step: 2 while the loads of the next step
+// are issued, 1 in the MFMA loop, 0 for the A store and the barrier. The
+// SIMD issues from the ready wavefront of highest priority, so a wave that
+// has just passed the barrier gets its loads out before the waves in their
+// MFMA loop go on, and those go before a wave that only stores A and waits.
+// These items are bound by the weight stream; earlier loads help it. Items
+// of 48 and 64 rows keep the default: with priorities they were up to 12 %
+// (48 rows, mlp2) and 1 % (64 rows) slower.
+template <int MSA> struct MoePrio {
+  static constexpr int load = MSA <= 2 ? 2 : 0, mfma = MSA <= 2 ? 1 : 0;
+};
+
 // One step of 128 k. Decodes the weights of step p from wq with the scale
 // in the low byte of sc (then shifts sc down by one byte), refills wq with
 // step p+1, loads the A slice of step p+1 and, after the 8 MFMA k-steps,
@@ -342,6 +355,8 @@ __device__ __forceinline__ void moe_step(MoeSmem &sm, int p, int np,
   }
 
   const int pn = min(p + 1, np - 1);
+  if (MoePrio<MSA>::load)
+    __builtin_amdgcn_s_setprio(MoePrio<MSA>::load);
   const uint4 x0 = moe_load16(ln.a_rsrc, ln.a_off, pn * MOE_KS * 2);
   const uint4 x1 = moe_load16(ln.a_rsrc, ln.a_off + 16, pn * MOE_KS * 2);
 #pragma unroll
@@ -351,6 +366,8 @@ __device__ __forceinline__ void moe_step(MoeSmem &sm, int p, int np,
   // moves them to the end (to free registers), where the A loads' latency
   // is no longer hidden behind the MFMAs.
   __builtin_amdgcn_sched_barrier(0);
+  if (MoePrio<MSA>::load != MoePrio<MSA>::mfma)
+    __builtin_amdgcn_s_setprio(MoePrio<MSA>::mfma);
 
 #pragma unroll
   for (int d = 0; d < 4; d++) {
@@ -381,6 +398,8 @@ __device__ __forceinline__ void moe_step(MoeSmem &sm, int p, int np,
   // And keep the reordering of A for the store here, after the MFMAs: done
   // early it would wait for the loads just issued.
   __builtin_amdgcn_sched_barrier(0);
+  if (MoePrio<MSA>::mfma)
+    __builtin_amdgcn_s_setprio(0);
   moe_store_a(sm, buf ^ 1, arow, apart, x0, x1);
   __syncthreads();
 }
@@ -447,6 +466,12 @@ __device__ void moe_item(MoeSmem &sm, const bf16_t *__restrict__ A,
     sc[jn][4] = s1.x;
     sc[jn][5] = s1.y;
   }
+  // Keep the scale loads before the loads of step 0: the wait for the A
+  // loads (before their LDS store) then also covers the scales. Issued after
+  // them, a scale load can still be pending when the loop starts, and the
+  // compiler then waits at the top of every loop turn for more loads than
+  // the step needs.
+  __builtin_amdgcn_sched_barrier(0);
 
   moe_f32x4 acc[MSA][MOE_NS];
 #pragma unroll

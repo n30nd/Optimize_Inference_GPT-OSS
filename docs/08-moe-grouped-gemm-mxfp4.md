@@ -25,6 +25,12 @@ A second step (section 7) stores the 4-bit weights once, while the model loads, 
 kernel reads them. That made each call another **7–25 % faster** (most for gpt-oss-120b, whose
 experts get few rows), with exactly the same results.
 
+A third round of measurements (section 8) found what limits the kernel now. The suspected cause, the
+way the rows of A are loaded, turned out not to matter. Experts with few rows wait on the stream of
+weights from memory, not on the unpacking. Telling the GPU which wavefronts to serve first (wave
+priorities) makes those experts **5–11 % faster** and every real call **0.3–1.2 % faster**, with
+the same results (whole program +1.6 to +2.2 %).
+
 ## An everyday comparison
 
 A print shop with very fast presses (the matrix cores). The paper arrives vacuum-packed to save
@@ -42,6 +48,11 @@ Then the warehouse itself was re-shelved. The bundles were stored in the supplie
 one step of work a runner had to visit 256 different shelves and take a small packet from each.
 Now, once, before the shop opens, a clerk puts the 256 packets that one step needs side by side on
 one shelf, in the order the press uses them. The runner grabs one armful.
+
+Last, the shop set a rule for who goes first at the shared door. Before, the door was served
+oldest-first. Now a worker who must send a runner to the warehouse goes before one who is only
+operating a press, and both go before one who is just tidying up. Small orders wait mostly for
+paper, so their runners now leave a little earlier.
 
 ## The words
 
@@ -85,6 +96,13 @@ one shelf, in the order the press uses them. The runner grabs one armful.
 - **staging buffer** — a temporary piece of GPU memory that the raw bytes pass through before
   they are rearranged.
 - **bit-identical** — exactly the same bits: not even the last digit of any number changes.
+- **ablation** — a test build with one part removed (for example, no weight loads). Its results are
+  wrong, but its time shows how much that part costs.
+- **wave priority** (`s_setprio`) — a number 0–3 that a wavefront sets for itself. When several
+  wavefronts of a SIMD are ready, the SIMD issues the next instruction of the one with the highest
+  priority (among equals, the oldest).
+- **L1 cache** — the small cache (16 KB) of each compute unit, in front of the L2. Two loads of the
+  same 64-byte line close together are served by one L2 request.
 
 ## How it works
 
@@ -321,6 +339,110 @@ matrix cores busy 53 → 70 % of the time (120b mlp1 B=512: 17.6 → 10.5 millio
 Whole program, 64 prompts × 128 tokens (`./run … -n 128`, mv-mi250-02): 20b on one GCD 2,743 →
 **3,315 tok/s** (+21 %), 120b on a GCD pair 1,433 → **1,755 tok/s** (+22 %), same output hashes.
 
+### 8. What limits it now, and wave priorities
+
+**The starting guess was wrong.** After section 7, a test build without the A loads was 10 % faster,
+and each 64-byte line of A is read by two load instructions of 32 bytes (`moe_item`, thread
+`(arow, apart)`: lanes 2i and 2i+1 share a line). So the guess was: every A line costs two requests
+to the L2 cache. A version where 4 neighbouring lanes read the 4 quarters of one line in a single
+instruction cut the lookups in the L1 cache by 34 % (19.8 → 13.1 million per call). But the
+requests that reach the L2 did not change (11.89 → 11.88 million; 20b mlp1, B=512). The L1 had
+already merged the two halves of each line. The time did not improve either: 20b mlp1 B=512
+717 → 719–724 µs, and 64-row tiles 643 → 667 µs. A first version also had 3 times more LDS bank
+conflicts; an XOR of the LDS row index removed them, still with no gain. So the A loads stay as
+they were.
+
+**What each part costs** (ablations, µs per call, one GCD, mean of 20 calls, two rounds within 1 %):
+
+| removed from the kernel | 20b mlp1 B=512 | 120b mlp1 B=512 | 16 rows per expert | 64 rows per expert |
+|---|---:|---:|---:|---:|
+| nothing (the kernel) | 713 | 843 | 314 | 642 |
+| A loads | 666 (−7 %) | 803 (−5 %) | 337 (+7 %) | 604 (−6 %) |
+| weight loads | 666 (−7 %) | 753 (−11 %) | 249 (−21 %) | 629 (−2 %) |
+| both | 618 (−13 %) | 699 (−17 %) | 230 (−27 %) | 585 (−9 %) |
+| unpacking | 693 (−3 %) | 826 (−2 %) | 309 (−2 %) | 657 (+2 %) |
+| unpacking and MFMAs (loads only) | 425 | 613 | 276 | 388 |
+
+("16 / 64 rows per expert": every one of the 32 experts gets exactly that many rows, `MOE_UNIFORM`.)
+Read the last line: with 16 rows per expert, the loads alone take 276 of the 314 µs (88 %). Without
+the unpacking it is only 2 % faster. So small experts are limited by the **stream of weights from
+memory**, not by the unpacking. Even with nothing to load, 64-row tiles reach only about 75 % of the
+matrix cores' peak (585 µs). There the register file is full (128 per thread), so the compiler reads
+each A operand from LDS just before its MFMA and waits for it (`ds_read` then
+`s_waitcnt lgkmcnt`, about 16 times per step).
+
+**How fast can that stream be?** `getp-csrc/bench/moe_stream_bench.cpp` reads the weights exactly as
+the kernel does (same queue, same 208 blocks, 16 KB per block and step) and does nothing else:
+
+| setup | GB/s |
+|---|---:|
+| 208 blocks, loads 1 step ahead (the kernel) | 1,116–1,122 |
+| 208 blocks, 2 or 4 steps ahead | 1,136–1,148 |
+| 104 blocks (one per CU) | 1,342–1,344 |
+| 208 blocks, "step-major" order (step p of all 23 tiles of an expert side by side) | 1,286–1,293 |
+
+So loading further ahead gives nothing at this grid; what helps the memory is fewer separate
+streams, or putting the pieces that run at the same time next to each other. Neither carried over to
+the kernel: loading the weights two steps ahead (possible for 16- and 32-row tiles, which hold fewer
+accumulators) changed nothing (−1 to +2 %), and the step-major order gave −2.4 % at 16 rows per
+expert and ±1 % elsewhere (see "What did not help").
+
+**What did help: wave priorities.** A SIMD has 4 wavefronts (2 from each block of its CU). Each
+step of a wavefront has three phases: issue the loads of the next step, the unpacking and MFMA loop,
+then store A and wait at the barrier. Normally the SIMD serves the oldest ready wavefront first.
+For tiles of at most 32 rows, the kernel now sets a priority per phase (`s_setprio`):
+
+```
+ phase:     issue next loads  │  unpack + MFMAs  │  store A, barrier
+ priority:        2           │        1         │        0
+```
+
+A wavefront that has just passed the barrier gets its loads out at once, before the others in their
+MFMA loop issue their next instruction. A wavefront in its MFMA loop goes before one that only
+stores A and waits. These tiles wait on the weight stream, and their loads now leave earlier.
+
+Measured, µs per call (mean of 3 rounds × 40 calls on each of mv-mi250-02 and mv-mi250-03; the
+real 20b routing and the synthetic 120b routing of the next section):
+
+| model | call | B | before | after | change |
+|---|---|---:|---:|---:|---:|
+| 20b | mlp1 | 512 | 720.4 | **715.2** | −0.7 % |
+| 20b | mlp2 | 512 | 403.9 | **400.6** | −0.8 % |
+| 20b | gather + mlp1 + SwiGLU (engine) | 512 | 718.2 | **711.6** | −0.9 % |
+| 20b | mlp1 | 1024 | 1,239.2 | **1,231.5** | −0.6 % |
+| 20b | mlp2 | 1024 | 683.0 | **680.8** | −0.3 % |
+| 20b | gather + mlp1 + SwiGLU (engine) | 1024 | 1,254.2 | **1,244.9** | −0.7 % |
+| 120b | mlp1 | 512 | 848.0 | **842.6** | −0.6 % |
+| 120b | mlp2 | 512 | 477.0 | **471.1** | −1.2 % |
+| 120b | mlp1 + SwiGLU (engine) | 512 | 826.7 | **821.4** | −0.6 % |
+| 120b | mlp1 | 1024 | 1,374.7 | **1,365.6** | −0.7 % |
+| 120b | mlp2 | 1024 | 751.2 | **747.6** | −0.5 % |
+| 120b | mlp1 + SwiGLU (engine) | 1024 | 1,369.2 | **1,360.7** | −0.6 % |
+| 20b, 16 rows per expert | mlp1 / mlp2 | — | 315.9 / 174.8 | **301.6 / 164.8** | −4.5 / −5.7 % |
+| 20b, 32 rows per expert | mlp1 / mlp2 | — | 403.1 / 251.6 | **398.6 / 224.2** | −1.1 / −10.9 % |
+| 20b, 48 and 64 rows per expert | mlp1 / mlp2 | — | | | within ±0.5 % |
+
+Hardware counters (rocprofv3, one call): requests to the L2 unchanged (20b mlp1 B=512 9.31 M, 120b
+mlp1 B=512 10.47 M); matrix cores busy 69.9 → 70.4 % (20b mlp1 B=512), 64.1 → 64.7 % (120b mlp1
+B=512), 61.4 → 62.0 % (20b mlp2 B=512), 56.8 → 57.6 % (120b mlp2 B=512).
+
+Whole program, 64 prompts × 128 tokens, mv-mi250-02, 3 runs each: 20b on one GCD 3,438 →
+**3,513 tok/s** (+2.2 %), 120b on a GCD pair 2,188 → **2,222 tok/s** (+1.6 %); output hashes
+unchanged (`ccfc732a4a25`, `4ed6e262b73a`). At 64 prompts every expert has about 8 rows, the case
+the priorities help most.
+
+**Why only up to 32 rows.** With the same priorities, 48-row tiles were 12 % slower on uniform
+mlp2 (287 → 323 µs, both machines), and 64-row tiles 1 % slower. Any priority in their MFMA loop
+caused it; a priority for their loads alone still cost 6.5 %. On the real routings it made no
+difference (±0.5 %), so those tiles keep the default (`MoePrio`, `fast_moe_gemm.hpp:324`).
+
+**One small fix found on the way.** At the start of an item, the compiler had issued some scale
+loads after the weight loads of step 0. Its wait counting then made the top of every loop turn wait
+for all but one load in flight (`s_waitcnt vmcnt(1)` in the 16- and 48-row loops). A
+`sched_barrier` after the scale loads (`:474`) keeps them first, and every loop turn now waits only
+for the loads its step needs. The time did not change measurably, but the test of loading two steps
+ahead only meant something after this fix.
+
 ## What was limiting it: requests to the L2 cache
 
 The previous draft of this kernel (64 × 128 items, 4 wavefronts, steps of 64 k, one scale byte loaded
@@ -423,9 +545,16 @@ setup): 20b B=512 947 → 802 µs, B=1024 1,560 → 1,342 µs, B=2048 2,823 → 
 **Weights stored in reading order** (section 7): another 7–25 % per call; 64 prompts × 128 tokens
 20b 2,743 → 3,315 tok/s, 120b 1,433 → 1,755 tok/s.
 
-**What could come next.** The A loads now cost about as much as the weight loads (−10 % each when
-skipped): each 64-byte line of A is asked for by two load instructions of 32 bytes each. Experts
-with 16 rows are limited by the unpacking (about 145 plain instructions per step against 16 MFMAs).
+**Wave priorities** (section 8): another 0.3–1.2 % per call, 5–11 % for experts of 16–32 rows; 64
+prompts × 128 tokens 20b 3,438 → 3,513 tok/s, 120b 2,188 → 2,222 tok/s.
+
+**What could come next.** Section 8 shows two limits. Small experts wait on the weight stream: the
+kernel gets about 0.9 TB/s out of a measured 1.1–1.3 TB/s for this access pattern. Big tiles reach
+only about 75 % of the matrix cores even with nothing to load, because with 128 registers per
+thread the A operands are read from LDS just before use. Both need a bigger redesign than this
+round tried. One option: fewer, longer weight streams (e.g. one block per CU doing 512 columns,
+which also halves the A traffic per multiply). Another: a step loop written so that LDS reads run
+one MFMA group ahead.
 
 ## Where it is in our code
 
@@ -433,31 +562,36 @@ All in `getp-csrc/kernels/fast_moe_gemm.hpp`:
 
 - `:39` the packed layout, described at the top of the file; `:122` `moe_packed_blocks_bytes`,
   `:125` `moe_packed_scales_bytes` — its size per expert.
-- `:604` `moe_pack_blocks_kernel`, `:626` `moe_pack_scales_kernel`, `:651` `moe_pack_mxfp4` —
+- `:629` `moe_pack_blocks_kernel`, `:651` `moe_pack_scales_kernel`, `:676` `moe_pack_mxfp4` —
   the repacking, run once at load time.
 - `:138` `fp4_tables`, `:158` `fp4x8_to_bf16` — unpacking MXFP4 to bf16 with `v_perm_b32`.
 - `:184` `MoeSmem` — the 32 KB of LDS (two A buffers).
 - `:208` `moe_tile_prefix`, `:259` `moe_find_rank` — counting each expert's row tiles, biggest first,
   and finding the item of a ticket.
 - `:273` `moe_store_a` — A into LDS in the "even k first" order.
-- `:322` `moe_step` — one step of 128 k: loads of the next step (`:349` the weights, `:353` keeps
-  them at the start), unpacking, 64 MFMAs (`:376`), A into the other buffer (`:384`), barrier.
-- `:395` `moe_item` — one work item: the tile's packed buffer descriptor (`:420`), per-thread
-  offsets (`:430`), the scale loads (`:441`), the step loop (`:475`), the bias add and stores (`:483`).
-- `:525` `gemm_grouped_mxfp4_mfma_kernel` — the persistent loop: ticket (`:543`), made uniform
-  (`:549`), the 1–4 row-tile variants (`:574`), queue reset (`:593`).
-- `:780` `gemm_grouped_mxfp4` — the entry point for mlp2 (`getp-csrc/engine/gpu_engine.hpp:456`);
-  `:723` the simple version, still used (on the checkpoint layout) for shapes the fast kernel does
-  not take (`:756` `moe_mfma_ok`).
-- `:798` `gemm_grouped_mxfp4_swiglu` (120b split, `gpu_engine.hpp:446`), `:813`
-  `gemm_grouped_mxfp4_gather_swiglu` (20b, `gpu_engine.hpp:438`) — the fused mlp1 versions, equal
+- `:324` `MoePrio` — the wave priorities of section 8 (2 / 1 / 0 for items of at most 32 rows).
+- `:335` `moe_step` — one step of 128 k: priority for the loads (`:359`), loads of the next step
+  (`:364` the weights, `:368` keeps them at the start), priority for the MFMA loop (`:370`),
+  unpacking, 64 MFMAs (`:393`), priority back to 0 (`:402`), A into the other buffer (`:403`),
+  barrier.
+- `:414` `moe_item` — one work item: the tile's packed buffer descriptor (`:439`), per-thread
+  offsets (`:449`), the scale loads (`:460`) kept before the step-0 loads (`:474`), the step loop
+  (`:500`), the bias add and stores (`:508`).
+- `:550` `gemm_grouped_mxfp4_mfma_kernel` — the persistent loop: ticket (`:568`), made uniform
+  (`:574`), the 1–4 row-tile variants (`:599`), queue reset (`:618`).
+- `:805` `gemm_grouped_mxfp4` — the entry point for mlp2 (`getp-csrc/engine/gpu_engine.hpp:465`);
+  `:748` the simple version, still used (on the checkpoint layout) for shapes the fast kernel does
+  not take (`:781` `moe_mfma_ok`).
+- `:823` `gemm_grouped_mxfp4_swiglu` (120b split, `gpu_engine.hpp:455`), `:838`
+  `gemm_grouped_mxfp4_gather_swiglu` (20b, `gpu_engine.hpp:447`) — the fused mlp1 versions, equal
   bit for bit to the separate kernels.
-- `getp-csrc/engine/gpu_engine.hpp:152` — the `experts` helper of `gpu_upload_weights` that stages
-  and packs each layer's expert weights (`:195` mlp1, `:197` mlp2).
+- `getp-csrc/engine/gpu_engine.hpp:153` — the `experts` helper of `gpu_upload_weights` that stages
+  and packs each layer's expert weights (`:196` mlp1, `:198` mlp2).
 
 Tests and measurements: `getp-csrc/tests/moe_gemm_test.cpp` (unit test),
 `getp-csrc/bench/moe_gemm_bench.cpp` (speed, `MOE_UNIFORM=64` for even routing, `MOE_ONLY=…` for
-one configuration), `getp-csrc/bench/moe_torch_lib.py` (library yardstick, separate script).
+one configuration), `getp-csrc/bench/moe_stream_bench.cpp` (the weight stream alone, section 8),
+`getp-csrc/bench/moe_torch_lib.py` (library yardstick, separate script).
 
 ## Correctness
 
@@ -477,6 +611,12 @@ one configuration), `getp-csrc/bench/moe_torch_lib.py` (library yardstick, separ
   counts, 128 experts, small odd shapes — for the plain multiply and both fused versions.
 - End-to-end output hashes unchanged by section 7: 20b `ccfc732a4a25` (one GCD), 120b
   `836592181c82` (GCD pair), 64 prompts × 128 tokens.
+- Section 8 (wave priorities, scale-load order): every instruction gets the same operands in the
+  same order, so the bits cannot change; checked anyway. The kernel before section 8 and after it,
+  on the same packed weights, give the same bits on 1.45 billion outputs (the same routings as
+  above, plain multiply and both fused versions). The unit test passes. The output hashes of `./run`
+  (64 prompts × 128 tokens) are unchanged on one GCD (20b) and on a GCD pair (120b). The inner loops of the generated code have no `s_waitcnt vmcnt(0)` and no register
+  copies (checked in the `.s` file).
 - End to end, 64 prompts × 128 tokens: 49 of 64 answers identical to the reference, 88.6 % of tokens
   before the first difference (simple kernel: 43 / 64, 80.9 %). The order of additions changed, so
   some answers drift later, as with every bf16 change (doc 10).
@@ -496,6 +636,18 @@ one configuration), `getp-csrc/bench/moe_torch_lib.py` (library yardstick, separ
 | packed, but one load instruction = 1 KB contiguous (piece first, kq second; K padded to whole steps) | 749 → 755 µs; 120b 878 → 886 µs; 16 rows 329 → 324 µs | no gain over 4 runs of 256 bytes, and 2.2 % more memory for the padding |
 | packed, weights still loaded two steps ahead (two register sets) | 734 → 751 µs (all 8 shapes 1.5–2.8 % slower) | one step is enough once the weights stream contiguously; the second set only takes registers |
 | packed, the decode reads a forced copy of the loaded registers | 722 → 734 µs | 8 more instructions per step; without it the compiler alternates two register sets by itself |
+| A loaded in whole lines: 4 neighbouring lanes read the 4 quarters of one 64-byte line in one instruction (section 8) | 717 → 719–724 µs; 64 rows 643 → 667 µs | L1 lookups −34 %, but L2 requests unchanged (11.89 → 11.88 M): the L1 had already merged the two halves; the new pattern first tripled LDS bank conflicts (3.4 → 10.4 M cycles; fixed with an XOR of the LDS row) |
+| A rows past the expert's last row read as zeros (no memory traffic) instead of repeating the last row | within noise (722–724 µs) | the repeated rows hit the same line in the same instruction, so they cost almost nothing before either |
+| weights two steps ahead for tiles of ≤ 32 rows (whole step unpacked first, which their fewer accumulators allow) | 721 → 726 µs; 120b 848 → 861 µs; 16 rows 319 → 315 µs; with 48-row tiles too 752 / 893 µs | the stream of weights does not get faster with more in flight (`moe_stream_bench`: 1,116 → 1,148 GB/s), and unpacking everything first loses the mixing of unpacking and MFMAs |
+| "step-major" weight order (step p of all tiles of an expert side by side) | 16 rows 313 → 305 µs; real routings −0.3 to +0.9 %; 64 rows +1.4 % | the plain stream gets 15 % faster (1,116 → 1,290 GB/s), but in the kernel the stream is not the only wait |
+| scale bytes shifted out once per two steps instead of once per step | same machine code | the compiler had already merged the two one-byte shifts of a loop turn |
+| first quarter of the next step unpacked before the barrier | +3 to +6 % on every shape | the barrier then waits for every wave's weight loads (`s_waitcnt vmcnt(0)` before it) |
+| k-steps 2d and 2d+1 of a row side by side in LDS (one 16-byte LDS read for both) | +5 to +16 % | its A mapping put the two halves of a line in different halves of the wavefront: L2 requests 9.31 → 9.83 M |
+| MFMAs ordered row tile first | ±0.5 % | the compiler schedules both orders the same way |
+| more registers per thread (2 or 3 wavefronts per SIMD, 177 / 163 registers, one block per CU) | +11 to +15 % | half the wavefronts to hide waits with |
+| items handed out in fixed round-robin order instead of the queue | 717 → 823 µs (+15 %) | the biggest-first queue matters; without the per-step barrier on top: 821 µs, 16 rows 325 → 344 µs (the barrier is not what limits small tiles) |
+| wave priorities also for 48-row tiles | uniform 48-row mlp2 287 → 323 µs (+12 %); real routings ±0.5 % | see section 8; any MFMA-loop priority did it, a load priority alone +6.5 % |
+| wave priorities also for 64-row tiles | +1 % | these tiles are bound by the MFMA loop itself |
 
 ## Pitfalls
 
@@ -527,6 +679,20 @@ one configuration), `getp-csrc/bench/moe_torch_lib.py` (library yardstick, separ
   time would share the counter and mix up their work. The engine uses one stream per GPU.
 - **Rows past an expert's end** are loaded (copies of its last row) and computed, but never stored;
   columns past N load zeros (an address past the end of the buffer reads 0 without memory traffic).
+- **The order of the loads at an item's start matters for every loop turn.** The compiler counts
+  loads in flight across the loop's back edge. When a load issued before the loop (here a scale
+  load) is still counted as pending, the top of every loop turn waits for all but one load
+  (`vmcnt(1)`), including the next step's weights. Keep such loads first (`sched_barrier`) and look
+  at the `s_waitcnt` at the loop top.
+- **Ablation builds need the same check.** One "loads only" test build got an `s_waitcnt vmcnt(0)`
+  at the end of its loop, so its time said nothing about loading further ahead. Read its `.s` before
+  trusting its time.
+- **Microbenchmarks change with compile-time constants.** The same stream test measured 1,148 or
+  1,344 GB/s at 104 blocks depending on whether K was a constant or a kernel argument (the compiler
+  builds a different loop). Pass sizes at run time, as the kernel gets them.
+- **Uniform routings can mislead.** With every expert at 48 rows, mlp2 has 384 items for 208 blocks
+  (less than two rounds), and the time depends on how the last round is spread. A change can look
+  12 % worse there and neutral on real routings. Always measure both.
 
 ## Further reading
 

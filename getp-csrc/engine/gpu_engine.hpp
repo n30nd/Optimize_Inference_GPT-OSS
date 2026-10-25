@@ -285,7 +285,11 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
     w->Xg = gpu_alloc<float>(own, R * H);
     w->Gg = gpu_alloc<float>(own, R * c.intermediate_dim);
   } else {
-    w->t16 = gpu_alloc<bf16_t>(own, B * H);
+    // The gathering mlp1 reads its last 128-k step whole, so the last row
+    // runs up to 64 values past the end of t16. Those values meet zero
+    // weights; zeroing them keeps a NaN from appearing there.
+    w->t16 = gpu_alloc<bf16_t>(own, B * H + 64);
+    HIP_CHECK(hipMemset(w->t16 + B * H, 0, 64 * sizeof(bf16_t)));
     w->att16 = gpu_alloc<bf16_t>(own, B * ATT);
     w->Xg16 = gpu_alloc<bf16_t>(own, R * H);
     w->Gg16 = gpu_alloc<bf16_t>(own, R * c.intermediate_dim);
