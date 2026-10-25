@@ -88,8 +88,8 @@ struct GpuWorker {
   GpuWorker *peer = nullptr;    // the GCD holding the other experts, if split
   // Signals to the partner (ep_signal_kernel): flags[EP_ROUTED] reaches
   // sent[EP_ROUTED] when topk_e, topk_w and t of the layer may be read (and
-  // the partner's t16_peer is written), flags[EP_EXPERTS] when Zg, S and
-  // peer_row may. Fine-grained memory.
+  // the partner's t16 rows batch .. are written), flags[EP_EXPERTS] when Zg,
+  // S and peer_row may. Fine-grained memory.
   int *flags = nullptr;
   int sent[2] = {0, 0}; // signals of each kind queued so far
   std::vector<GpuLayer> layers;
@@ -102,10 +102,6 @@ struct GpuWorker {
   int *topk_e, *counts, *offsets, *row_pair, *own_row, *peer_row;
   bf16_t *t16, *att16, *Xg16, *Gg16; // fast path matrix-multiply inputs
   float *S = nullptr; // fast path, split experts: partial sums for the partner's tokens
-  // fast path, split experts: a copy of the partner's t16 (the MoE input),
-  // written into this GCD's memory by the partner's add_rmsnorm_bf16, so that
-  // the gather reads it here instead of across the link
-  bf16_t *t16_peer = nullptr;
   unsigned long long *amax_keys = nullptr; // fast path: one argmax key per row (logits unused)
   int *load_log = nullptr; // GPTOSS_EXPERT_LOAD: counts of every layer of the step
   std::vector<void *> weight_allocs, state_allocs;
@@ -303,7 +299,7 @@ static size_t gpu_state_bytes(const GpuWorker *w, int batch, int max_pos) {
                  + (w->exact ? B * (size_t)c.vocab_size * 4 : 0) // logits
                  + 2 * (size_t)max_pos * c.head_dim / 2 * 4; // cos, sin
   if (!w->exact && w->e_count < c.n_experts)
-    bytes += B * H * (4 + 2); // S, t16_peer
+    bytes += B * H * (4 + 2); // S, the partner's t16 rows
   return bytes + (B * K * 3 + R + w->e_count) * sizeof(int);
 }
 
@@ -360,11 +356,15 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
     w->Xg = gpu_alloc<float>(own, R * H);
     w->Gg = gpu_alloc<float>(own, R * c.intermediate_dim);
   } else {
-    // The gathering mlp1 reads its last 128-k step whole, so the last row
-    // runs up to 64 values past the end of t16. Those values meet zero
-    // weights; zeroing them keeps a NaN from appearing there.
-    w->t16 = gpu_alloc<bf16_t>(own, B * H + 64);
-    HIP_CHECK(hipMemset(w->t16 + B * H, 0, 64 * sizeof(bf16_t)));
+    // The gathering mlp1 reads its last 128-k step whole, so a row runs up
+    // to 64 values into the next one, and the last row past the end of t16.
+    // Those values meet zero weights; zeroing the buffer keeps a NaN from
+    // appearing there. With a partner, rows batch .. hold the partner's rows:
+    // its add_rmsnorm_bf16 writes them here, so that the expert multiply
+    // gathers all its input rows from one table, in this GCD's memory.
+    const size_t n16 = (w->e_count < c.n_experts ? 2 * B : B) * H + 64;
+    w->t16 = gpu_alloc<bf16_t>(own, n16);
+    HIP_CHECK(hipMemset(w->t16, 0, n16 * sizeof(bf16_t)));
     w->att16 = gpu_alloc<bf16_t>(own, B * ATT);
     w->Xg16 = gpu_alloc<bf16_t>(own, R * H);
     w->Gg16 = gpu_alloc<bf16_t>(own, R * c.intermediate_dim);
@@ -377,11 +377,8 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
     w->amax_keys = gpu_alloc<unsigned long long>(own, B);
     HIP_CHECK(hipMemset(w->amax_keys, 0, B * sizeof(unsigned long long)));
   }
-  w->t16_peer = nullptr;
-  if (!w->exact && w->e_count < c.n_experts) {
+  if (!w->exact && w->e_count < c.n_experts)
     w->S = gpu_alloc<float>(own, B * H);
-    w->t16_peer = gpu_alloc<bf16_t>(own, B * H);
-  }
   w->load_log = nullptr;
   if (getenv("GPTOSS_EXPERT_LOAD")) {
     w->load_log = gpu_alloc<int>(own, (size_t)c.n_layers * w->e_count);
@@ -444,6 +441,10 @@ static GpuWorker *gpu_create_worker(int device, const Transformer *t, bool exact
 }
 
 static void gpu_pair(GpuWorker *a, GpuWorker *b) {
+  if (!a->exact && a->batch != b->batch) { // t16 holds batch rows of the partner
+    fprintf(stderr, "gpu_pair: the fast path needs the same batch on both GCDs\n");
+    exit(EXIT_FAILURE);
+  }
   a->peer = b;
   b->peer = a;
   for (auto [x, y] : {std::make_pair(a, b), std::make_pair(b, a)}) {
@@ -497,11 +498,10 @@ static void layer_attention(GpuWorker *w, int l, int B, int pos) {
                           ATT, B, pos, g.window, cosv, sinv);
     gemm_bf16(s, w->att16, B, g.w_o, g.b_o, w->proj, H, ATT);
     // residual add and the MoE input norm in one pass; with a partner, the
-    // norm also goes to its t16_peer (it reads that copy in its gather, after
-    // our EP_ROUTED signal; we write the next layer's copy only after its
-    // EP_EXPERTS signal, i.e. after that gather)
+    // norm also goes to rows batch .. of the partner's t16
+    GpuWorker *p = w->peer;
     add_rmsnorm_bf16(s, B, w->x, w->proj, g.rms_ffn, w->t16, H,
-                     w->peer ? w->peer->t16_peer : nullptr);
+                     p ? p->t16 + (size_t)p->batch * H : nullptr);
     return;
   }
   add_inplace_kernel<<<((size_t)B * H + 255) / 256, 256, 0, s>>>(w->x, w->proj, (size_t)B * H);
@@ -539,40 +539,37 @@ static void layer_experts(GpuWorker *w, int l, int B, int B_peer) {
   GpuLayer &g = w->layers[l];
   hipStream_t s = w->stream;
   GpuWorker *p = w->peer;
-  moe_group_ep(s, w->topk_e, B * K, p ? p->topk_e : nullptr, B_peer * K, w->e_begin,
-               w->e_count, w->counts, w->offsets, w->row_pair, w->own_row, w->peer_row);
+  moe_group_ep(s, w->topk_e, B * K, p ? p->topk_e : nullptr, B_peer * K, w->batch * K,
+               w->e_begin, w->e_count, w->counts, w->offsets, w->row_pair, w->own_row,
+               w->peer_row);
   if (w->load_log)
     HIP_CHECK(hipMemcpyAsync(w->load_log + (size_t)l * w->e_count, w->counts,
                              w->e_count * sizeof(int), hipMemcpyDeviceToDevice, s));
   if (w->exact) {
     moe_gather_ep_kernel<float><<<R, 256, 0, s>>>(w->t, p ? p->t : nullptr, w->row_pair,
-                                                  w->offsets, w->e_count, K, w->Xg, H);
+                                                  w->offsets, w->e_count, K, w->batch, w->Xg,
+                                                  H);
     gemm_grouped_mxfp4_exact(s, w->Xg, w->offsets, B + B_peer, w->e_count, g.mlp1_blocks,
                              g.mlp1_scales, g.b_mlp1, w->Yg, 2 * I, H);
     swiglu_exact<<<((size_t)R * I + 255) / 256, 256, 0, s>>>(w->Yg, w->Gg, R, I, c.swiglu_limit);
     gemm_grouped_mxfp4_exact(s, w->Gg, w->offsets, B + B_peer, w->e_count, g.mlp2_blocks,
                              g.mlp2_scales, g.b_mlp2, w->Zg, H, I);
   } else {
-    // mlp1 and SwiGLU in one kernel when it applies (same bits as the three
-    // separate steps); without a partner it also gathers the rows itself.
+    // Gather, mlp1 and SwiGLU in one kernel when it applies (same bits as
+    // the three separate steps). Every input row is in t16: own tokens in
+    // rows 0 .., the partner's (written there by the partner) in rows batch ..
     const bool fused = moe_mfma_ok(w->e_count, 2 * I, H);
-    if (fused && !p) {
-      gemm_grouped_mxfp4_gather_swiglu(s, w->t16, w->row_pair, K, w->offsets, B,
+    if (fused) {
+      gemm_grouped_mxfp4_gather_swiglu(s, w->t16, w->row_pair, K, w->offsets, B + B_peer,
                                        w->e_count, g.mlp1_blocks, g.mlp1_scales,
                                        g.b_mlp1, w->Gg16, c.swiglu_limit, 2 * I, H);
     } else {
-      moe_gather_ep_bf16(s, R, w->t16, p ? w->t16_peer : nullptr, w->row_pair, w->offsets,
-                         w->e_count, K, w->Xg16, H);
-      if (fused) {
-        gemm_grouped_mxfp4_swiglu(s, w->Xg16, w->offsets, B + B_peer, w->e_count,
-                                  g.mlp1_blocks, g.mlp1_scales, g.b_mlp1, w->Gg16,
-                                  c.swiglu_limit, 2 * I, H);
-      } else {
-        gemm_grouped_mxfp4(s, w->Xg16, w->offsets, B + B_peer, w->e_count, g.mlp1_blocks,
-                           g.mlp1_scales, g.b_mlp1, w->Yg, 2 * I, H);
-        swiglu_bf16_kernel<<<((size_t)R * I + 255) / 256, 256, 0, s>>>(w->Yg, w->Gg16, R, I,
-                                                                       c.swiglu_limit);
-      }
+      moe_gather_ep_bf16(s, R, w->t16, w->t16 + (size_t)w->batch * H, w->row_pair,
+                         w->offsets, w->e_count, K, w->batch, w->Xg16, H);
+      gemm_grouped_mxfp4(s, w->Xg16, w->offsets, B + B_peer, w->e_count, g.mlp1_blocks,
+                         g.mlp1_scales, g.b_mlp1, w->Yg, 2 * I, H);
+      swiglu_bf16_kernel<<<((size_t)R * I + 255) / 256, 256, 0, s>>>(w->Yg, w->Gg16, R, I,
+                                                                     c.swiglu_limit);
     }
     gemm_grouped_mxfp4(s, w->Gg16, w->offsets, B + B_peer, w->e_count, g.mlp2_blocks,
                        g.mlp2_scales, g.b_mlp2, w->Zg, H, I);
@@ -641,9 +638,9 @@ static void ep_wait(GpuWorker *w, int kind) {
 // and its Zg, S and peer_row after EP_EXPERTS. A GCD overwrites those only in
 // the next layer, after it has waited for its partner's next signal, which
 // the partner sends after finishing these reads, so one copy of each buffer
-// is enough. The same holds for the partner's t16_peer, which a GCD writes
-// into the partner's memory on the fast path: written before EP_ROUTED, read
-// by the partner's gather, written again only after the partner's next
+// is enough. The same holds for the rows a GCD writes into the partner's t16
+// (rows batch ..) on the fast path: written before EP_ROUTED, read by the
+// partner's expert multiply, written again only after the partner's next
 // EP_EXPERTS. The host queues every signal before the wait that refers to it.
 static void gpu_step_group(GpuGroup &g, const int *B, int pos) {
   const int n = (int)g.m.size();

@@ -53,9 +53,12 @@ amount of expert work" below).
 *next* layer, and by then it has already waited for a signal its partner sends *after* it finished
 reading them. So the partner can never read half-overwritten data.
 
-**Pull, not push.** Each GCD *reads* its partner's buffers. The other team found that when a copy
-engine *wrote* into a GPU's memory, the receiving GPU's cache could still hold the old contents;
-reading directly avoided that. Our bit-exact test (below) would show any such stale read.
+**Pull on the exact path, push on the fast path.** On the exact path each GCD *reads* its
+partner's buffers. The other team found that when a copy engine *wrote* into a GPU's ordinary
+memory, the receiving GPU's cache could still hold the old contents; reading directly avoided that.
+Our bit-exact test (below) would show any such stale read. The fast path now *writes* the normed
+rows into the partner instead (doc 12 and section "One table for the expert input rows" below;
+`tests/peer_write_test.cpp` checks that the reader never sees stale rows).
 
 ## The numbers for our model
 
@@ -212,13 +215,102 @@ The output is the same with both (same hash), and the exact path is still bit-id
 Most of what is left is the cache work itself: before the partner may read, a GCD must write its
 L2 cache back to memory, and the reader must drop its stale copies.
 
+## One table for the expert input rows
+
+### The problem in plain words
+
+In every layer each GCD of a pair needs the normalized rows (the input of the experts) of those
+partner tokens that chose one of its experts. Doc 12 ("Activations sent once") made the norm write
+its rows straight into the partner's memory, but the receiving GCD still kept them in a separate
+buffer and ran a gather kernel that copied about 2,000 rows (11.8 MB per layer) from its own and
+that buffer into one block, which the expert multiply then read back. 20b never needed that copy:
+its first expert multiply reads every input row itself from the table of token rows.
+
+### An everyday comparison
+
+Two offices share work. Each office already drops its finished pages into the other office's
+in-tray. Now the pages go straight into the binder the specialist works from, instead of the in-tray
+first and then photocopied, together with the office's own pages, into a second binder.
+
+### The words
+
+- **link** — the connection between the two GCDs of one MI250. Measured: about 175 GB/s each way for
+  long transfers, 100–145 GB/s for the few MB of one layer; a GCD's own memory gives about 1,300 GB/s.
+- **push** — the GCD that produces data writes it straight into the partner's memory (instead of
+  the partner reading, **pulling**, it).
+- **pair** — one token's choice of one expert (4 per token); the grouping sorts pairs by expert.
+
+### How it works
+
+1. **One table.** On a split GCD `t16` has two halves: its own tokens in rows 0 .. 511 and the
+   partner's from row 512 (`batch`) on. The partner's norm writes its rows straight into that second
+   half. A partner pair is numbered `batch × 4 + p` (it used to be `-(p + 1)`), so "pair number / 4"
+   is always the token's row in the table, on both paths.
+2. **The expert multiply gathers its own rows.** With every row in one table, 120b's first expert
+   multiply uses the same gathering mode as 20b (`gemm_grouped_mxfp4_gather_swiglu`, same bits as
+   gather + multiply). The gather kernel and its 11.8 MB block are gone.
+
+**Why the signals still protect the data.** The partner reads the second half after this GCD's
+"routed" signal, in its expert multiply, before its own "experts" signal; this GCD writes it again
+only in the next layer's norm, which comes after it has waited for that "experts" signal.
+
+### The numbers
+
+One GCD pair, 1,024 requests, 256 steps, rocprofv3 (AMD's profiler), per call (first / second GCD):
+
+| 120b, per layer | before | after |
+|---|---:|---:|
+| gather of the expert inputs | 18.7 / 18.3 µs | — |
+| first expert multiply (now also gathers its rows) | 929.1 / 901.5 µs | +2.8 / +2.9 µs |
+| norm, top-4, grouping, partial sums, combine | | unchanged |
+
+Full runs, official input (4,096 requests), 8 GCDs of mi250-03, old and new build alternated, two
+runs each; the output is the same (same hash, `973e97c40a85`):
+
+| | before | after |
+|---|---:|---:|
+| gpt-oss-120b | 45,792 / 45,762 tok/s | **46,081 / 46,030 tok/s (+0.6 %)** |
+
+The 20b path does not change. The exact path (`GPTOSS_EXACT=1`), which still reads the partner's
+buffers, uses the new pair numbering too and stays bit-identical to the CPU (`EP=2
+tests/gpu_vs_cpu.cpp`, 4 prompts × 16 steps, 120b and 20b).
+
+### What did not help
+
+Each measured on top of the change above (full runs: 8 GCDs, alternated, 2 runs each):
+
+- **The table in fine-grained memory** (memory both GCDs always see up to date): the partner's
+  writes into it waited for the link inside the norm kernel, 31 → 38 µs. `tests/peer_write_test.cpp`
+  shows ordinary memory never served a stale row either, so the table stays ordinary.
+- **Pushing the expert choices as well** (top-4 writes them into the partner, the grouping and the
+  partial sums read them locally): top-4 +1.5 µs, the grouping no faster (it reads the 16 KB once,
+  all loads together). Together with the fine-grained table: +0.29 % instead of +0.6 %.
+- **Pushing the partial sums** (into the partner's fine-grained `S`, the combine reads locally): the
+  combine 61 → 30 µs, the partial-sum kernel 18 → 49 µs (the same 5.9 MB still cross the link, now
+  inside it); full run 45,858 against 45,931 tok/s without it.
+- **Raising the signals from the kernels that wrote the data** (the last wave of the top-4 and of the
+  partial-sum kernel raises the counter): two 6.8 µs signal kernels per layer gone, 3–5 µs more in
+  those two kernels; full run +0.02 %, within the noise.
+- **Before doc 12's push, on the older kernels:** copying the partner's rows once in a pull kernel
+  took 28–33 µs (fresh data over the link is slower than the link's peak); with the grouping in the
+  same kernel reading the partner's choices over the link it took 51 µs, because those small reads
+  waited behind the copy's traffic. Pushing the rows from a second stream while the router multiply
+  runs slowed that multiply from 33 to 45–50 µs.
+
+### Pitfalls
+
+- A push is not free: writing into the partner runs at the link's speed and the writing kernel only
+  ends when its writes have arrived. It pays where it replaces slower reads (many small ones, or the
+  same rows read twice).
+- `wall_clock64()` counts at 25 MHz on MI250 (`hipDeviceAttributeWallClockRate`), not 100 MHz.
+
 ## Where it is in our code
 
 - `getp-csrc/engine/gpu_engine.hpp`: `GpuGroup`, `gpu_pair()` (peer access), `gpu_step_group()` (the
   four parts per layer and the two waits), `gpu_group_size()` (2 when the weights would fill more
-  than 60 % of a GCD; `GPTOSS_EP` overrides).
-- `getp-csrc/kernels/moe_ep.hpp`: grouping rows from both GCDs, gathering them, combining outputs from
-  both GCDs; `ep_signal_kernel` / `ep_wait_kernel`.
+  than 60 % of a GCD; `GPTOSS_EP` overrides); `t16` with the partner's rows from row `batch` on.
+- `getp-csrc/kernels/moe_ep.hpp`: grouping rows from both GCDs (`moe_group_ep`), gathering them,
+  combining outputs from both GCDs; `ep_signal_kernel` / `ep_wait_kernel`.
 - `getp-csrc/engine/ep_split_120b.hpp` (made by `tools/ep_split.py`): which experts each GCD holds;
   `gpu_expert_order()` and the expert upload in `gpu_upload_weights()` use it;
   `tools/make_calib_prompts.py` writes the calibration prompts.

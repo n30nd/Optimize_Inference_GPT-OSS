@@ -358,12 +358,12 @@ static void bench_group() {
       moe_count_ep_kernel_ref<<<cs.e_count, MOE_GROUP_THREADS>>>(
           d_own, NP, cs.peer ? d_peer : nullptr, n_peer, cs.e_begin, o[0][0]);
       moe_place_ep_kernel_ref<<<cs.e_count, MOE_GROUP_THREADS>>>(
-          d_own, NP, cs.peer ? d_peer : nullptr, n_peer, cs.e_begin, cs.e_count, o[0][0],
+          d_own, NP, cs.peer ? d_peer : nullptr, n_peer, NP, cs.e_begin, cs.e_count, o[0][0],
           o[0][1], o[0][2], o[0][3], o[0][4]);
     };
     auto run_new = [&] {
-      moe_group_ep(0, d_own, NP, cs.peer ? d_peer : nullptr, n_peer, cs.e_begin, cs.e_count,
-                   o[1][0], o[1][1], o[1][2], o[1][3], o[1][4]);
+      moe_group_ep(0, d_own, NP, cs.peer ? d_peer : nullptr, n_peer, NP, cs.e_begin,
+                   cs.e_count, o[1][0], o[1][1], o[1][2], o[1][3], o[1][4]);
     };
     run_old();
     run_new();

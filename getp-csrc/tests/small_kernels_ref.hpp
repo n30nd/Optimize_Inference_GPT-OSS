@@ -110,7 +110,7 @@ __global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_count_ep_kernel_ref(
 }
 
 __device__ inline void moe_place_pairs_ref(const int *__restrict__ topk, int n, int ge,
-                                       bool partner, int *__restrict__ row_pair,
+                                       int pair0, int *__restrict__ row_pair,
                                        int *__restrict__ rows, int *base) {
   __shared__ int wave_count[MOE_GROUP_THREADS / 64];
   const int lane = threadIdx.x % 64, wave = threadIdx.x / 64;
@@ -126,7 +126,7 @@ __device__ inline void moe_place_pairs_ref(const int *__restrict__ topk, int n, 
       before += wave_count[w];
     if (hit) {
       const int row = before + __popcll(mask & ((1ull << lane) - 1));
-      row_pair[row] = partner ? -(p + 1) : p;
+      row_pair[row] = pair0 + p;
       rows[p] = row;
     }
     __syncthreads();
@@ -139,7 +139,7 @@ __device__ inline void moe_place_pairs_ref(const int *__restrict__ topk, int n, 
 
 __global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_place_ep_kernel_ref(
     const int *__restrict__ topk_own, int n_own, const int *__restrict__ topk_peer,
-    int n_peer, int e_begin, int e_count, const int *__restrict__ counts,
+    int n_peer, int peer_pair0, int e_begin, int e_count, const int *__restrict__ counts,
     int *__restrict__ offsets, int *__restrict__ row_pair, int *__restrict__ own_row,
     int *__restrict__ peer_row) {
   __shared__ int base;
@@ -164,8 +164,8 @@ __global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_place_ep_kernel_ref(
       peer_row[p] = -1;
   }
   __syncthreads();
-  moe_place_pairs_ref(topk_own, n_own, ge, false, row_pair, own_row, &base);
-  moe_place_pairs_ref(topk_peer, n_peer, ge, true, row_pair, peer_row, &base);
+  moe_place_pairs_ref(topk_own, n_own, ge, 0, row_pair, own_row, &base);
+  moe_place_pairs_ref(topk_peer, n_peer, ge, peer_pair0, row_pair, peer_row, &base);
 }
 
 __global__ __launch_bounds__(256) void moe_combine_rmsnorm_kernel_ref(

@@ -203,14 +203,17 @@ def cmd_check(args):
 
 
 def trace_phases(path, layers):
-    """Per agent: the expert phase (start of moe_count_ep_kernel to the end of
-    the moe_partial_ep_kernel after it), in us, shape (steps, layers)."""
+    """Per agent: the expert phase (start of the grouping kernel,
+    moe_group_ep_kernel or the older moe_count_ep_kernel, to the end of the
+    moe_partial_ep_kernel after it), in us, shape (steps, layers)."""
     rows = {}
     with open(path) as f:
         r = csv.DictReader(f)
         for d in r:
             name = d["Kernel_Name"]
-            if name.startswith("moe_count_ep_kernel"):
+            if name.startswith("void "):  # template kernels, e.g. moe_group_ep_kernel<16>
+                name = name[5:]
+            if name.startswith(("moe_group_ep_kernel", "moe_count_ep_kernel")):
                 k = 0
             elif name.startswith("moe_partial_ep_kernel"):
                 k = 1

@@ -246,10 +246,12 @@ static void test_group(int tok_own, int tok_peer, int k, int E, int e_begin, int
   const int *pp = n_peer ? peer.d : nullptr;
   moe_count_ep_kernel_ref<<<e_count, MOE_GROUP_THREADS>>>(own.d, n_own, pp, n_peer, e_begin,
                                                           c0.d);
-  moe_place_ep_kernel_ref<<<e_count, MOE_GROUP_THREADS>>>(own.d, n_own, pp, n_peer, e_begin,
-                                                          e_count, c0.d, f0.d, rp0.d, or0.d,
-                                                          pr0.d);
-  moe_group_ep(0, own.d, n_own, pp, n_peer, e_begin, e_count, c1.d, f1.d, rp1.d, or1.d, pr1.d);
+  // partner pairs numbered from n_own on: the own tokens fill the table's first rows
+  moe_place_ep_kernel_ref<<<e_count, MOE_GROUP_THREADS>>>(own.d, n_own, pp, n_peer, n_own,
+                                                          e_begin, e_count, c0.d, f0.d, rp0.d,
+                                                          or0.d, pr0.d);
+  moe_group_ep(0, own.d, n_own, pp, n_peer, n_own, e_begin, e_count, c1.d, f1.d, rp1.d, or1.d,
+               pr1.d);
   char name[128];
   snprintf(name, sizeof name, "moe_group_ep %d+%d tokens x %d, experts %d..%d of %d", tok_own,
            tok_peer, k, e_begin, e_begin + e_count - 1, E);
@@ -307,9 +309,9 @@ static void test_gather_partial(int B, int B_peer, int k, int H) {
   Buf<int> cnt(e_count), off(e_count + 1), rp(R), orow(n_own), prow(n_peer);
   moe_count_ep_kernel_ref<<<e_count, MOE_GROUP_THREADS>>>(own.d, n_own, peer.d, n_peer, e_begin,
                                                           cnt.d);
-  moe_place_ep_kernel_ref<<<e_count, MOE_GROUP_THREADS>>>(own.d, n_own, peer.d, n_peer, e_begin,
-                                                          e_count, cnt.d, off.d, rp.d, orow.d,
-                                                          prow.d);
+  moe_place_ep_kernel_ref<<<e_count, MOE_GROUP_THREADS>>>(own.d, n_own, peer.d, n_peer, n_own,
+                                                          e_begin, e_count, cnt.d, off.d, rp.d,
+                                                          orow.d, prow.d);
   // gather of bf16 rows from both GCDs' activations
   std::vector<bf16_t> xo((size_t)B * H), xp((size_t)B_peer * H);
   for (auto &v : xo)
@@ -321,8 +323,8 @@ static void test_gather_partial(int B, int B_peer, int k, int H) {
   dxp.put(xp);
   g0.fill(0x11);
   g1.fill(0x11);
-  moe_gather_ep_kernel<bf16_t><<<R, 256>>>(dxo.d, dxp.d, rp.d, off.d, e_count, k, g0.d, H);
-  moe_gather_ep_bf16(0, R, dxo.d, dxp.d, rp.d, off.d, e_count, k, g1.d, H);
+  moe_gather_ep_kernel<bf16_t><<<R, 256>>>(dxo.d, dxp.d, rp.d, off.d, e_count, k, B, g0.d, H);
+  moe_gather_ep_bf16(0, R, dxo.d, dxp.d, rp.d, off.d, e_count, k, B, g1.d, H);
   char name[128];
   snprintf(name, sizeof name, "moe_gather_ep_bf16 %d+%d tokens x %d, H=%d", B, B_peer, k, H);
   report(name, same(g0, g1));

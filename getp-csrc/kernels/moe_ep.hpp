@@ -1,11 +1,16 @@
 // Mixture-of-experts steps when a layer's experts are split between two GCDs
 // (expert parallelism). Each GCD routes its own tokens; each GCD runs only its
 // own experts, on the rows from both GCDs' tokens that chose them; each GCD
-// then adds up its own tokens' 4 expert outputs, reading the rows computed by
-// its partner straight from the partner's memory.
+// then adds up its own tokens' 4 expert outputs. The exact path reads the
+// partner's routing, rows and expert outputs straight from the partner's
+// memory; on the fast path the partner writes its normed rows into this
+// GCD's memory, and its expert outputs arrive as one partial sum per token.
 //
 // Pair indices: p = token * k + choice. A row of the grouped input refers to
-// an own pair as p and to a partner pair as -(p + 1).
+// an own pair as p and to a partner pair as cap * k + p, cap = the GCD's
+// batch capacity: then row_pair[row] / k is the token's row in one table
+// that holds this GCD's tokens in rows 0 .. cap-1 and the partner's from row
+// cap on (the fast path keeps such a table of normed rows, t16).
 // With no partner (n_peer = 0, e_begin = 0, e_count = all experts) these do
 // the same as moe_group_kernel / moe_gather_kernel / moe_combine_exact.
 #pragma once
@@ -71,9 +76,9 @@ __global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_count_ep_kernel(
 }
 
 // Writes the rows of the pairs in topk[0..n) that chose expert `ge`, in pair
-// order, from row *base on (partner pairs are stored in row_pair as -(p + 1)).
+// order, from row *base on (row_pair gets pair0 + p).
 __device__ inline void moe_place_pairs(const int *__restrict__ topk, int n, int ge,
-                                       bool partner, int *__restrict__ row_pair,
+                                       int pair0, int *__restrict__ row_pair,
                                        int *__restrict__ rows, int *base) {
   __shared__ int wave_count[MOE_GROUP_THREADS / 64];
   const int lane = threadIdx.x % 64, wave = threadIdx.x / 64;
@@ -89,7 +94,7 @@ __device__ inline void moe_place_pairs(const int *__restrict__ topk, int n, int 
       before += wave_count[w];
     if (hit) {
       const int row = before + __popcll(mask & ((1ull << lane) - 1));
-      row_pair[row] = partner ? -(p + 1) : p;
+      row_pair[row] = pair0 + p;
       rows[p] = row;
     }
     __syncthreads();
@@ -104,7 +109,7 @@ __device__ inline void moe_place_pairs(const int *__restrict__ topk, int n, int 
 // block also marks its share of the pairs whose expert another GCD holds.
 __global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_place_ep_kernel(
     const int *__restrict__ topk_own, int n_own, const int *__restrict__ topk_peer,
-    int n_peer, int e_begin, int e_count, const int *__restrict__ counts,
+    int n_peer, int peer_pair0, int e_begin, int e_count, const int *__restrict__ counts,
     int *__restrict__ offsets, int *__restrict__ row_pair, int *__restrict__ own_row,
     int *__restrict__ peer_row) {
   __shared__ int base;
@@ -129,8 +134,8 @@ __global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_place_ep_kernel(
       peer_row[p] = -1;
   }
   __syncthreads();
-  moe_place_pairs(topk_own, n_own, ge, false, row_pair, own_row, &base);
-  moe_place_pairs(topk_peer, n_peer, ge, true, row_pair, peer_row, &base);
+  moe_place_pairs(topk_own, n_own, ge, 0, row_pair, own_row, &base);
+  moe_place_pairs(topk_peer, n_peer, ge, peer_pair0, row_pair, peer_row, &base);
 }
 
 // moe_count_ep_kernel and moe_place_ep_kernel in one kernel, with the same
@@ -145,7 +150,7 @@ __global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_place_ep_kernel(
 template <int S>
 __global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_group_ep_kernel(
     const int *__restrict__ topk_own, int n_own, const int *__restrict__ topk_peer,
-    int n_peer, int e_begin, int e_count, int *__restrict__ counts,
+    int n_peer, int peer_pair0, int e_begin, int e_count, int *__restrict__ counts,
     int *__restrict__ offsets, int *__restrict__ row_pair, int *__restrict__ own_row,
     int *__restrict__ peer_row) {
   constexpr int NW = MOE_GROUP_THREADS / 64;
@@ -199,7 +204,7 @@ __global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_group_ep_kernel(
       row_pair[row] = i;
       own_row[i] = row;
     } else {
-      row_pair[row] = -(i - n_own + 1);
+      row_pair[row] = peer_pair0 + (i - n_own);
       peer_row[i - n_own] = row;
     }
   }
@@ -225,15 +230,16 @@ __global__ __launch_bounds__(MOE_GROUP_THREADS) void moe_group_ep_kernel(
 
 // Groups the pairs as moe_count_ep_kernel + moe_place_ep_kernel do, with
 // moe_group_ep_kernel when the pairs fit (at most 32 per thread).
+// peer_pair0 = cap * k (see the pair indices above).
 static void moe_group_ep(hipStream_t s, const int *topk_own, int n_own, const int *topk_peer,
-                         int n_peer, int e_begin, int e_count, int *counts, int *offsets,
-                         int *row_pair, int *own_row, int *peer_row) {
+                         int n_peer, int peer_pair0, int e_begin, int e_count, int *counts,
+                         int *offsets, int *row_pair, int *own_row, int *peer_row) {
   const int per = (n_own + n_peer + MOE_GROUP_THREADS - 1) / MOE_GROUP_THREADS;
   const bool by4 = n_own % 4 == 0 && n_peer % 4 == 0;
 #define MOE_GROUP_CASE(S)                                                                    \
   moe_group_ep_kernel<S><<<e_count, MOE_GROUP_THREADS, 0, s>>>(                              \
-      topk_own, n_own, topk_peer, n_peer, e_begin, e_count, counts, offsets, row_pair,        \
-      own_row, peer_row)
+      topk_own, n_own, topk_peer, n_peer, peer_pair0, e_begin, e_count, counts, offsets,      \
+      row_pair, own_row, peer_row)
   if (by4 && per <= 8)
     MOE_GROUP_CASE(8); // gpt-oss-20b: 512 tokens x 4 choices
   else if (by4 && per <= 16)
@@ -244,8 +250,8 @@ static void moe_group_ep(hipStream_t s, const int *topk_own, int n_own, const in
     moe_count_ep_kernel<<<e_count, MOE_GROUP_THREADS, 0, s>>>(topk_own, n_own, topk_peer,
                                                                n_peer, e_begin, counts);
     moe_place_ep_kernel<<<e_count, MOE_GROUP_THREADS, 0, s>>>(
-        topk_own, n_own, topk_peer, n_peer, e_begin, e_count, counts, offsets, row_pair,
-        own_row, peer_row);
+        topk_own, n_own, topk_peer, n_peer, peer_pair0, e_begin, e_count, counts, offsets,
+        row_pair, own_row, peer_row);
   }
 #undef MOE_GROUP_CASE
 }
@@ -258,14 +264,13 @@ __global__ void moe_gather_ep_kernel(const T *__restrict__ x_own,
                                      const T *__restrict__ x_peer,
                                      const int *__restrict__ row_pair,
                                      const int *__restrict__ offsets,
-                                     int e_count, int k, T *__restrict__ Xg,
+                                     int e_count, int k, int cap, T *__restrict__ Xg,
                                      int H) {
   const int row = blockIdx.x;
   if (row >= offsets[e_count])
     return;
-  const int p = row_pair[row];
-  const T *src = p >= 0 ? x_own + (size_t)(p / k) * H
-                        : x_peer + (size_t)((-p - 1) / k) * H;
+  const int tok = row_pair[row] / k;
+  const T *src = tok < cap ? x_own + (size_t)tok * H : x_peer + (size_t)(tok - cap) * H;
   for (int i = threadIdx.x; i < H; i += blockDim.x)
     Xg[(size_t)row * H + i] = src[i];
 }
@@ -333,13 +338,13 @@ template <int NV>
 __global__ __launch_bounds__(256) void moe_gather_ep_bf16_kernel(
     const bf16_t *__restrict__ x_own, const bf16_t *__restrict__ x_peer,
     const int *__restrict__ row_pair, const int *__restrict__ offsets, int e_count, int k,
-    bf16_t *__restrict__ Xg, int H) {
+    int cap, bf16_t *__restrict__ Xg, int H) {
   const int row = blockIdx.x, nv = H / 8;
-  const int n_rows = offsets[e_count], p = row_pair[row]; // loaded together
+  const int n_rows = offsets[e_count], tok = row_pair[row] / k; // loaded together
   if (row >= n_rows)
     return;
-  const uint4 *src = (const uint4 *)(p >= 0 ? x_own + (size_t)(p / k) * H
-                                            : x_peer + (size_t)((-p - 1) / k) * H);
+  const uint4 *src = (const uint4 *)(tok < cap ? x_own + (size_t)tok * H
+                                               : x_peer + (size_t)(tok - cap) * H);
   uint4 v[NV];
 #pragma unroll
   for (int c = 0; c < NV; c++)
@@ -353,13 +358,13 @@ __global__ __launch_bounds__(256) void moe_gather_ep_bf16_kernel(
 
 static void moe_gather_ep_bf16(hipStream_t s, int R, const bf16_t *x_own,
                                const bf16_t *x_peer, const int *row_pair, const int *offsets,
-                               int e_count, int k, bf16_t *Xg, int H) {
+                               int e_count, int k, int cap, bf16_t *Xg, int H) {
   if (H % 8 == 0 && H / 8 <= 2 * 256) // gpt-oss: H = 2880, 360 vectors
     moe_gather_ep_bf16_kernel<2><<<R, 256, 0, s>>>(x_own, x_peer, row_pair, offsets, e_count,
-                                                   k, Xg, H);
+                                                   k, cap, Xg, H);
   else
     moe_gather_ep_kernel<bf16_t><<<R, 256, 0, s>>>(x_own, x_peer, row_pair, offsets, e_count,
-                                                   k, Xg, H);
+                                                   k, cap, Xg, H);
 }
 
 // Fast path with a partner: for each of the partner's tokens, the weighted
