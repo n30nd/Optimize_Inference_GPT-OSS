@@ -86,6 +86,7 @@ struct GpuWorker {
   int *topk_e, *counts, *offsets, *row_pair, *own_row, *peer_row;
   bf16_t *t16, *att16, *Xg16, *Gg16; // fast path matrix-multiply inputs
   float *S = nullptr; // fast path, split experts: partial sums for the partner's tokens
+  unsigned long long *amax_keys = nullptr; // fast path: one argmax key per row (logits unused)
   std::vector<void *> weight_allocs, state_allocs;
 };
 
@@ -225,7 +226,7 @@ static size_t gpu_state_bytes(const GpuWorker *w, int batch, int max_pos) {
                  + B * (H + ATT) * act                     // t att
                  + R * (2 * c.intermediate_dim + H) * 4    // Yg Zg
                  + R * (H + c.intermediate_dim) * act      // Xg Gg
-                 + B * (size_t)c.vocab_size * 4            // logits
+                 + (w->exact ? B * (size_t)c.vocab_size * 4 : 0) // logits
                  + 2 * (size_t)max_pos * c.head_dim / 2 * 4; // cos, sin
   if (!w->exact && w->e_count < c.n_experts)
     bytes += B * H * 4; // S
@@ -294,7 +295,14 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
     w->Xg16 = gpu_alloc<bf16_t>(own, R * H);
     w->Gg16 = gpu_alloc<bf16_t>(own, R * c.intermediate_dim);
   }
-  w->logits = gpu_alloc<float>(own, B * c.vocab_size);
+  w->logits = nullptr;
+  w->amax_keys = nullptr;
+  if (w->exact) {
+    w->logits = gpu_alloc<float>(own, B * c.vocab_size);
+  } else {
+    w->amax_keys = gpu_alloc<unsigned long long>(own, B);
+    HIP_CHECK(hipMemset(w->amax_keys, 0, B * sizeof(unsigned long long)));
+  }
   if (!w->exact && w->e_count < c.n_experts)
     w->S = gpu_alloc<float>(own, B * H);
 
@@ -522,10 +530,10 @@ static void step_logits(GpuWorker *w, int B) {
   if (w->exact) {
     rmsnorm_exact<<<B, 256, H * sizeof(float), s>>>(w->x, w->rms_out, w->t, H);
     gemm_bf16_exact(s, w->t, B, w->unemb, nullptr, w->logits, V, H);
+    argmax_kernel<<<B, 256, 0, s>>>(w->logits, V, w->next);
   } else { // t16 = final RMSNorm(x) from the last layer's combine
-    gemm_bf16(s, w->t16, B, w->unemb, nullptr, w->logits, V, H);
+    gemm_bf16_argmax(s, w->t16, B, w->unemb, nullptr, V, H, w->amax_keys, w->next);
   }
-  argmax_kernel<<<B, 256, 0, s>>>(w->logits, V, w->next);
 }
 
 // One decode step for every GCD of a group at position `pos`: member i has

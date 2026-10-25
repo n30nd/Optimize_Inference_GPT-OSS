@@ -15,6 +15,8 @@ Four simple ideas fixed most of it:
    instead of one thread.
 3. **Sort in parallel**: one block per expert instead of one thread per expert.
 4. **Skip work nobody needs**: requests that already ended do not need their experts computed.
+5. **Keep only what the next step reads**: the LM head's 201,088 scores per request are only
+   used to pick the largest one, so the multiply picks it itself and never writes the scores.
 
 ## An everyday comparison
 
@@ -29,6 +31,11 @@ among a whole team finishes sooner than one person doing it while the team watch
 - **reduction** — combining many values into one (a sum, or the largest value); within a wavefront
   this is done with *shuffles*, threads reading each other's registers directly.
 - **residual stream** — the 2,880 numbers per request that every layer adds its result into.
+- **LM head** (language-model head) — the last multiply: it gives every word of the vocabulary
+  (201,088 of them) a score; greedy decoding then takes the word with the highest score (*argmax*).
+- **epilogue** — the end of a matrix-multiply kernel, where the finished results leave the registers.
+- **atomic maximum** (`atomicMax`) — a memory operation that replaces a value with a larger one in one
+  indivisible step, so many blocks can update the same place without losing an update.
 
 ## How it works
 
@@ -60,6 +67,23 @@ hit the end token). Their rows are still in the batch, but the router now gives 
 "none", so the expert multiplies, which are half of each step, skip them. 3.1 % of the row-steps of
 a 4,096-request run belong to finished requests.
 
+**5. The LM head picks the next token.** Before, the LM head wrote 512 × 201,088 scores in fp32
+(412 MB) per step, and a second kernel read them all back only to find each row's largest. Now the
+epilogue of the LM-head multiply does the search:
+
+```
+before:  multiply ─► write 412 MB of scores ─► argmax reads 412 MB ─► 512 token ids
+after:   multiply ─► [each tile: best score of each of its rows] ─► atomicMax on 512 keys ─► ids
+```
+
+Each block's tile covers 128 rows and 128 columns. It puts its scores through shared memory 16 rows
+at a time, so that every thread can scan a quarter of one row; lane shuffles and shared memory then
+combine the quarters and the waves. The block ends with one atomic maximum per row on a 64-bit *key*.
+The key holds the score in its high half, rearranged so that bigger scores give bigger integers,
+and the column with its bits flipped in its low half. A bigger key is then exactly "higher score,
+or the same score in a lower column": the same choice argmax_kernel makes. A maximum gives the same
+answer in any order, so the result does not depend on which block finishes first.
+
 ## The numbers for our model
 
 | Change | Kernel time | End to end (8 GCDs, 4,096 requests) |
@@ -69,6 +93,7 @@ a 4,096-request run belong to finished requests.
 | Grouping, block per expert | 318 → 14.4 µs per layer | (part of a +37 % row) |
 | Finished requests skip the experts | — | 20b +0.8 %, 120b +1.2 % |
 | Adds fused with the norms | 2 passes over the residual stream fewer per layer | 20b +0.9 %, 120b +0.3 % |
+| LM head picks the token | 4,897 + 435 → 4,510 + 6 µs (B=512); 9,719 + 865 → 9,223 + 6 µs (B=1024) | see the log |
 
 Every row above was checked to leave the output bits unchanged (same output hash).
 
@@ -79,12 +104,17 @@ Every row above was checked to leave the output bits unchanged (same output hash
   `moe_combine_rmsnorm_kernel`, `moe_combine_partial_rmsnorm_kernel`.
 - `getp-csrc/kernels/moe.hpp` — `router_topk_wave_kernel` (expert −1 for finished requests).
 - `getp-csrc/kernels/fast_moe_gemm.hpp` — `gemm_grouped_mxfp4_swiglu`, `gemm_grouped_mxfp4_gather_swiglu`.
+- `getp-csrc/kernels/fast_gemm.hpp` — `argmax_key`, `TileGemm::argmax_rows`, `gemm_argmax_kernel`,
+  `gemm_bf16_argmax`; checked by `getp-csrc/tests/lm_head_argmax_test.cpp` (same token as the
+  unfused pair on every row, planted ties included).
 - `getp-csrc/engine/gpu_engine.hpp` — `layer_attention`, `layer_route`, `layer_combine`, and the
   done flags in `gpu_run_wave`.
 
 ## Pitfalls
 
 - A merged kernel must keep each thread's element order, or the sums change in their last bit.
+- A fused argmax must break ties exactly like the old one (lowest column), treat -0 and +0 as equal
+  and never pick a NaN, or a rare tie changes a token and every token after it.
 - Our first guess at "the GPU is idle 7.5 % of the time" was wrong: the idle time was the weight
   upload before inference, which is not timed. Measure only the timed part.
 

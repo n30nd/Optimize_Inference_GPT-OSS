@@ -84,6 +84,18 @@ __device__ inline void set_flag(unsigned *flag, unsigned value) {
     __hip_atomic_store(flag, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
 }
 
+// Key of output value x in column n for a greedy argmax: keys compare like
+// argmax_kernel's choice (larger x first, then lower n; -0 equals +0), so the
+// largest key of a row names the column it picks. NaN gives 0, which loses
+// to every other key, as argmax_kernel never picks a NaN.
+__device__ inline unsigned long long argmax_key(float x, int n) {
+  if (x != x)
+    return 0;
+  unsigned u = x == 0.0f ? 0u : __float_as_uint(x);
+  u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  return ((unsigned long long)u << 32) | (unsigned)~n;
+}
+
 //                  K -->
 //        A tile  +--------+        W tile (BN x BK, rows = output columns)
 //   BM   rows of |  sA    |        +--------+
@@ -298,6 +310,67 @@ struct TileGemm {
         }
     }
   }
+
+  // For each row m < M of the tile: atomicMax(keys[m], argmax_key(value, n))
+  // over the tile's columns n < N, where value = acc + bv is what store_c
+  // would have written. The rows go through LDS 16 at a time, so that each
+  // lane can scan a quarter of one row's columns; then shuffles combine the
+  // quarters, and LDS the WAVES_N waves that share the rows.
+  static constexpr int ARG_STRIDE = WN + 1; // floats per LDS row, no bank conflicts
+  static_assert(NT / 64 * 16 * ARG_STRIDE * 4 <= (int)sizeof(Smem) &&
+                    WAVES_N * BM * 8 <= (int)sizeof(Smem),
+                "argmax scratch fits in the tile buffers");
+  __device__ static void argmax_rows(Smem &sm, int M, int N, int m0, int n0,
+                                     const float (&bv)[TN], Acc &acc,
+                                     unsigned long long *__restrict__ keys) {
+    const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
+    const int wm = wave % WAVES_M, wn = wave / WAVES_M;
+    float *rows = (float *)&sm + wave * 16 * ARG_STRIDE;
+    unsigned long long best[TM][2];
+    __syncthreads(); // every wave has read its last operands from LDS
+#pragma unroll
+    for (int i = 0; i < TM; i++)
+#pragma unroll
+      for (int h = 0; h < 2; h++) { // rows 16 h .. 16 h + 15 of row tile i
+#pragma unroll
+        for (int j = 0; j < TN; j++)
+#pragma unroll
+          for (int v = 8 * h; v < 8 * h + 8; v++) {
+            const int r = 8 * (v / 4 - 2 * h) + 4 * (lane >> 5) + v % 4;
+            rows[r * ARG_STRIDE + j * 32 + (lane & 31)] = acc[i][j][v] + bv[j];
+          }
+        __syncthreads();
+        const int r = lane & 15, q = lane >> 4;
+        unsigned long long b = 0;
+#pragma unroll
+        for (int k = 0; k < WN / 4; k++) {
+          const int c = q * (WN / 4) + k, n = n0 + wn * WN + c;
+          if (n < N)
+            b = max(b, argmax_key(rows[r * ARG_STRIDE + c], n));
+        }
+        b = max(b, (unsigned long long)__shfl_xor((long long)b, 16));
+        b = max(b, (unsigned long long)__shfl_xor((long long)b, 32));
+        best[i][h] = b;
+        __syncthreads();
+      }
+    unsigned long long *part = (unsigned long long *)&sm; // [WAVES_N][BM]
+    if (lane < 16)
+#pragma unroll
+      for (int i = 0; i < TM; i++)
+#pragma unroll
+        for (int h = 0; h < 2; h++)
+          part[wn * BM + wm * WM + i * 32 + h * 16 + lane] = best[i][h];
+    __syncthreads();
+    for (int r = threadIdx.x; r < BM; r += NT) {
+      if (m0 + r >= M)
+        break;
+      unsigned long long b = part[r];
+#pragma unroll
+      for (int w = 1; w < WAVES_N; w++)
+        b = max(b, part[w * BM + r]);
+      atomicMax(&keys[m0 + r], b);
+    }
+  }
 };
 
 // One flag per output tile for split K (one copy per GCD). Values only ever
@@ -402,6 +475,44 @@ __global__ __launch_bounds__(64 * KW) void gemm_splitk_kernel(
     if (m < M)
       C[(size_t)m * N + n] = acc[v] + b;
   }
+}
+
+// gemm_mfma_kernel without split K that keeps, instead of C, the argmax key
+// of each row (TileGemm::argmax_rows).
+template <int BM, int BN, int BK, int WAVES_M, int WAVES_N>
+__global__ __launch_bounds__(64 * WAVES_M *WAVES_N) __attribute__((amdgpu_waves_per_eu(
+    TileGemm<BM, BN, BK, WAVES_M, WAVES_N>::WAVES_PER_SIMD))) void gemm_argmax_kernel(
+    const bf16_t *__restrict__ A, int M, const bf16_t *__restrict__ W,
+    const float *__restrict__ bias, int N, int K, int m_blocks,
+    unsigned long long *__restrict__ keys) {
+  typedef TileGemm<BM, BN, BK, WAVES_M, WAVES_N> T;
+  __shared__ typename T::Smem sm;
+  const int m0 = (blockIdx.x % m_blocks) * BM, n0 = (blockIdx.x / m_blocks) * BN;
+  float bv[T::TN];
+  T::load_bias(bias, N, n0, bv);
+  typename T::Acc acc;
+  T::mainloop(sm, A, M, W, N, K, m0, n0, 0, K / BK, acc);
+  T::argmax_rows(sm, M, N, m0, n0, bv, acc, keys);
+}
+
+// out[m] = the column named by keys[m] (0x7fffffff if the row was all NaN,
+// as argmax_kernel gives); resets keys[m] to 0 for the next call.
+__global__ void argmax_keys_kernel(unsigned long long *__restrict__ keys, int M,
+                                   int *__restrict__ out) {
+  const int m = blockIdx.x * blockDim.x + threadIdx.x;
+  if (m >= M)
+    return;
+  const unsigned long long k = keys[m];
+  out[m] = k ? (int)~(unsigned)k : 0x7fffffff;
+  keys[m] = 0;
+}
+
+template <int BM, int BN, int BK, int WAVES_M, int WAVES_N>
+static void launch_argmax(hipStream_t s, const bf16_t *A, int M, const bf16_t *W,
+                          const float *bias, int N, int K, unsigned long long *keys) {
+  const int mb = (M + BM - 1) / BM, nb = (N + BN - 1) / BN;
+  gemm_argmax_kernel<BM, BN, BK, WAVES_M, WAVES_N>
+      <<<mb * nb, 64 * WAVES_M * WAVES_N, 0, s>>>(A, M, W, bias, N, K, mb, keys);
 }
 
 static unsigned next_epoch() {
@@ -528,4 +639,31 @@ static void gemm_bf16(hipStream_t s, const bf16_t *A, int M, const bf16_t *W,
   int k_slices = 1;
   const fgemm::GemmConfig &cfg = fgemm::kGemmConfigs[fgemm::gemm_pick_config(M, N, K, &k_slices)];
   cfg.launch(s, A, M, W, bias, C, N, K, k_slices);
+}
+
+// out[m] = argmax over n of C[m][n], C = A · W^T (+ bias), the lowest n on
+// ties, without writing C: the same tile configuration and arithmetic as
+// gemm_bf16(), so the same choice as gemm_bf16() + argmax_kernel. For shapes
+// where gemm_bf16() does not split K (it never does for N > 65536, the LM
+// head). keys: M device values, all 0 (they are left at 0).
+static void gemm_bf16_argmax(hipStream_t s, const bf16_t *A, int M, const bf16_t *W,
+                             const float *bias, int N, int K, unsigned long long *keys,
+                             int *out) {
+  if (M <= 0 || N <= 0)
+    return;
+  int k_slices = 1;
+  switch (fgemm::gemm_pick_config(M, N, K, &k_slices)) {
+  case fgemm::CFG_256x256x32_2x4:
+    fgemm::launch_argmax<256, 256, 32, 2, 4>(s, A, M, W, bias, N, K, keys);
+    break;
+  case fgemm::CFG_128x128x64_2x4:
+    fgemm::launch_argmax<128, 128, 64, 2, 4>(s, A, M, W, bias, N, K, keys);
+    break;
+  case fgemm::CFG_64x128x64_2x4:
+    fgemm::launch_argmax<64, 128, 64, 2, 4>(s, A, M, W, bias, N, K, keys);
+    break;
+  default:
+    fgemm::launch_argmax<128, 128, 32, 2, 4>(s, A, M, W, bias, N, K, keys);
+  }
+  fgemm::argmax_keys_kernel<<<(M + 255) / 256, 256, 0, s>>>(keys, M, out);
 }
