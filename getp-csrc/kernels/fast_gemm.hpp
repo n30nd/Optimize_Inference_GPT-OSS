@@ -23,10 +23,17 @@
 // - gemm_mfma_kernel: one block per BM x BN output tile, optionally split
 //   along K into slices that add up in a fixed order. Tile sizes are picked
 //   per shape (gemm_pick_config at the end of this file).
-// - gemm_splitk_kernel: for outputs too narrow to fill the GPU (the router,
-//   N = 32 or 128). One 32x32 output tile per block; the block's waves split
-//   K between them, read straight from global memory, and add their partial
-//   sums through LDS in a fixed order (deterministic).
+// - gemm_stream_kernel: the same tiles, for multiplies whose tile count does
+//   not fit the compute units well; one block per compute unit, the K steps
+//   of all tiles shared out evenly. Same bits as gemm_mfma_kernel.
+// - gemm_splitk_kernel / gemm_router_kernel: for outputs too narrow to fill
+//   the GPU (the router, N = 32 or 128). 32x32 output tiles, K split in parts
+//   read straight from global memory and added in a fixed order
+//   (deterministic); the router kernel spreads the parts of a tile over
+//   several compute units.
+// Without split K, every output gets its K steps added in the same order by
+// the same instructions in every tiled or stream configuration, so they all
+// give the same bits.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -140,9 +147,13 @@ struct TileGemm {
   typedef f32x16 Acc[TM][TN];
 
   // acc = sum over K steps [k_begin, k_begin + nk) of tile (m0, n0); nk >= 1.
+  // With keep_acc the sum continues from the values already in acc, with the
+  // same instructions in the same order as if the K steps before k_begin had
+  // been done in this call: the result has the same bits.
   __device__ static void mainloop(Smem &sm, const bf16_t *__restrict__ A, int M,
                                   const bf16_t *__restrict__ W, int N, int K, int m0,
-                                  int n0, int k_begin, int nk, Acc &acc) {
+                                  int n0, int k_begin, int nk, Acc &acc,
+                                  bool keep_acc = false) {
     const int tid = threadIdx.x, lane = tid & 63, wave = tid >> 6;
     const int wm = wave % WAVES_M, wn = wave / WAVES_M;
 
@@ -168,11 +179,12 @@ struct TileGemm {
 
     bf16x8 ra[A_LOADS], rw[W_LOADS];         // next K step, on its way to LDS
     bf16x8 fa[2][TM], fw[2][TN];             // MFMA operands, double buffered
+    if (!keep_acc)
 #pragma unroll
-    for (int i = 0; i < TM; i++)
+      for (int i = 0; i < TM; i++)
 #pragma unroll
-      for (int j = 0; j < TN; j++)
-        acc[i][j] = f32x16{};
+        for (int j = 0; j < TN; j++)
+          acc[i][j] = f32x16{};
 
     // All indices below are compile-time constants after unrolling, so every
     // array stays in registers.
@@ -286,6 +298,38 @@ struct TileGemm {
 #pragma unroll
     for (int j = 0; j < TN; j++)
       bv[j] = bias ? bias[min(n0 + wn * WN + j * 32 + (lane & 31), N - 1)] : 0.0f;
+  }
+
+  // The raw accumulators of the block, in a layout only save_acc / load_acc
+  // know: for each (wave, accumulator, group of 4 values) the 64 lanes write
+  // 64 consecutive float4 (1 KB).
+  static constexpr int ACC_FLOAT4 = NT * TM * TN * 4; // = BM * BN / 4
+  __device__ static void save_acc(float4 *__restrict__ dst, const Acc &acc) {
+    const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
+#pragma unroll
+    for (int i = 0; i < TM; i++)
+#pragma unroll
+      for (int j = 0; j < TN; j++)
+#pragma unroll
+        for (int q = 0; q < 4; q++)
+          dst[(((wave * TM + i) * TN + j) * 4 + q) * 64 + lane] =
+              make_float4(acc[i][j][4 * q], acc[i][j][4 * q + 1], acc[i][j][4 * q + 2],
+                          acc[i][j][4 * q + 3]);
+  }
+  __device__ static void load_acc(const float4 *__restrict__ src, Acc &acc) {
+    const int lane = threadIdx.x & 63, wave = threadIdx.x >> 6;
+#pragma unroll
+    for (int i = 0; i < TM; i++)
+#pragma unroll
+      for (int j = 0; j < TN; j++)
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+          const float4 v = src[(((wave * TM + i) * TN + j) * 4 + q) * 64 + lane];
+          acc[i][j][4 * q] = v.x;
+          acc[i][j][4 * q + 1] = v.y;
+          acc[i][j][4 * q + 2] = v.z;
+          acc[i][j][4 * q + 3] = v.w;
+        }
   }
 
   // Writes acc + bv (or + the value already in C) to the tile (m0, n0).
@@ -416,45 +460,166 @@ __global__ __launch_bounds__(64 * WAVES_M *WAVES_N) __attribute__((amdgpu_waves_
     set_flag(&g_split_flags[tile], epoch + ks + 1);
 }
 
-// One 32x32 output tile per block, KW waves splitting K: wave w takes the
-// 32-wide k chunks w, w + KW, w + 2 KW, ... Within a chunk lane l reads 16
-// consecutive k values (two 16-byte loads) of its row of A and of W.
+// Persistent version for multiplies with too few tiles to keep every compute
+// unit equally busy (wave quantization: 160 tiles on 104 compute units leave
+// 56 of them with two tiles and 48 with one, so the time is that of two
+// tiles). The grid holds a fixed number of blocks ("workers") that share the
+// work evenly at the granularity of one K step, and every output value still
+// gets its K steps added in the same order by the same instructions, so C has
+// exactly the bits gemm_mfma_kernel gives.
+//
+// Workers come in m_blocks rows: worker w works on row tile r = w % m_blocks,
+// as the g-th of the G = gridDim.x / m_blocks workers of that row. The row's
+// n_blocks tiles of S K steps each form one sequence of n_blocks * S steps,
+// cut into G equal ranges. The workers of different rows with the same g run
+// over the same column tiles at the same K steps at the same time, so a W
+// tile read from memory is found in the L2 cache by the other rows (as in
+// gemm_mfma_kernel).
+//
+// A range covers at most three kinds of piece:
+//   tail  - the end of a tile whose start belongs to worker w - m_blocks;
+//   full  - whole tiles;
+//   head  - the start of a tile that worker w + m_blocks finishes.
+// The head goes first: its raw accumulators go to a scratch slot of the
+// worker and a flag says they are there. Then the full tiles, then the tail,
+// which waits for the previous worker's flag, loads its accumulators and goes
+// on summing. The previous worker wrote them at the start of its run, so the
+// wait is short or none. (A range shorter than a tile can also be one middle
+// piece: it continues a tile and hands it on.) Each worker publishes at most
+// one piece, so one slot per worker is enough.
+constexpr int kMaxStreamWorkers = 256;
+__device__ unsigned g_stream_flags[kMaxStreamWorkers];
+// Scratch of one GEMM call at a time per GCD (16 MB): the hand-over slots of
+// gemm_stream_kernel, or the partial sums of gemm_router_kernel. Like the
+// split-K flags, it needs the calls of one GCD to run one after another (one
+// stream per GCD).
+__device__ float4 g_gemm_scratch[kMaxStreamWorkers][128 * 128 / 4];
+
+template <int BM, int BN, int BK, int WAVES_M, int WAVES_N>
+__global__ __launch_bounds__(64 * WAVES_M *WAVES_N) __attribute__((amdgpu_waves_per_eu(
+    TileGemm<BM, BN, BK, WAVES_M, WAVES_N>::WAVES_PER_SIMD))) void gemm_stream_kernel(
+    const bf16_t *__restrict__ A, int M, const bf16_t *__restrict__ W,
+    const float *__restrict__ bias, float *__restrict__ C, int N, int K,
+    int m_blocks, int n_blocks, unsigned epoch) {
+  typedef TileGemm<BM, BN, BK, WAVES_M, WAVES_N> T;
+  static_assert(T::ACC_FLOAT4 <= 128 * 128 / 4, "accumulators fit in a slot");
+  __shared__ typename T::Smem sm;
+  const int w = blockIdx.x, G = gridDim.x / m_blocks;
+  const int m0 = (w % m_blocks) * BM, g = w / m_blocks;
+  const int S = K / BK;
+  const long long L = (long long)n_blocks * S;
+  const int b = (int)(g * L / G), e = (int)((g + 1) * L / G); // steps [b, e)
+  const int t_first = b / S, t_last = (e - 1) / S;
+  const bool has_tail = b > t_first * S;
+  const bool has_head = e < (t_last + 1) * S && t_last * S >= b;
+  const int full_lo = t_first + has_tail, full_hi = t_last - has_head;
+  const int n_pieces = has_head + has_tail + max(0, full_hi - full_lo + 1);
+
+  for (int p = 0; p < n_pieces; p++) {
+    int t, k0, nk;
+    bool cont, done; // continues the previous worker's sum / finishes the tile
+    if (has_head && p == 0) {
+      t = t_last, k0 = 0, nk = e - t * S, cont = false, done = false;
+    } else if (has_tail && p == n_pieces - 1) {
+      t = t_first, k0 = b - t * S, nk = min(e, (t + 1) * S) - b, cont = true;
+      done = k0 + nk == S;
+    } else {
+      t = full_lo + p - has_head, k0 = 0, nk = S, cont = false, done = true;
+    }
+    const int n0 = t * BN;
+    float bv[T::TN];
+    T::load_bias(done ? bias : nullptr, N, n0, bv);
+    typename T::Acc acc;
+    if (cont) {
+      wait_flag(&g_stream_flags[w - m_blocks], epoch);
+      T::load_acc(g_gemm_scratch[w - m_blocks], acc);
+    }
+    __syncthreads(); // the previous piece's last LDS reads are done
+    T::mainloop(sm, A, M, W, N, K, m0, n0, k0, nk, acc, cont);
+    if (done) {
+      T::store_c(C, M, N, m0, n0, bv, false, acc);
+    } else {
+      T::save_acc(g_gemm_scratch[w], acc);
+      set_flag(&g_stream_flags[w], epoch);
+    }
+  }
+}
+
+// Router multiplies (N = 32 or 128): 32x32 output tiles, K split KW ways:
+// "part" w of a tile takes the 32-wide k chunks w, w + KW, w + 2 KW, ... in
+// that order, and the parts are added in the order 0, 1, ..., KW - 1. Within
+// a chunk lane l reads 16 consecutive k values (two 16-byte loads) of its row
+// of A and of W. Part w is computed by one wavefront (router_part); the
+// loads run D chunks ahead through a ring of registers.
+template <int KW>
+__device__ inline f32x16 router_part(const bf16_t *__restrict__ A, int M,
+                                     const bf16_t *__restrict__ W, int N, int K, int m0,
+                                     int n0, int part) {
+  const int lane = threadIdx.x & 63, koff = (lane >> 5) * 16;
+  const bf16x8 *pa = (const bf16x8 *)(A + (size_t)min(m0 + (lane & 31), M - 1) * K + koff);
+  const bf16x8 *pw = (const bf16x8 *)(W + (size_t)min(n0 + (lane & 31), N - 1) * K + koff);
+  constexpr int D = 8;
+  const int nchunks = K / 32, mine = (nchunks - part + KW - 1) / KW;
+  bf16x8 ra[D][2], rw[D][2];
+  auto load = [&](int d, int c) { // chunk number c of this part into slot d
+    const int ch = part + min(c, mine - 1) * KW;
+    ra[d][0] = pa[ch * 4];
+    ra[d][1] = pa[ch * 4 + 1];
+    rw[d][0] = pw[ch * 4];
+    rw[d][1] = pw[ch * 4 + 1];
+  };
+  f32x16 acc = {};
+  if (mine > 0) {
+#pragma unroll
+    for (int d = 0; d < D; d++)
+      load(d, d);
+    // No branches inside this loop, so the compiler can wait for exactly
+    // the loads each MFMA needs.
+    int c = 0;
+    for (; c + D <= mine; c += D)
+#pragma unroll
+      for (int d = 0; d < D; d++) {
+        acc = mfma_k8x2(ra[d][0], rw[d][0], acc);
+        acc = mfma_k8x2(ra[d][1], rw[d][1], acc);
+        load(d, c + d + D);
+      }
+#pragma unroll
+    for (int d = 0; d < D; d++) // the last mine - c chunks, already loaded
+      if (c + d < mine) {
+        acc = mfma_k8x2(ra[d][0], rw[d][0], acc);
+        acc = mfma_k8x2(ra[d][1], rw[d][1], acc);
+      }
+  }
+  return acc;
+}
+
+// C for one 32x32 tile from the KW parts (sum[0] + sum[1] + ...) + bias.
+template <int KW>
+__device__ inline void router_store(const float *__restrict__ bias, float *__restrict__ C,
+                                    int M, int N, int m0, int n0, f32x16 acc) {
+  const int lane = threadIdx.x & 63, n = n0 + (lane & 31);
+  if (n >= N)
+    return;
+  const float b = bias ? bias[n] : 0.0f;
+#pragma unroll
+  for (int v = 0; v < 16; v++) {
+    const int m = m0 + 8 * (v / 4) + 4 * (lane >> 5) + (v % 4);
+    if (m < M)
+      C[(size_t)m * N + n] = acc[v] + b;
+  }
+}
+
+// One tile per block, wave w computes part w, the parts meet in LDS.
 template <int KW>
 __global__ __launch_bounds__(64 * KW) void gemm_splitk_kernel(
     const bf16_t *__restrict__ A, int M, const bf16_t *__restrict__ W,
     const float *__restrict__ bias, float *__restrict__ C, int N, int K,
     int m_blocks) {
   __shared__ float part[KW - 1][16][64];
-  const int tid = threadIdx.x, lane = tid & 63, wave = tid >> 6;
-  const int m0 = (blockIdx.x % m_blocks) * 32;
-  const int n0 = (blockIdx.x / m_blocks) * 32;
-  const int koff = (lane >> 5) * 16;
-  const bf16x8 *pa =
-      (const bf16x8 *)(A + (size_t)min(m0 + (lane & 31), M - 1) * K + koff);
-  const bf16x8 *pw =
-      (const bf16x8 *)(W + (size_t)min(n0 + (lane & 31), N - 1) * K + koff);
-
-  const int n = n0 + (lane & 31);
-  const float b = bias ? bias[min(n, N - 1)] : 0.0f;
-
-  f32x16 acc = {};
-  const int nchunks = K / 32;
-  int ch = wave;
-  for (; ch + KW < nchunks; ch += 2 * KW) { // two chunks in flight
-    const bf16x8 a0 = pa[ch * 4], a1 = pa[ch * 4 + 1];
-    const bf16x8 w0 = pw[ch * 4], w1 = pw[ch * 4 + 1];
-    const bf16x8 a2 = pa[(ch + KW) * 4], a3 = pa[(ch + KW) * 4 + 1];
-    const bf16x8 w2 = pw[(ch + KW) * 4], w3 = pw[(ch + KW) * 4 + 1];
-    acc = mfma_k8x2(a0, w0, acc);
-    acc = mfma_k8x2(a1, w1, acc);
-    acc = mfma_k8x2(a2, w2, acc);
-    acc = mfma_k8x2(a3, w3, acc);
-  }
-  if (ch < nchunks) {
-    acc = mfma_k8x2(pa[ch * 4], pw[ch * 4], acc);
-    acc = mfma_k8x2(pa[ch * 4 + 1], pw[ch * 4 + 1], acc);
-  }
-
+  const int lane = threadIdx.x & 63;
+  const int wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6); // same for all lanes
+  const int m0 = (blockIdx.x % m_blocks) * 32, n0 = (blockIdx.x / m_blocks) * 32;
+  f32x16 acc = router_part<KW>(A, M, W, N, K, m0, n0, wave);
   if (wave > 0)
 #pragma unroll
     for (int v = 0; v < 16; v++)
@@ -467,14 +632,55 @@ __global__ __launch_bounds__(64 * KW) void gemm_splitk_kernel(
 #pragma unroll
     for (int v = 0; v < 16; v++)
       acc[v] += part[w][v][lane];
-  if (n >= N)
-    return;
+  router_store<KW>(bias, C, M, N, m0, n0, acc);
+}
+
+// Same sums with one wavefront per block and KW blocks per tile, so that the
+// loads of a tile come from KW compute units instead of one (a compute unit
+// has only so many loads in flight; with 16 tiles for 512 requests the
+// one-block version used 16 of the 104 compute units). Every block writes its
+// part to scratch and counts itself in; the last one of a tile adds the parts
+// in the fixed order and resets the count for the next call. Same bits as
+// gemm_splitk_kernel.
+__device__ unsigned g_router_count[kMaxSplitTiles];
+
+template <int KW>
+__global__ __launch_bounds__(64) void gemm_router_kernel(
+    const bf16_t *__restrict__ A, int M, const bf16_t *__restrict__ W,
+    const float *__restrict__ bias, float *__restrict__ C, int N, int K,
+    int m_blocks) {
+  const int lane = threadIdx.x;
+  const int tile = blockIdx.x / KW, wave = blockIdx.x % KW;
+  const int m0 = (tile % m_blocks) * 32, n0 = (tile / m_blocks) * 32;
+  f32x16 acc = router_part<KW>(A, M, W, N, K, m0, n0, wave);
+  float4 *parts = &g_gemm_scratch[0][0] + (size_t)tile * KW * 256;
 #pragma unroll
-  for (int v = 0; v < 16; v++) {
-    const int m = m0 + 8 * (v / 4) + 4 * (lane >> 5) + (v % 4);
-    if (m < M)
-      C[(size_t)m * N + n] = acc[v] + b;
-  }
+  for (int q = 0; q < 4; q++)
+    parts[(wave * 4 + q) * 64 + lane] =
+        make_float4(acc[4 * q], acc[4 * q + 1], acc[4 * q + 2], acc[4 * q + 3]);
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  unsigned before = 0;
+  if (lane == 0)
+    before = atomicAdd(&g_router_count[tile], 1u);
+  if (__shfl(before, 0) != KW - 1)
+    return;
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+  if (lane == 0)
+    g_router_count[tile] = 0;
+  f32x16 sum;
+#pragma unroll
+  for (int w = 0; w < KW; w++)
+#pragma unroll
+    for (int q = 0; q < 4; q++) {
+      const float4 p = w == wave ? make_float4(acc[4 * q], acc[4 * q + 1], acc[4 * q + 2],
+                                               acc[4 * q + 3])
+                                 : parts[(w * 4 + q) * 64 + lane];
+      const float pv[4] = {p.x, p.y, p.z, p.w};
+#pragma unroll
+      for (int i = 0; i < 4; i++)
+        sum[4 * q + i] = w == 0 ? pv[i] : sum[4 * q + i] + pv[i];
+    }
+  router_store<KW>(bias, C, M, N, m0, n0, sum);
 }
 
 // gemm_mfma_kernel without split K that keeps, instead of C, the argmax key
@@ -534,11 +740,44 @@ static void launch_tiled(hipStream_t s, const bf16_t *A, int M, const bf16_t *W,
       <<<mb * nb * k_slices, threads, 0, s>>>(A, M, W, bias, C, N, K, mb, k_slices, epoch);
 }
 
+static int num_cus() {
+  static const int n = [] {
+    int dev = 0, v = 0;
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetAttribute(&v, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess ||
+        v <= 0)
+      v = 104;
+    return v;
+  }();
+  return n;
+}
+
+// per_cu: workers per compute unit (the grid is the largest multiple of the
+// row tile count that fits per_cu * compute units, and at most one worker per
+// K step).
+template <int BM, int BN, int BK, int WAVES_M, int WAVES_N>
+static void launch_stream(hipStream_t s, const bf16_t *A, int M, const bf16_t *W,
+                          const float *bias, float *C, int N, int K, int per_cu) {
+  const int mb = (M + BM - 1) / BM, nb = (N + BN - 1) / BN;
+  const int limit = std::min(kMaxStreamWorkers, std::max(1, per_cu) * num_cus());
+  const int G = std::max(1, std::min(limit / mb, nb * (K / BK)));
+  if (mb * G > kMaxStreamWorkers) {
+    launch_tiled<BM, BN, BK, WAVES_M, WAVES_N>(s, A, M, W, bias, C, N, K, 1);
+    return;
+  }
+  gemm_stream_kernel<BM, BN, BK, WAVES_M, WAVES_N><<<mb * G, 64 * WAVES_M * WAVES_N, 0, s>>>(
+      A, M, W, bias, C, N, K, mb, nb, next_epoch());
+}
+
 template <int KW>
 static void launch_splitk(hipStream_t s, const bf16_t *A, int M, const bf16_t *W,
                           const float *bias, float *C, int N, int K, int) {
   const int mb = (M + 31) / 32, nb = (N + 31) / 32;
-  gemm_splitk_kernel<KW><<<mb * nb, 64 * KW, 0, s>>>(A, M, W, bias, C, N, K, mb);
+  if ((size_t)mb * nb * KW * 256 <= sizeof(g_gemm_scratch) / sizeof(float4) &&
+      mb * nb <= kMaxSplitTiles)
+    gemm_router_kernel<KW><<<mb * nb * KW, 64, 0, s>>>(A, M, W, bias, C, N, K, mb);
+  else
+    gemm_splitk_kernel<KW><<<mb * nb, 64 * KW, 0, s>>>(A, M, W, bias, C, N, K, mb);
 }
 
 typedef void (*GemmLaunch)(hipStream_t, const bf16_t *, int, const bf16_t *,
@@ -554,16 +793,18 @@ struct GemmConfig {
 // WAVES_M x WAVES_N waves. "LDS" is the double-buffered tile copy; 64 KB of
 // LDS per compute unit (CU) decides how many blocks share a CU.
 // The benchmark (bench/gemm_bench.cpp --sweep) times all of them.
-enum {                // wave tile, LDS, blocks per CU
-  CFG_128x128x32_2x4, // 64x32,  32 KB, 2 (4 waves per SIMD)
-  CFG_128x256x32_2x4, // 64x64,  48 KB, 1
-  CFG_256x256x32_2x4, // 128x64, 64 KB, 1
-  CFG_128x128x64_2x4, // 64x32,  64 KB, 1 (half the barriers per K)
-  CFG_64x128x64_2x4,  // 32x32,  48 KB, 1 (small M: more blocks)
-  CFG_64x64x64_2x2,   // 32x32,  32 KB, 2 (small M or N)
-  CFG_128x128x32_2x2, // 64x64,  32 KB, 2 (4 waves: the first version)
-  CFG_ROUTER_4W,      // gemm_splitk_kernel, 32x32 tiles, 4 waves split K
-  CFG_ROUTER_8W,      // same with 8 waves
+enum {                 // wave tile, LDS, blocks per CU
+  CFG_128x128x32_2x4,  // 64x32,  32 KB, 2 (4 waves per SIMD)
+  CFG_128x256x32_2x4,  // 64x64,  48 KB, 1
+  CFG_256x256x32_2x4,  // 128x64, 64 KB, 1
+  CFG_128x128x64_2x4,  // 64x32,  64 KB, 1 (half the barriers per K)
+  CFG_64x128x64_2x4,   // 32x32,  48 KB, 1 (small M: more blocks)
+  CFG_64x64x64_2x2,    // 32x32,  32 KB, 2 (small M or N)
+  CFG_128x128x32_2x2,  // 64x64,  32 KB, 2 (4 waves: the first version)
+  CFG_ROUTER_4W,       // router kernels, 32x32 tiles, K split in 4 parts
+  CFG_ROUTER_8W,       // same with 8 parts
+  CFG_S128x128x64_2x4, // gemm_stream_kernel, tiles of CFG_128x128x64_2x4, 1 per CU
+  CFG_S64x128x64_2x4,  // gemm_stream_kernel, tiles of CFG_64x128x64_2x4, 1 per CU
 };
 static const GemmConfig kGemmConfigs[] = {
     {"128x128x32 2x4", launch_tiled<128, 128, 32, 2, 4>, 32},
@@ -575,13 +816,25 @@ static const GemmConfig kGemmConfigs[] = {
     {"128x128x32 2x2", launch_tiled<128, 128, 32, 2, 2>, 32},
     {"splitk32x32 4w", launch_splitk<4>, 32},
     {"splitk32x32 8w", launch_splitk<8>, 32},
+    {"stream 128x128x64 2x4", launch_stream<128, 128, 64, 2, 4>, 64},
+    {"stream 64x128x64 2x4", launch_stream<64, 128, 64, 2, 4>, 64},
 };
 static const int kNumGemmConfigs = sizeof(kGemmConfigs) / sizeof(kGemmConfigs[0]);
 
+// True if gemm_stream_kernel with BM x BN tiles of BK steps gives every
+// worker at least one whole tile's worth of K steps, so that no tile is
+// split in three (the middle worker would wait for the first one).
+template <int BM, int BN>
+static bool stream_fits(int M, int N) {
+  const int mb = (M + BM - 1) / BM, nb = (N + BN - 1) / BN;
+  return mb <= num_cus() && nb >= num_cus() / mb;
+}
+
 // Index into kGemmConfigs for this shape, and how many K slices to use.
 // Picked from bench/gemm_bench.cpp --sweep on one MI250 GCD (fastest at each
-// M of 64..2048 for the gpt-oss shapes; a batch between two measured sizes
-// uses the choice of the larger one). Other shapes get the qkv choices.
+// M of 64..2048 for the gpt-oss shapes, plus 384 and 768; a batch between two
+// measured sizes uses the choice of the larger one). Other shapes get the
+// qkv choices.
 static int gemm_pick_config(int M, int N, int K, int *k_slices) {
   *k_slices = 1;
   const bool k64 = K % 64 == 0;
@@ -602,10 +855,12 @@ static int gemm_pick_config(int M, int N, int K, int *k_slices) {
     }
     if (M <= 256)
       return CFG_64x128x64_2x4;
+    if (M <= 384 && stream_fits<64, 128>(M, N))
+      return CFG_S64x128x64_2x4;
     if (M <= 512)
       return CFG_128x128x64_2x4;
     if (M <= 1024)
-      return CFG_128x256x32_2x4;
+      return stream_fits<128, 128>(M, N) ? CFG_S128x128x64_2x4 : CFG_128x256x32_2x4;
     return CFG_256x256x32_2x4;
   }
   if (N > 65536) { // LM head
@@ -622,9 +877,11 @@ static int gemm_pick_config(int M, int N, int K, int *k_slices) {
     *k_slices = M <= 64 ? 2 : 1;
     return CFG_64x128x64_2x4;
   }
-  if (M <= 512 || M > 1024)
+  if (M <= 256 || M > 1024)
     return CFG_128x128x32_2x4;
-  return CFG_256x256x32_2x4;
+  if (k64 && stream_fits<128, 128>(M, N))
+    return CFG_S128x128x64_2x4;
+  return M <= 512 ? CFG_128x128x32_2x4 : CFG_256x256x32_2x4;
 }
 
 } // namespace fgemm

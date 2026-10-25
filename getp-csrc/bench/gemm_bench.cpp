@@ -14,6 +14,10 @@
 //   --iters N        timed calls per measurement (default 20)
 //   --ms 64,512,...  batch sizes (default 64,128,256,512,1024,2048)
 //   --shapes a,b     subset of qkv,attn_out,router_20b,router_120b,lm_head
+//   --interleave     time each call between attention-out multiplies at 512 rows
+//                    (time of both minus the attention-out alone), as in the
+//                    engine, where a small multiply finds its inputs out of the
+//                    L2 cache and follows a big kernel
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,7 +102,7 @@ static std::vector<std::string> split(const char *s) {
 }
 
 int main(int argc, char **argv) {
-  bool old = false, sweep = false;
+  bool old = false, sweep = false, interleave = false;
   int iters = 20;
   std::vector<int> ms = {64, 128, 256, 512, 1024, 2048};
   std::vector<std::string> shapes;
@@ -108,6 +112,8 @@ int main(int argc, char **argv) {
       old = true;
     else if (!strcmp(argv[i], "--sweep"))
       sweep = true;
+    else if (!strcmp(argv[i], "--interleave"))
+      interleave = true;
     else if (!strcmp(argv[i], "--iters") && i + 1 < argc)
       iters = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--ms") && i + 1 < argc) {
@@ -144,6 +150,29 @@ int main(int argc, char **argv) {
   CHECK(hipMemset(bias, 0, maxN * 4));
   CHECK(hipDeviceSynchronize());
 
+  // the multiply the timed calls are interleaved with (--interleave)
+  bf16_t *A2, *W2;
+  float *C2;
+  CHECK(hipMalloc(&A2, 512 * 4096 * 2));
+  CHECK(hipMalloc(&W2, 2880 * 4096 * 2));
+  CHECK(hipMalloc(&C2, 512 * 2880 * 4));
+  fill_bf16<<<1024, 256>>>(A2, 512 * 4096, 3);
+  fill_bf16<<<1024, 256>>>(W2, 2880 * 4096, 4);
+  CHECK(hipDeviceSynchronize());
+  auto big = [&] { gemm_bf16(0, A2, 512, W2, bias, C2, 2880, 4096); };
+  const double big_us = interleave ? time_us(big, iters) : 0.0;
+  auto timed = [&](auto f) {
+    if (!interleave)
+      return time_us(f, iters);
+    return time_us(
+               [&] {
+                 big();
+                 f();
+               },
+               iters) -
+           big_us;
+  };
+
   printf("%-12s %5s %7s %5s  %-26s %10s %8s\n", "shape", "M", "N", "K", "kernel", "us",
          "TFLOP/s");
   for (const Shape &sh : kShapes) {
@@ -165,13 +194,13 @@ int main(int argc, char **argv) {
       const int N = sh.N, K = sh.K;
       if (old)
         row("old fp32 FMA",
-            time_us([&] { gemm_bf16_old_fma(0, A, M, W, b, C, N, K); }, iters));
+            timed([&] { gemm_bf16_old_fma(0, A, M, W, b, C, N, K); }));
       int pick_ks = 1;
       const int pick = fgemm::gemm_pick_config(M, N, K, &pick_ks);
       if (!sweep) {
         char name[64];
         snprintf(name, sizeof name, "%s ks%d", fgemm::kGemmConfigs[pick].name, pick_ks);
-        row(name, time_us([&] { gemm_bf16(0, A, M, W, b, C, N, K); }, iters));
+        row(name, timed([&] { gemm_bf16(0, A, M, W, b, C, N, K); }));
         continue;
       }
       for (int c = 0; c < fgemm::kNumGemmConfigs; c++) {
@@ -189,7 +218,7 @@ int main(int argc, char **argv) {
           char name[64];
           snprintf(name, sizeof name, "%s ks%d%s", cfg.name, ks,
                    c == pick && ks == pick_ks ? " *" : "");
-          row(name, time_us([&] { cfg.launch(0, A, M, W, b, C, N, K, ks); }, iters));
+          row(name, timed([&] { cfg.launch(0, A, M, W, b, C, N, K, ks); }));
         }
       }
     }

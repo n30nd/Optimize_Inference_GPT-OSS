@@ -9,9 +9,11 @@
 // Small outputs are checked in full; large ones on every row and column of
 // the last (partial) tiles plus 200,000 random positions.
 // With --all-configs every kernel configuration is checked, the tiled ones
-// also with split K (3 slices). Split-K runs (also when the picked
-// configuration uses split K) are repeated and must be bit-identical: the
-// slices add up in a fixed order.
+// also with split K (3 slices), the stream ones also with 3 workers per
+// compute unit. Split-K runs (also when the picked configuration uses split
+// K) are repeated and must be bit-identical: the slices add up in a fixed
+// order. Every run without split K (tiled or stream kernel, any tile shape)
+// must give exactly the bits of configuration 0.
 //
 // Build from the repo root:
 //   hipcc --std=c++17 -O3 -fopenmp --offload-arch=gfx90a getp-csrc/tests/gemm_test.cpp -o gemm_test
@@ -196,6 +198,11 @@ int main(int argc, char **argv) {
         CHECK(hipMemcpy(out.data(), dC, out.size() * 4, hipMemcpyDeviceToHost));
       };
 
+      // Without split K, the tiled and stream kernels add every output's K
+      // steps in the same order with the same instructions, whatever the tile
+      // shape: they must give the bits of configuration 0.
+      std::vector<float> Cref;
+      run(0, 1, Cref);
       for (int c = all ? 0 : -1; c < (all ? fgemm::kNumGemmConfigs : 0); c++)
         for (int ks : {1, 3}) {
           if (c >= 0 && K % fgemm::kGemmConfigs[c].bk)
@@ -210,20 +217,26 @@ int main(int argc, char **argv) {
             cfg = fgemm::kGemmConfigs[fgemm::gemm_pick_config(M, N, K, &used_ks)].name;
           else
             cfg = fgemm::kGemmConfigs[c].name;
+          // stream kernels: ks is the number of workers per compute unit
+          const bool stream = !strncmp(cfg, "stream", 6);
+          const bool same_bits = strncmp(cfg, "splitk", 6) && (stream || used_ks == 1);
           run(c, ks, C);
           const double rel = rel_error(R, C, N);
-          bool repeat_ok = true;
-          if (used_ks != 1) {
+          bool repeat_ok = true, bits_ok = true;
+          if (used_ks != 1 && !stream) {
             run(c, ks, C2);
             repeat_ok = memcmp(C.data(), C2.data(), C.size() * 4) == 0;
           }
-          const bool ok = rel < 1e-4 && repeat_ok;
+          if (same_bits)
+            bits_ok = memcmp(C.data(), Cref.data(), C.size() * 4) == 0;
+          const bool ok = rel < 1e-4 && repeat_ok && bits_ok;
           worst = std::max(worst, std::isnan(rel) ? INFINITY : rel);
           cases++;
           fails += !ok;
-          printf("%-12s M=%5d N=%6d K=%5d bias=%d  %-22s ks%-2d rel err %.2e %s%s\n", s.name,
+          printf("%-12s M=%5d N=%6d K=%5d bias=%d  %-22s ks%-2d rel err %.2e %s%s%s\n", s.name,
                  M, N, K, with_bias, cfg, used_ks, rel, ok ? "ok" : "FAIL",
-                 repeat_ok ? "" : " (not repeatable)");
+                 repeat_ok ? "" : " (not repeatable)",
+                 !same_bits ? "" : bits_ok ? " (same bits)" : " (bits differ)");
           fflush(stdout);
         }
       CHECK(hipFree(dA));
