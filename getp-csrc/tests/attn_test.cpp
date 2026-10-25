@@ -413,7 +413,7 @@ static bool check_writer(std::mt19937 &rng) {
   long long codes = 0;
   for (int slot : {0, 77, 127}) {
     CHECK(hipMemcpy(dqkv, qkv.data(), qkv.size() * 4, hipMemcpyHostToDevice));
-    rope_kv_bf16_kernel<<<B, 256>>>(dqkv, ROW, dc, dsn, NH, NKV, D, dk, dvq, dvs, slots, slot);
+    rope_kv_bf16(0, B, dqkv, ROW, dc, dsn, NH, NKV, dk, dvq, dvs, slots, slot);
     CHECK(hipDeviceSynchronize());
     std::vector<uint16_t> k(cache);
     std::vector<int8_t> vq(cache);

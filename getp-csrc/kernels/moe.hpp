@@ -53,7 +53,9 @@ __global__ void router_topk_exact(const float *__restrict__ logits, int E,
 
 // Same result as router_topk_exact, bit for bit, with one 64-lane wave per
 // row: lane l holds experts l, l + 64, ... (E <= 256); k rounds of a wave
-// arg-max (ties: lower expert), then lane 0 does the same softmax.
+// arg-max (ties: lower expert), then the same softmax, lane j computing the
+// exponential of choice j. Short code on purpose: the kernel starts with its
+// code out of the instruction cache, and each fetch then waits on memory.
 // Rows with done[b] set (done may be null) get expert -1, "no expert", for
 // all k choices: finished requests then cost no expert work.
 // slot_of (may be null) renumbers the chosen experts on output: topk_e gets
@@ -67,23 +69,22 @@ __global__ __launch_bounds__(64 * TOPK_WAVES) void router_topk_wave_kernel(
   const int b = blockIdx.x * TOPK_WAVES + threadIdx.x / 64;
   if (b >= B)
     return;
-  if (done && done[b]) {
-    if (lane < k) {
-      topk_w[(size_t)b * k + lane] = 0.0f;
-      topk_e[(size_t)b * k + lane] = -1;
-    }
-    return;
-  }
+  // All loads at once (past E: expert E - 1 again, unused).
   const float *r = logits + (size_t)b * E;
   float v[4];
+#pragma unroll
   for (int j = 0; j < 4; j++)
-    v[j] = lane + 64 * j < E ? r[lane + 64 * j] : 0.0f;
+    v[j] = r[min(lane + 64 * j, E - 1)];
+  const bool fin = done && done[b];
+  // Lane j < k keeps choice j (lane 0's view of it, as one thread would).
   unsigned taken = 0;
-  int chosen[MOE_MAX_TOPK];
-  float val[MOE_MAX_TOPK];
+  float mine = 0.0f;
+  int mine_e = 0;
+#pragma unroll 1
   for (int round = 0; round < k; round++) {
     float bv = 0.0f;
     int be = 0x7fffffff;
+#pragma unroll
     for (int j = 0; j < 4; j++) {
       const int e = lane + 64 * j;
       if (e < E && !(taken & (1u << j)) && (be == 0x7fffffff || v[j] > bv)) {
@@ -91,6 +92,7 @@ __global__ __launch_bounds__(64 * TOPK_WAVES) void router_topk_wave_kernel(
         be = e;
       }
     }
+#pragma unroll
     for (int off = 32; off > 0; off >>= 1) {
       const float ov = __shfl_xor(bv, off);
       const int oe = __shfl_xor(be, off);
@@ -102,23 +104,34 @@ __global__ __launch_bounds__(64 * TOPK_WAVES) void router_topk_wave_kernel(
     }
     if (be % 64 == lane)
       taken |= 1u << (be / 64);
-    chosen[round] = be;
-    val[round] = bv;
+    bv = __shfl(bv, 0);
+    be = __shfl(be, 0);
+    if (lane == round) {
+      mine = bv;
+      mine_e = be;
+    }
   }
-  if (lane != 0)
+  if (fin) {
+    if (lane < k) {
+      topk_w[(size_t)b * k + lane] = 0.0f;
+      topk_e[(size_t)b * k + lane] = -1;
+    }
     return;
-  double max_val = val[0];
-  for (int j = 1; j < k; j++)
-    if (val[j] > max_val)
-      max_val = val[j];
-  double sum = 0.0;
-  for (int j = 0; j < k; j++) {
-    val[j] = expf_cpu((float)__dsub_rn((double)val[j], max_val));
-    sum = __dadd_rn(sum, (double)val[j]);
   }
-  for (int j = 0; j < k; j++) {
-    topk_w[(size_t)b * k + j] = (float)__ddiv_rn((double)val[j], sum);
-    topk_e[(size_t)b * k + j] = slot_of ? slot_of[chosen[j]] : chosen[j];
+  // softmax; lane j computes exp of choice j, the sum adds them in order
+  double max_val = __shfl(mine, 0);
+  for (int j = 1; j < k; j++) {
+    const float x = __shfl(mine, j);
+    if (x > max_val)
+      max_val = x;
+  }
+  const float ex = expf_cpu((float)__dsub_rn((double)mine, max_val));
+  double sum = 0.0;
+  for (int j = 0; j < k; j++)
+    sum = __dadd_rn(sum, (double)__shfl(ex, j));
+  if (lane < k) {
+    topk_w[(size_t)b * k + lane] = (float)__ddiv_rn((double)ex, sum);
+    topk_e[(size_t)b * k + lane] = slot_of ? slot_of[mine_e] : mine_e;
   }
 }
 

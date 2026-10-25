@@ -99,7 +99,7 @@ Every row above was checked to leave the output bits unchanged (same output hash
 
 ## Where it is in our code
 
-- `getp-csrc/kernels/fast_misc.hpp` — `add_rmsnorm_bf16_kernel`, `rmsnorm_row_bf16`.
+- `getp-csrc/kernels/fast_misc.hpp` — `add_rmsnorm_bf16_kernel`, `rms_inv_row`, `rmsnorm_store_bf16`.
 - `getp-csrc/kernels/moe_ep.hpp` — `moe_count_ep_kernel`, `moe_place_ep_kernel`,
   `moe_combine_rmsnorm_kernel`, `moe_combine_partial_rmsnorm_kernel`.
 - `getp-csrc/kernels/moe.hpp` — `router_topk_wave_kernel` (expert −1 for finished requests).
@@ -117,6 +117,165 @@ Every row above was checked to leave the output bits unchanged (same output hash
   and never pick a NaN, or a rare tie changes a token and every token after it.
 - Our first guess at "the GPU is idle 7.5 % of the time" was wrong: the idle time was the weight
   upload before inference, which is not timed. Measure only the timed part.
+
+## Round two: less waiting
+
+### The problem in plain words
+
+After the first round, a profile of the whole run still showed the small kernels taking 1.5 to 3
+times the time their bytes need. A copy of 21 MB takes about 17 µs on one GCD; `add_rmsnorm` moves
+20 MB and took 26 µs, `rope_kv` moves 20 MB and took 22 µs, the expert combine moves 38 MB and took
+51 µs. Grouping (count + place) and top-4 move almost nothing and still took 15 and 16 µs.
+
+The time went into *waiting*, not into work. Five fixes, all with the same arithmetic as before, so
+the output bits do not change:
+
+1. **Ask for all the numbers first.** The old loops did "load, wait, add, store, next". Now each
+   thread asks for all of its numbers at once, then computes, then stores.
+2. **Keep the code short.** A small kernel's code is no longer in the instruction cache when it
+   starts (a whole layer of other kernels ran since its last call), so long code costs real time.
+3. **Rotate the query where it is read.** The attention kernel reads the query anyway; it now
+   applies RoPE itself, so `rope_kv` only handles keys and values (2 MB instead of 20 MB).
+4. **Count and place in one pass** when grouping the (token, expert) pairs.
+5. **Let the attention kernel's first loads go out before it reads the query**, and each step's
+   next loads go out while it computes (software pipelining).
+
+For gpt-oss-120b, whose experts are split between two GCDs, one more: **send the activations to
+the partner once instead of letting it fetch them row by row.**
+
+### An everyday comparison
+
+A cook who fetches one ingredient, cooks it, then walks back for the next, spends most of the
+evening walking. Writing the whole shopping list first and fetching everything in one trip is the
+first fix. The second: a recipe that fills ten pages takes longer to *read* than a one-page recipe,
+even if the cooking is the same.
+
+### The words
+
+- **latency** — how long one request to memory takes before the answer arrives (about 1 to 2 µs
+  here). Many requests can be on their way at the same time; a thread that waits for each answer
+  before asking the next one pays the full latency every time.
+- **memory-level parallelism** — having many memory requests on their way at once, so their waits
+  overlap.
+- **instruction cache** — a small fast memory next to the compute units that holds the code being
+  run. When a kernel's code is not in it ("cold"), every 64 bytes of code must first be fetched
+  from main memory.
+- **scratch memory** — per-thread memory the compiler uses when an array cannot stay in registers
+  (for example, when it is indexed by a number only known at run time). Every use is a slow memory
+  access.
+- **software pipelining** — starting the loads for the next round of a loop before the current
+  round's work, so the loading and the computing overlap.
+- **scan (prefix sum)** — giving each thread the sum of the values of all threads before it; here,
+  "how many pairs of this expert come before mine".
+- **link** — the connection between the two GCDs of one MI250 card (about 150-180 GB/s, ten times
+  less than a GCD's own memory).
+- **RoPE** (rotary position embedding) — the step that turns pairs of numbers of each query and key
+  by an angle that depends on the token's position, so attention can tell near words from far ones.
+- **shared memory** (LDS, local data share) — a small fast memory that the threads of one block
+  share; used here to pass partial sums between the block's wavefronts.
+- **buffer descriptor** — a small record (start address and size) that a load goes through; a load
+  outside the size returns zero instead of touching memory.
+- **rocprofv3** — AMD's profiler; it records when every kernel of a run starts and ends.
+
+### How it works
+
+**1. All loads first.** On this GPU a thread's wait for one load also waits for every store it
+issued before, so a loop "load, store, load, store" waits for each store as well. The new kernels
+load everything a thread needs into registers (12 numbers of x, 12 of y, 12 weights for a row of
+2,880 handled by 256 threads), then compute, then store. To make the compiler issue the loads
+together, the loop counts are compile-time constants (one version for the 2,880 of gpt-oss, a
+general one for other sizes) and loads past the end of a row read the last element again instead of
+being skipped. The sum of squares of a row still goes through the same halving tree of 256 values:
+the first two levels through shared memory, the last six inside a wavefront with shuffles, which
+add the same pairs in the same order.
+
+**2. Short code.** We found this one by accident: a kernel that did the router multiply and the
+top-4 in one go took 24 µs in a test that called it again and again, but 45 µs inside the real run.
+The test kept its 17 KB of code in the instruction cache; the real run, with a whole layer of other
+kernels between two calls, did not. A test option (`--evict`) that runs other kernels between calls
+reproduced it. So the top-4 and grouping kernels are written with short loops and no scratch
+memory, and the merged router + top-4 was dropped (it saved a kernel start but its long code cost
+as much).
+
+**3. The query is rotated inside the attention kernel.** RoPE turns each pair of numbers
+(i, i + 32) of a 64-wide head by an angle that depends on the position. Each attention lane already
+loads dims d and d + 32 of the query, exactly the pairs RoPE needs, so it rotates them right after
+loading, with the same two rounding steps as before (`rope_pair`). `rope_kv` now reads only the
+keys and values (2 MB instead of 10.5 MB, and writes nothing back to the query).
+
+**4. Grouping in one pass.** Each of the 32 (or 64) blocks, one per expert, reads all the pairs
+once, 8 or 16 per thread with 16-byte loads. It counts the pairs of lower experts (that sum is the
+expert's first row) and marks its own pairs; a scan over the 256 threads gives each of its pairs a
+row, in pair order, exactly as the two old kernels did.
+
+**5. Attention loads early.** Each attention wave now asks for its first keys and values before it
+reads the query, then, inside the loop, asks for the next step's keys right after the scores and
+the next values at the end of the step. Positions past the end read zeros (the buffer descriptors
+already guarantee that), so the extra last request is harmless.
+
+**6. (120b) Activations sent once.** The expert multiply of one GCD needs the normalized
+activations of the partner's tokens that chose its experts. It used to read them across the link
+row by row: about 1,000 rows (5.9 MB) per layer, most tokens twice (two of their four experts are
+on each side). Now the kernel that computes the activations (`add_rmsnorm`) also writes them once
+(2.9 MB) into the partner's memory, and the partner reads them locally. The existing signals
+between the two GCDs already guarantee the order (written before "routed", rewritten only after the
+partner's "experts done").
+
+### The numbers for our model
+
+Per call on one GCD inside the real run (rocprofv3), 512 requests, 1,024 steps (20b) or one pair of
+GCDs, 128 steps (120b):
+
+| Kernel | 20b before → after | 120b before → after |
+|---|---|---|
+| add + RMSNorm | 25.8 → 20.0 µs | 26.8 → 20.8 µs (30.7 with the copy to the partner) |
+| rope_kv (keys and values only now) | 22.3 → 9.4 µs | 22.8 → 10.7 µs |
+| attention, full layers past 128 positions | 419.0 → 402.7 µs | — |
+| top-4 | 16.2 → 12.9 µs | 18.8 → 14.5 µs |
+| count + place → one kernel | 5.6 + 9.8 → 9.1 µs | 14.9 + 18.9 → 14.4 µs |
+| gather of the expert inputs | (inside mlp1) | 42.8 → 18.6 µs |
+| partial sums for the partner | — | 23.0 → 18.5 µs |
+| combine + RMSNorm | 51.4 → 35.6 µs | 70.7 → 60.6 µs |
+| GPU busy time | 46.5 → 45.0 s (−3.2 %) | 10.62 → 10.41 s (−2.0 %) |
+
+End to end (official input, 8 GCDs, old and new builds alternated twice): gpt-oss-20b
+78,773 → 80,059 tok/s (+1.6 %), gpt-oss-120b 44,200 → 45,210 tok/s (+2.3 %). In the full runs
+every package is at its power limit, so the small kernels' share is smaller than on one GCD.
+Every change leaves the output hash unchanged; `getp-csrc/tests/small_kernels_test.cpp` compares
+each new kernel with the one it replaced, bit for bit.
+
+### What did not help
+
+- **Router multiply + top-4 in one kernel.** Same bits, 5 µs faster in a warm test, but slower in
+  the run (cold code, and a long serial tail in the last block of each tile).
+- **Pushing the 120b partial sums to the partner too.** The 5.9 MB still cross the link; the cost
+  only moved from the partner's combine to the signal that follows (it must flush them).
+  Fine-grained memory for these buffers made the writes wait for the link inside the kernels.
+- **A shallower load ring in the router multiply** (shorter code): no measurable change.
+
+### Where it is
+
+- `getp-csrc/kernels/fast_misc.hpp` — `add_rmsnorm_bf16` (with `load_row256`, `block_sum256`,
+  `rms_inv_row`, `rmsnorm_store_bf16`), `rope_kv_bf16`.
+- `getp-csrc/kernels/fast_common.hpp` — `rope_pair`, the one place the rotation is written.
+- `getp-csrc/kernels/fast_attention.hpp` — `attention_gqa8_kernel`: `ROT`, `load_k` / `load_v`.
+- `getp-csrc/kernels/moe.hpp` — `router_topk_wave_kernel`.
+- `getp-csrc/kernels/moe_ep.hpp` — `moe_group_ep`, `moe_gather_ep_bf16`, `moe_partial_ep`,
+  `moe_combine_rmsnorm`, `moe_combine_partial_rmsnorm`.
+- `getp-csrc/engine/gpu_engine.hpp` — `t16_peer` and the calls above.
+- `getp-csrc/tests/small_kernels_test.cpp` (bit-for-bit test against
+  `getp-csrc/tests/small_kernels_ref.hpp`, the kernels before) and
+  `getp-csrc/bench/small_kernels_bench.cpp` (timing, `--evict`).
+
+### Pitfalls
+
+- A loop guarded by a run-time bound (`if (j < H)`) splits the code into small pieces, and the
+  compiler then waits for all outstanding memory operations at each piece. Use compile-time counts
+  and clamp addresses instead of skipping loads.
+- Array indexed by a run-time variable → scratch memory. Unroll so every index is a constant, or
+  keep values in a different form (one bit per element in a word, one value per lane).
+- Measure small kernels in the real run or with other kernels between calls: a test that calls one
+  kernel in a loop keeps its code and data in the caches and can rank two versions the wrong way.
 
 ## Further reading
 
