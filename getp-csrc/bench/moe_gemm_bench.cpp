@@ -10,7 +10,8 @@
 // MOE_ONLY="20b mlp1 512" limits the run to one configuration; MOE_UNIFORM=64
 // gives every expert 64 rows; MOE_FUSED=1 also times, for mlp1, the engine's
 // three kernels (gather_bf16_kernel + gemm_grouped_mxfp4 + swiglu_bf16_kernel)
-// against the fused gemm_grouped_mxfp4_gather_swiglu.
+// against the fused gemm_grouped_mxfp4_gather_swiglu. MOE_DUMP120=<path with
+// %d for B> replaces the synthetic 120b routing by dumped real routing.
 //
 // A dump file holds lines "B pos layer offsets[0] .. offsets[32]": the real
 // routing of gpt-oss-20b, one line per layer and step. Each timed call uses
@@ -19,7 +20,8 @@
 // card: each GCD runs experts 0..63 (or 64..127) on the rows of both GCDs'
 // B tokens (about 4 * B rows, at most 2 * B per expert). Its routing is
 // synthetic (2 * B tokens picking 4 of 128 experts, the first 64 kept), with
-// the same unevenness as the measured 20b one.
+// the same unevenness as the measured 20b one, unless MOE_DUMP120 points to
+// dumps of the real one (see below; the real one is more uneven).
 //
 // The fast kernel reads the weights repacked by moe_pack_mxfp4 (done once,
 // not timed), the simple version the checkpoint layout.
@@ -193,9 +195,30 @@ int main(int argc, char **argv) {
     printf("routing unevenness (std/mean of rows per expert): real 20b B=512 %.2f, "
            "synthetic 20b B=512 %.2f\n", cvreal, cv20);
   }
+  // MOE_DUMP120=<path with %d> uses real routing of the gpt-oss-120b split
+  // instead (one GCD's 64 experts per line: "rows e_begin layer offsets[0]
+  // .. offsets[64]", 72 lines per step), when the file for that B exists:
+  // positions from 16 on (the first ones are the prompts' shared prefix),
+  // every 37th line, so the calls mix layers and both GCDs.
   for (int i = 0; i < 3; i++) {
     Config c{"120b", 64, Bs[i], 2 * Bs[i], {}};
-    for (int s = 0; s < 24; s++)
+    if (const char *pat = getenv("MOE_DUMP120")) {
+      char path[1024];
+      snprintf(path, sizeof path, pat, Bs[i]);
+      if (FILE *f = fopen(path, "r")) {
+        int rows, e0, l, n = 0;
+        while (fscanf(f, "%d %d %d", &rows, &e0, &l) == 3) {
+          std::vector<int> off(65);
+          for (auto &o : off)
+            if (fscanf(f, "%d", &o) != 1)
+              exit(1);
+          if (n++ >= 16 * 72 && n % 37 == 0)
+            c.sets.push_back(off);
+        }
+        fclose(f);
+      }
+    }
+    for (int s = 0; c.sets.empty() && s < 24; s++)
       c.sets.push_back(synth_offsets(64, 2 * Bs[i], 1000 * i + s, shape, 128));
     cfgs.push_back(c);
   }

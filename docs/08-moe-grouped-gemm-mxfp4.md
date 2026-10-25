@@ -443,6 +443,68 @@ for all but one load in flight (`s_waitcnt vmcnt(1)` in the 16- and 48-row loops
 for the loads its step needs. The time did not change measurably, but the test of loading two steps
 ahead only meant something after this fix.
 
+### 9. Where the other half of the peak goes
+
+20b mlp1 at B=512 does 2 × 2,048 × 5,760 × 2,880 = 68 GFLOP of useful work in 715 µs: 95 TFLOP/s,
+52 % of the 181 TFLOP/s peak. The three factors below multiply to it (counters of one call,
+rocprofv3, mv-mi250-03):
+
+| factor | measured | × |
+|---|---|---:|
+| clock: 1.05 million cycles in 720 µs | 1.46 GHz, not the 1.7 GHz of the peak | 0.86 |
+| matrix cores busy: MFMAs issued × 32 cycles / (416 SIMDs × cycles) | 9.62 M MFMAs → 70.3 % | 0.70 |
+| of the issued MFMA work, the useful part: 67.95 of 78.8 GFLOP | rows 0.895 × columns 0.978 × k 0.978 | 0.86 |
+| product: 181 × 0.86 × 0.70 × 0.86 | 94 TFLOP/s | |
+
+"Busy" counts every issued MFMA, also the padding ones, so it is a measure of issue, not of
+useful work. The padding comes from three places:
+
+- **Rows** (−10.5 %): an item computes its rows in 16-row MFMA tiles, so an expert with 20 rows
+  pays for 32. Measured on real routings: 20b 10.5 % (B=512) and 5.6 % (B=1,024); the gpt-oss-120b
+  split 19.2 % and 10.6 % (its real routing, dumped from `./run`, positions from 16 on, is much more
+  uneven than the synthetic one of the next section). Rows are already rounded up to 16, not 64; a
+  smaller MFMA shape would add the products in another order, so this part stays as long as the
+  output must not change by a bit.
+- **Columns** (−2.2 % for mlp1, −6.25 % for mlp2): N = 5,760 is 22.5 tiles of 256, and N = 2,880
+  is 11.25. In the last tile the wavefronts whose pieces lie past N (4 of 8 for mlp1, 6 of 8 for
+  mlp2) load zero weights and still issue all their MFMAs.
+- **k** (−2.2 %): K = 2,880 is 22.5 steps of 128; in the last step half of each MFMA's 16 k slots
+  hold zeros. Packing the last 64 k into fewer MFMAs would also change the order of the additions.
+
+The 30 % of time with idle matrix cores, measured per block with a timeline build (each block
+records when it starts, when it ends, and the time it spends inside items):
+
+| call, B=512 | idle at the end (queue tail) | gaps between items (ticket, lookup) | in items | items per block |
+|---|---:|---:|---:|---:|
+| 20b mlp1 | 3.6–3.7 % | 1.4 % | 93.8 % | 5.5 |
+| 20b mlp2 | 7.3–8.4 % | 2.4 % | 88.3 % | 2.9 |
+| 120b mlp1 / mlp2 (real routing) | 3.0–3.1 / 5.6–5.7 % | 1.5 / 1.5 % | 94.4 / 91.1 % | 7.8 / 4.1 |
+
+(The rest, about 1 %, is the start, the last ticket and the exit.)
+
+At B=1,024 the tail is 2.2 / 5.5 % (20b) and 1.9 / 3.5 % (120b). The rest, about 24 % of the time
+inside items, are the stalls of section 8: the weight stream for small items, and LDS waits for
+the big ones.
+
+**What was tried against these parts** (all bit-identical; µs per call on the real routings, the
+120b ones with `MOE_DUMP120`, 3 rounds):
+
+- *Column padding:* the wavefronts without a column took a path that only copies A and joins the
+  barriers. The fused mlp1 calls got 0.2–0.9 % faster, plain mlp2 at B=512 1.3 % slower (20b
+  404 → 409, 120b 467 → 473), uniform 48/64-row mlp2 12 / 9 % slower. Those MFMAs on zero
+  weights were not what the time waited for.
+- *Queue tail:* the items of the smallest experts (≤ 16 rows) were split into two items of 128
+  columns. As two halves on 4 wavefronts each (the others only copy A), the time grew 0.2–2.4 %:
+  the busy wavefronts did as much as before. As 8 wavefronts with one 16-column piece each (half
+  the work per wavefront), the tail did shrink (20b mlp1 B=512 3.6 → 2.2 %, mlp2 7.3 → 5.4 %, 120b
+  mlp2 5.7 → 3.2 %). But each extra item repeats its A copy, ticket, scale loads and epilogue
+  (about 12 µs per extra item), and the calls ended 0.6 % faster to 1.1 % slower.
+- The gaps between items (ticket, expert lookup) are 1.4–2.4 % of a call: not attempted, as a
+  ticket taken early would make the queue tail longer.
+
+So the part worth a next attack is the 24 % inside items (section 8, "What could come next"), not
+the padding or the queue.
+
 ## What was limiting it: requests to the L2 cache
 
 The previous draft of this kernel (64 × 128 items, 4 wavefronts, steps of 64 k, one scale byte loaded
@@ -590,7 +652,8 @@ All in `getp-csrc/kernels/fast_moe_gemm.hpp`:
 
 Tests and measurements: `getp-csrc/tests/moe_gemm_test.cpp` (unit test),
 `getp-csrc/bench/moe_gemm_bench.cpp` (speed, `MOE_UNIFORM=64` for even routing, `MOE_ONLY=…` for
-one configuration), `getp-csrc/bench/moe_stream_bench.cpp` (the weight stream alone, section 8),
+one configuration, `MOE_DUMP120=…/off120_b%d.txt` for the real routing of the 120b split instead of
+the synthetic one), `getp-csrc/bench/moe_stream_bench.cpp` (the weight stream alone, section 8),
 `getp-csrc/bench/moe_torch_lib.py` (library yardstick, separate script).
 
 ## Correctness
@@ -648,6 +711,9 @@ one configuration), `getp-csrc/bench/moe_stream_bench.cpp` (the weight stream al
 | items handed out in fixed round-robin order instead of the queue | 717 → 823 µs (+15 %) | the biggest-first queue matters; without the per-step barrier on top: 821 µs, 16 rows 325 → 344 µs (the barrier is not what limits small tiles) |
 | wave priorities also for 48-row tiles | uniform 48-row mlp2 287 → 323 µs (+12 %); real routings ±0.5 % | see section 8; any MFMA-loop priority did it, a load priority alone +6.5 % |
 | wave priorities also for 64-row tiles | +1 % | these tiles are bound by the MFMA loop itself |
+| wavefronts without a column (last tile) only copy A instead of multiplying zero weights (section 9) | fused mlp1 −0.2..−0.9 %; mlp2 B=512 +1.3 % (20b and 120b); uniform 48 / 64-row mlp2 +12 / +9 % | the time did not wait on those MFMAs |
+| items of experts with ≤ 16 rows split into two 128-column items on 4 wavefronts each | +0.2..+2.4 % | the busy wavefronts did the same work as before; the other 4 only copied A |
+| the same split, 8 wavefronts with one 16-column piece each | queue tail 3.6 → 2.2 % (20b mlp1 B=512), 7.3 → 5.4 % (mlp2); calls −0.6..+1.1 % | each extra item repeats its A copy, ticket, scale loads and epilogue (about 12 µs) |
 
 ## Pitfalls
 
