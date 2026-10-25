@@ -93,7 +93,7 @@ answer in any order, so the result does not depend on which block finishes first
 | Grouping, block per expert | 318 → 14.4 µs per layer | (part of a +37 % row) |
 | Finished requests skip the experts | — | 20b +0.8 %, 120b +1.2 % |
 | Adds fused with the norms | 2 passes over the residual stream fewer per layer | 20b +0.9 %, 120b +0.3 % |
-| LM head picks the token | 4,897 + 435 → 4,510 + 6 µs (B=512); 9,719 + 865 → 9,223 + 6 µs (B=1024) | see the log |
+| LM head picks the token | 4,897 + 435 → 4,510 + 6 µs (B=512); 9,719 + 865 → 9,223 + 6 µs (B=1024) | 20b +1.3 %, 120b +0.9 % |
 
 Every row above was checked to leave the output bits unchanged (same output hash).
 
