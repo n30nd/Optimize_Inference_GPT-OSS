@@ -56,10 +56,13 @@ __global__ void router_topk_exact(const float *__restrict__ logits, int E,
 // arg-max (ties: lower expert), then lane 0 does the same softmax.
 // Rows with done[b] set (done may be null) get expert -1, "no expert", for
 // all k choices: finished requests then cost no expert work.
+// slot_of (may be null) renumbers the chosen experts on output: topk_e gets
+// slot_of[e] instead of e. The choice itself and the weights do not change.
 #define TOPK_WAVES 4
 __global__ __launch_bounds__(64 * TOPK_WAVES) void router_topk_wave_kernel(
     const float *__restrict__ logits, int E, int k, float *__restrict__ topk_w,
-    int *__restrict__ topk_e, int B, const int *__restrict__ done) {
+    int *__restrict__ topk_e, int B, const int *__restrict__ done,
+    const int *__restrict__ slot_of) {
   const int lane = threadIdx.x % 64;
   const int b = blockIdx.x * TOPK_WAVES + threadIdx.x / 64;
   if (b >= B)
@@ -115,7 +118,7 @@ __global__ __launch_bounds__(64 * TOPK_WAVES) void router_topk_wave_kernel(
   }
   for (int j = 0; j < k; j++) {
     topk_w[(size_t)b * k + j] = (float)__ddiv_rn((double)val[j], sum);
-    topk_e[(size_t)b * k + j] = chosen[j];
+    topk_e[(size_t)b * k + j] = slot_of ? slot_of[chosen[j]] : chosen[j];
   }
 }
 

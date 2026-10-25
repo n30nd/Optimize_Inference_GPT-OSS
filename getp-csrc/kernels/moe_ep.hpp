@@ -15,6 +15,27 @@
 #include "fast_common.hpp"
 #include "moe.hpp"
 
+// Signals between the two GCDs of a pair. A GCD tells its partner "the data
+// I wrote before this point may be read" by raising a counter in its own
+// memory; the partner's stream runs a one-thread kernel that waits until the
+// counter reaches the expected value. The counters live in fine-grained
+// memory (kept coherent between the GCDs), and the fences make
+// the data around them visible: the release writes this GCD's L2 cache back
+// to memory before the counter goes up, the acquire drops the partner's data
+// that this GCD's L2 may still hold from earlier reads. Same meaning as
+// hipEventRecord / hipStreamWaitEvent across two GCDs, but cheaper on MI250:
+// about 13 microseconds per exchange for both kernels together, against
+// about 18 for the event wait.
+__global__ void ep_signal_kernel(int *flag, int value) {
+  __hip_atomic_store(flag, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+__global__ void ep_wait_kernel(const int *flag, int value) {
+  while (__hip_atomic_load(flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < value)
+    __builtin_amdgcn_s_sleep(2);
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+}
+
 // Grouping the rows for experts e_begin .. e_begin+e_count-1: own pairs first,
 // then the partner's, each in pair order. offsets (e_count + 1) are local.
 // own_row[p] / peer_row[p]: row of that pair in this GCD's grouped buffers,
@@ -135,7 +156,9 @@ __global__ void moe_gather_ep_kernel(const T *__restrict__ x_own,
 // Z_peer at the partner's peer_row[p]. kExact: add the experts in increasing
 // expert order with FMA, as forward() in run.cpp builds e_agg (same as
 // moe_combine_exact); otherwise in choice order (same as moe_combine_kernel).
-// One block per token.
+// When topk_e holds renumbered experts (router_topk_wave_kernel's slot_of),
+// phys_of maps them back to the checkpoint's numbers for that order; null
+// otherwise. One block per token.
 template <bool kExact>
 __global__ void moe_combine_ep_kernel(float *__restrict__ x,
                                       const float *__restrict__ Z_own,
@@ -144,16 +167,18 @@ __global__ void moe_combine_ep_kernel(float *__restrict__ x,
                                       const int *__restrict__ peer_rows_of_mine,
                                       const float *__restrict__ topk_w,
                                       const int *__restrict__ topk_e,
-                                      int e_begin, int e_count, int k, int H) {
+                                      int e_begin, int e_count, int k, int H,
+                                      const int *__restrict__ phys_of) {
   const int b = blockIdx.x;
-  int order[MOE_MAX_TOPK];
-  for (int j = 0; j < k; j++)
+  int order[MOE_MAX_TOPK], key[MOE_MAX_TOPK];
+  for (int j = 0; j < k; j++) {
     order[j] = j;
+    const int e = topk_e[(size_t)b * k + j];
+    key[j] = phys_of && e >= 0 ? phys_of[e] : e;
+  }
   if (kExact)
     for (int i = 1; i < k; i++)
-      for (int j = i; j > 0 && topk_e[(size_t)b * k + order[j]] <
-                                   topk_e[(size_t)b * k + order[j - 1]];
-           j--) {
+      for (int j = i; j > 0 && key[order[j]] < key[order[j - 1]]; j--) {
         int t = order[j];
         order[j] = order[j - 1];
         order[j - 1] = t;

@@ -3,11 +3,11 @@
 // The visible GCDs are split into groups. A group is one GCD holding the whole
 // model (gpt-oss-20b), or two GCDs of one MI250 card that share the model:
 // both hold the dense weights, each holds half of every layer's experts
-// (gpt-oss-120b, which does not fit on one GCD). Every GCD serves its own
-// requests; inside a group the two GCDs only meet in the expert step, where
-// each runs its experts for both GCDs' tokens. Groups never talk to each
-// other (data parallel). On a GCD, up to `batch` requests run together and
-// advance one position per step (static batching).
+// (gpt-oss-120b, which does not fit on one GCD; which half: gpu_expert_order).
+// Every GCD serves its own requests; inside a group the two GCDs only meet in
+// the expert step, where each runs its experts for both GCDs' tokens. Groups
+// never talk to each other (data parallel). On a GCD, up to `batch` requests
+// run together and advance one position per step (static batching).
 //
 // Weights: bf16 for the dense matrices, MXFP4 for the experts, fp32 for norms,
 // biases and sinks, exactly as stored in the checkpoint.
@@ -35,6 +35,7 @@
 #include "../kernels/misc.hpp"
 #include "../kernels/moe.hpp"
 #include "../kernels/moe_ep.hpp"
+#include "ep_split_120b.hpp"
 #include "hf_model.hpp"
 
 #define HIP_CHECK(call)                                                        \
@@ -50,6 +51,11 @@
 #define GPU_DEFAULT_BATCH 512
 #define GPU_DEFAULT_MAX_POS 1024
 
+// The two signals a GCD sends its partner in every layer (ep_signal).
+#define EP_ROUTED 0
+#define EP_EXPERTS 1
+#define EP_FLAG_STRIDE 64 // ints between the two flags: separate cache lines
+
 struct GpuLayer {
   const uint16_t *w_qkv, *w_o, *w_router;
   const float *b_qkv, *b_o, *b_router, *sinks, *rms_attn, *rms_ffn;
@@ -57,6 +63,11 @@ struct GpuLayer {
   // fast path packed by moe_pack_mxfp4 when moe_mfma_ok
   const uint8_t *mlp1_blocks, *mlp1_scales, *mlp2_blocks, *mlp2_scales;
   const float *b_mlp1, *b_mlp2;
+  // Experts split by a table (gpu_expert_order): the router writes expert
+  // slots, not checkpoint numbers, to topk_e. slot_of: checkpoint expert ->
+  // slot, phys_of: slot -> checkpoint expert. Null when slots and checkpoint
+  // numbers are the same.
+  const int *slot_of = nullptr, *phys_of = nullptr;
   float *kc, *vc;      // exact path KV cache (batch, slots, kv_dim)
   bf16_t *kc16;        // fast path K cache, chunk64 layout (fast_attention.hpp)
   int8_t *vq8;         // fast path V cache: int8 codes (vq_index_chunk64)
@@ -73,9 +84,13 @@ struct GpuWorker {
   Config cfg;
   int batch = 0;   // requests per wave
   int max_pos = 0; // positions the KV cache holds
-  int e_begin = 0, e_count = 0; // experts held: e_begin .. e_begin+e_count-1
+  int e_begin = 0, e_count = 0; // expert slots held: e_begin .. e_begin+e_count-1
   GpuWorker *peer = nullptr;    // the GCD holding the other experts, if split
-  hipEvent_t ev_routed, ev_experts; // peer may read topk_e / Zg after these
+  // Signals to the partner (ep_signal_kernel): flags[EP_ROUTED] reaches
+  // sent[EP_ROUTED] when topk_e, topk_w and t of the layer may be read,
+  // flags[EP_EXPERTS] when Zg, S and peer_row may. Fine-grained memory.
+  int *flags = nullptr;
+  int sent[2] = {0, 0}; // signals of each kind queued so far
   std::vector<GpuLayer> layers;
   const uint16_t *emb = nullptr, *unemb = nullptr;
   const float *rms_out = nullptr;
@@ -87,12 +102,14 @@ struct GpuWorker {
   bf16_t *t16, *att16, *Xg16, *Gg16; // fast path matrix-multiply inputs
   float *S = nullptr; // fast path, split experts: partial sums for the partner's tokens
   unsigned long long *amax_keys = nullptr; // fast path: one argmax key per row (logits unused)
+  int *load_log = nullptr; // GPTOSS_EXPERT_LOAD: counts of every layer of the step
   std::vector<void *> weight_allocs, state_allocs;
 };
 
 // One GCD, or two GCDs that split the experts.
 struct GpuGroup {
   std::vector<GpuWorker *> m;
+  FILE *load_file = nullptr; // GPTOSS_EXPERT_LOAD
 };
 
 static std::vector<GpuWorker *> g_workers;
@@ -116,6 +133,22 @@ static T *gpu_upload(std::vector<void *> &owner, const void *src, size_t n) {
 static int env_int(const char *name, int fallback) {
   const char *v = getenv(name);
   return v && *v ? atoi(v) : fallback;
+}
+
+// Which experts each GCD holds when two GCDs split them. Experts are handled
+// by slot: the GCD of rank r holds slots r * E/2 .. (r+1) * E/2 - 1 of every
+// layer, and the slot j of layer l is the checkpoint's expert
+// gpu_expert_order(c, l)[j]. The table (ep_split_120b.hpp, made by
+// tools/ep_split.py) gives each GCD of a pair a set of experts with about
+// the same expected work, instead of the first and second half (the router
+// picks some experts far more often than others). Null (slot = checkpoint
+// number) for a model without a table or with GPTOSS_EP_SPLIT=0.
+static const uint8_t *gpu_expert_order(const Config &c, int l) {
+  static const int on = env_int("GPTOSS_EP_SPLIT", 1);
+  if (!on || c.n_layers != EP_SPLIT_LAYERS || c.n_experts != EP_SPLIT_EXPERTS ||
+      c.hidden_dim != EP_SPLIT_HIDDEN)
+    return nullptr;
+  return ep_split_120b[l];
 }
 
 // Rows of the grouped expert buffers: this GCD's pairs, plus its partner's.
@@ -144,11 +177,38 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
     const StTensor &s = raw(name);
     return (const uint16_t *)gpu_upload<uint16_t>(own, s.data, s.nbytes / 2);
   };
-  auto bytes = [&](const std::string &name, size_t offset, size_t n) {
-    return (const uint8_t *)gpu_upload<uint8_t>(own, raw(name).data + offset, n);
-  };
   auto f32 = [&](const float *src, size_t n) {
     return (const float *)gpu_upload<float>(own, src, n);
+  };
+  // The checkpoint experts of this GCD's slots, in slot order, for layer l.
+  std::vector<int> phys(ne);
+  auto set_phys = [&](int l) {
+    const uint8_t *order = ne < E ? gpu_expert_order(c, l) : nullptr;
+    for (size_t j = 0; j < ne; j++)
+      phys[j] = order ? order[e0 + j] : (int)(e0 + j);
+  };
+  // Copies `per` bytes of each of this GCD's experts from src (all experts,
+  // `per` bytes each) to dst, one copy per run of consecutive experts.
+  auto copy_experts = [&](uint8_t *dst, const uint8_t *src, size_t per) {
+    for (size_t j = 0; j < ne;) {
+      size_t n = 1;
+      while (j + n < ne && phys[j + n] == phys[j] + (int)n)
+        n++;
+      HIP_CHECK(hipMemcpy(dst + j * per, src + (size_t)phys[j] * per, n * per,
+                          hipMemcpyHostToDevice));
+      j += n;
+    }
+  };
+  auto expert_bytes = [&](const std::string &name, size_t per) {
+    uint8_t *p = gpu_alloc<uint8_t>(own, ne * per);
+    copy_experts(p, raw(name).data, per);
+    return (const uint8_t *)p;
+  };
+  auto expert_f32 = [&](const float *src, size_t per) {
+    std::vector<float> h(ne * per);
+    for (size_t j = 0; j < ne; j++)
+      memcpy(&h[j * per], src + (size_t)phys[j] * per, per * sizeof(float));
+    return f32(h.data(), h.size());
   };
   // Expert weights: the fast path's matrix-core kernel reads them repacked
   // (moe_pack_mxfp4); the checkpoint bytes pass through a staging buffer.
@@ -158,8 +218,8 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
                      const uint8_t *&scales) {
     const size_t gr = (size_t)N * (K / 32); // scale groups per expert
     if (w->exact || !moe_mfma_ok((int)ne, N, K)) {
-      blocks = bytes(name + ".blocks", e0 * gr * 16, ne * gr * 16);
-      scales = bytes(name + ".scales", e0 * gr, ne * gr);
+      blocks = expert_bytes(name + ".blocks", gr * 16);
+      scales = expert_bytes(name + ".scales", gr);
       return;
     }
     if (ne * gr * 17 > stage_bytes) {
@@ -168,10 +228,8 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
       stage_bytes = ne * gr * 17;
       HIP_CHECK(hipMalloc(&stage, stage_bytes));
     }
-    HIP_CHECK(hipMemcpy(stage, raw(name + ".blocks").data + e0 * gr * 16, ne * gr * 16,
-                        hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(stage + ne * gr * 16, raw(name + ".scales").data + e0 * gr, ne * gr,
-                        hipMemcpyHostToDevice));
+    copy_experts(stage, raw(name + ".blocks").data, gr * 16);
+    copy_experts(stage + ne * gr * 16, raw(name + ".scales").data, gr);
     uint8_t *pb = gpu_alloc<uint8_t>(own, ne * moe_packed_blocks_bytes(N, K));
     uint8_t *ps = gpu_alloc<uint8_t>(own, ne * moe_packed_scales_bytes(N, K));
     moe_pack_mxfp4(0, stage, stage + ne * gr * 16, (int)ne, N, K, pb, ps);
@@ -197,10 +255,21 @@ static void gpu_upload_weights(GpuWorker *w, const Transformer *t) {
     g.rms_ffn = f32(tw.rms_ffn_w + l * H, H);
     g.w_router = bf16(b + "mlp.gate.weight");
     g.b_router = f32(tw.b_router + l * E, E);
+    set_phys(l);
     experts(b + "mlp.mlp1_weight", (int)(2 * I), (int)H, g.mlp1_blocks, g.mlp1_scales);
-    g.b_mlp1 = f32(tw.b_mlp1 + (l * E + e0) * 2 * I, ne * 2 * I);
+    g.b_mlp1 = expert_f32(tw.b_mlp1 + l * E * 2 * I, 2 * I);
     experts(b + "mlp.mlp2_weight", (int)H, (int)I, g.mlp2_blocks, g.mlp2_scales);
-    g.b_mlp2 = f32(tw.b_mlp2 + (l * E + e0) * H, ne * H);
+    g.b_mlp2 = expert_f32(tw.b_mlp2 + l * E * H, H);
+    g.slot_of = g.phys_of = nullptr;
+    if (const uint8_t *order = ne < E ? gpu_expert_order(c, l) : nullptr) {
+      std::vector<int> slot_of(E), phys_of(E);
+      for (size_t j = 0; j < E; j++) {
+        phys_of[j] = order[j];
+        slot_of[order[j]] = (int)j;
+      }
+      g.slot_of = (const int *)gpu_upload<int>(own, slot_of.data(), E);
+      g.phys_of = (const int *)gpu_upload<int>(own, phys_of.data(), E);
+    }
   }
   if (stage)
     HIP_CHECK(hipFree(stage));
@@ -305,6 +374,11 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
   }
   if (!w->exact && w->e_count < c.n_experts)
     w->S = gpu_alloc<float>(own, B * H);
+  w->load_log = nullptr;
+  if (getenv("GPTOSS_EXPERT_LOAD")) {
+    w->load_log = gpu_alloc<int>(own, (size_t)c.n_layers * w->e_count);
+    HIP_CHECK(hipMemset(w->load_log, 0, (size_t)c.n_layers * w->e_count * sizeof(int)));
+  }
 
   // RoPE angles from run.cpp's own compute_cos_sin(), one row per position.
   const int half = c.head_dim / 2;
@@ -334,8 +408,10 @@ static GpuWorker *gpu_new_worker(int device, const Transformer *t, bool exact,
   w->e_begin = e_begin;
   w->e_count = e_count;
   HIP_CHECK(hipStreamCreate(&w->stream));
-  HIP_CHECK(hipEventCreateWithFlags(&w->ev_routed, hipEventDisableTiming));
-  HIP_CHECK(hipEventCreateWithFlags(&w->ev_experts, hipEventDisableTiming));
+  HIP_CHECK(hipExtMallocWithFlags((void **)&w->flags, 2 * EP_FLAG_STRIDE * sizeof(int),
+                                  hipDeviceMallocFinegrained));
+  HIP_CHECK(hipMemset(w->flags, 0, 2 * EP_FLAG_STRIDE * sizeof(int)));
+  w->weight_allocs.push_back(w->flags);
   gpu_upload_weights(w, t);
   return w;
 }
@@ -435,8 +511,9 @@ static void layer_route(GpuWorker *w, int l, int B) {
   }
   if (E <= 256)
     router_topk_wave_kernel<<<(B + TOPK_WAVES - 1) / TOPK_WAVES, 64 * TOPK_WAVES, 0, s>>>(
-        w->router, E, K, w->topk_w, w->topk_e, B, w->exact ? nullptr : w->row_done);
-  else
+        w->router, E, K, w->topk_w, w->topk_e, B, w->exact ? nullptr : w->row_done,
+        g.slot_of);
+  else // gpu_expert_order() has no table for more than 256 experts
     router_topk_exact<<<(B + 63) / 64, 64, 0, s>>>(w->router, E, K, w->topk_w, w->topk_e, B);
 }
 
@@ -452,6 +529,9 @@ static void layer_experts(GpuWorker *w, int l, int B, int B_peer) {
   GpuWorker *p = w->peer;
   moe_count_ep_kernel<<<w->e_count, MOE_GROUP_THREADS, 0, s>>>(
       w->topk_e, B * K, p ? p->topk_e : nullptr, B_peer * K, w->e_begin, w->counts);
+  if (w->load_log)
+    HIP_CHECK(hipMemcpyAsync(w->load_log + (size_t)l * w->e_count, w->counts,
+                             w->e_count * sizeof(int), hipMemcpyDeviceToDevice, s));
   moe_place_ep_kernel<<<w->e_count, MOE_GROUP_THREADS, 0, s>>>(
       w->topk_e, B * K, p ? p->topk_e : nullptr, B_peer * K, w->e_begin, w->e_count,
       w->counts, w->offsets, w->row_pair, w->own_row, w->peer_row);
@@ -505,7 +585,7 @@ static void layer_combine(GpuWorker *w, int l, int B) {
   if (w->exact)
     moe_combine_ep_kernel<true><<<B, 256, 0, w->stream>>>(
         w->x, w->Zg, w->own_row, Zp, rows_p, w->topk_w, w->topk_e, w->e_begin, w->e_count,
-        c.experts_per_token, c.hidden_dim);
+        c.experts_per_token, c.hidden_dim, w->layers[l].phys_of);
   else {
     // the combine also writes t16 = RMSNorm(x) for the next layer (or the LM head)
     const float *norm_w = l + 1 < c.n_layers ? w->layers[l + 1].rms_attn : w->rms_out;
@@ -536,12 +616,25 @@ static void step_logits(GpuWorker *w, int B) {
   }
 }
 
+// This GCD's data of kind `kind` may now be read by its partner.
+static void ep_signal(GpuWorker *w, int kind) {
+  ep_signal_kernel<<<1, 1, 0, w->stream>>>(w->flags + kind * EP_FLAG_STRIDE, ++w->sent[kind]);
+}
+
+// The rest of this GCD's stream waits for the partner's last signal of `kind`
+// queued so far.
+static void ep_wait(GpuWorker *w, int kind) {
+  const GpuWorker *p = w->peer;
+  ep_wait_kernel<<<1, 1, 0, w->stream>>>(p->flags + kind * EP_FLAG_STRIDE, p->sent[kind]);
+}
+
 // One decode step for every GCD of a group at position `pos`: member i has
 // B[i] rows, tokens in its `tokens`, greedy next tokens to its `next`.
-// The partner reads a GCD's topk_e and t after ev_routed, and its Zg and
-// peer_row after ev_experts. A GCD overwrites those only in the next layer,
-// after it has waited for its partner's next event, which its partner records
-// after finishing these reads, so one copy of each buffer is enough.
+// The partner reads a GCD's topk_e, topk_w and t after its EP_ROUTED signal,
+// and its Zg, S and peer_row after EP_EXPERTS. A GCD overwrites those only in
+// the next layer, after it has waited for its partner's next signal, which
+// the partner sends after finishing these reads, so one copy of each buffer
+// is enough. The host queues every signal before the wait that refers to it.
 static void gpu_step_group(GpuGroup &g, const int *B, int pos) {
   const int n = (int)g.m.size();
   for (int i = 0; i < n; i++) {
@@ -556,22 +649,22 @@ static void gpu_step_group(GpuGroup &g, const int *B, int pos) {
       layer_attention(w, l, B[i], pos);
       layer_route(w, l, B[i]);
       if (n > 1)
-        HIP_CHECK(hipEventRecord(w->ev_routed, w->stream));
+        ep_signal(w, EP_ROUTED);
     }
     for (int i = 0; i < n; i++) {
       GpuWorker *w = g.m[i];
       HIP_CHECK(hipSetDevice(w->device));
       if (n > 1)
-        HIP_CHECK(hipStreamWaitEvent(w->stream, w->peer->ev_routed, 0));
+        ep_wait(w, EP_ROUTED);
       layer_experts(w, l, B[i], n > 1 ? B[1 - i] : 0);
       if (n > 1)
-        HIP_CHECK(hipEventRecord(w->ev_experts, w->stream));
+        ep_signal(w, EP_EXPERTS);
     }
     for (int i = 0; i < n; i++) {
       GpuWorker *w = g.m[i];
       HIP_CHECK(hipSetDevice(w->device));
       if (n > 1)
-        HIP_CHECK(hipStreamWaitEvent(w->stream, w->peer->ev_experts, 0));
+        ep_wait(w, EP_EXPERTS);
       layer_combine(w, l, B[i]);
     }
   }
@@ -624,6 +717,38 @@ static void wave_slot_init(WaveSlot &ws, Tokenizer *tok, Requests *req,
     ws.cur[b] = ws.prompts[b][0];
 }
 
+// GPTOSS_EXPERT_LOAD=<file>: after every step, appends to <file>.<first GPU
+// of the group> how many rows each expert got in each layer from the tokens
+// of the whole group: int16, n_layers x n_experts, by checkpoint expert
+// number. tools/ep_split.py reads these files.
+static void gpu_write_load(GpuGroup &g, const char *path) {
+  const Config &c = g.m[0]->cfg;
+  if (!g.load_file) {
+    const std::string name = std::string(path) + "." + std::to_string(g.m[0]->device);
+    g.load_file = fopen(name.c_str(), "wb");
+    if (!g.load_file) {
+      fprintf(stderr, "GPTOSS_EXPERT_LOAD: cannot write %s\n", name.c_str());
+      exit(EXIT_FAILURE);
+    }
+  }
+  std::vector<int16_t> rec((size_t)c.n_layers * c.n_experts, 0);
+  std::vector<int> h;
+  for (GpuWorker *w : g.m) {
+    h.resize((size_t)c.n_layers * w->e_count);
+    HIP_CHECK(hipSetDevice(w->device));
+    HIP_CHECK(hipMemcpy(h.data(), w->load_log, h.size() * sizeof(int), hipMemcpyDeviceToHost));
+    for (int l = 0; l < c.n_layers; l++) {
+      const uint8_t *order = w->e_count < c.n_experts ? gpu_expert_order(c, l) : nullptr;
+      for (int j = 0; j < w->e_count; j++) {
+        const int slot = w->e_begin + j;
+        rec[(size_t)l * c.n_experts + (order ? order[slot] : slot)] =
+            (int16_t)h[(size_t)l * w->e_count + j];
+      }
+    }
+  }
+  fwrite(rec.data(), sizeof(int16_t), rec.size(), g.load_file);
+}
+
 // Serves slots[i] on group member i, all advancing together. Returns the
 // number of generated tokens.
 static long long gpu_run_wave(GpuGroup &g, std::vector<WaveSlot> &slots,
@@ -665,6 +790,8 @@ static long long gpu_run_wave(GpuGroup &g, std::vector<WaveSlot> &slots,
       HIP_CHECK(hipSetDevice(g.m[i]->device));
       HIP_CHECK(hipStreamSynchronize(g.m[i]->stream));
     }
+    if (g.m[0]->load_log)
+      gpu_write_load(g, getenv("GPTOSS_EXPERT_LOAD"));
     pos++;
     for (int i = 0; i < n; i++) {
       WaveSlot &ws = slots[i];
@@ -816,13 +943,14 @@ static long long gpu_inference(Tokenizer *tok, Requests *req) {
 }
 
 static void gpu_finish() {
+  for (GpuGroup &g : g_groups)
+    if (g.load_file)
+      fclose(g.load_file);
   for (GpuWorker *w : g_workers) {
     HIP_CHECK(hipSetDevice(w->device));
     gpu_free_state(w);
     for (void *p : w->weight_allocs)
       HIP_CHECK(hipFree(p));
-    HIP_CHECK(hipEventDestroy(w->ev_routed));
-    HIP_CHECK(hipEventDestroy(w->ev_experts));
     HIP_CHECK(hipStreamDestroy(w->stream));
     delete w;
   }
