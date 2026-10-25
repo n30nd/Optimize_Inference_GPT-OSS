@@ -54,14 +54,23 @@ __global__ void router_topk_exact(const float *__restrict__ logits, int E,
 // Same result as router_topk_exact, bit for bit, with one 64-lane wave per
 // row: lane l holds experts l, l + 64, ... (E <= 256); k rounds of a wave
 // arg-max (ties: lower expert), then lane 0 does the same softmax.
+// Rows with done[b] set (done may be null) get expert -1, "no expert", for
+// all k choices: finished requests then cost no expert work.
 #define TOPK_WAVES 4
 __global__ __launch_bounds__(64 * TOPK_WAVES) void router_topk_wave_kernel(
     const float *__restrict__ logits, int E, int k, float *__restrict__ topk_w,
-    int *__restrict__ topk_e, int B) {
+    int *__restrict__ topk_e, int B, const int *__restrict__ done) {
   const int lane = threadIdx.x % 64;
   const int b = blockIdx.x * TOPK_WAVES + threadIdx.x / 64;
   if (b >= B)
     return;
+  if (done && done[b]) {
+    if (lane < k) {
+      topk_w[(size_t)b * k + lane] = 0.0f;
+      topk_e[(size_t)b * k + lane] = -1;
+    }
+    return;
+  }
   const float *r = logits + (size_t)b * E;
   float v[4];
   for (int j = 0; j < 4; j++)

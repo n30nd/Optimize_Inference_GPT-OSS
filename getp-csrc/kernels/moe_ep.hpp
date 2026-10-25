@@ -162,9 +162,12 @@ __global__ void moe_combine_ep_kernel(float *__restrict__ x,
   for (int j = 0; j < k; j++) {
     const int p = b * k + order[j];
     const int e = topk_e[p] - e_begin;
-    rows[j] = (e >= 0 && e < e_count) ? Z_own + (size_t)own_row[p] * H
-                                      : Z_peer + (size_t)peer_rows_of_mine[p] * H;
+    rows[j] = topk_e[p] < 0 ? nullptr // finished request: no expert
+              : (e >= 0 && e < e_count) ? Z_own + (size_t)own_row[p] * H
+                                         : Z_peer + (size_t)peer_rows_of_mine[p] * H;
   }
+  if (rows[0] == nullptr)
+    return;
   for (int i = threadIdx.x; i < H; i += blockDim.x) {
     float acc = 0.0f;
     if (kExact) {
@@ -236,6 +239,8 @@ __global__ void moe_combine_partial_kernel(float *__restrict__ x,
       wgt[n++] = topk_w[p];
     }
   }
+  if (topk_e[b * k] < 0) // finished request: no expert
+    return;
   float4 *xr = (float4 *)(x + (size_t)b * H);
   const float4 *sp = (const float4 *)(S_peer + (size_t)b * H);
   for (int i = threadIdx.x; i < H / 4; i += blockDim.x) {

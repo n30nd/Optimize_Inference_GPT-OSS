@@ -79,6 +79,7 @@ struct GpuWorker {
   const float *rms_out = nullptr;
   float *cos_tab = nullptr, *sin_tab = nullptr; // (max_pos, head_dim / 2)
   int *tokens = nullptr, *next = nullptr;
+  int *row_done = nullptr; // fast path: 1 for requests that already ended (no expert work)
   float *x, *t, *qkv, *att, *proj, *router, *topk_w, *Xg, *Yg, *Gg, *Zg, *logits;
   int *topk_e, *counts, *offsets, *row_pair, *own_row, *peer_row;
   bf16_t *t16, *att16, *Xg16, *Gg16; // fast path matrix-multiply inputs
@@ -256,6 +257,7 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
   }
   w->tokens = gpu_alloc<int>(own, B);
   w->next = gpu_alloc<int>(own, B);
+  w->row_done = gpu_alloc<int>(own, B);
   w->x = gpu_alloc<float>(own, B * H);
   w->qkv = gpu_alloc<float>(own, B * QKV);
   w->proj = gpu_alloc<float>(own, B * H);
@@ -411,7 +413,7 @@ static void layer_route(GpuWorker *w, int l, int B) {
   }
   if (E <= 256)
     router_topk_wave_kernel<<<(B + TOPK_WAVES - 1) / TOPK_WAVES, 64 * TOPK_WAVES, 0, s>>>(
-        w->router, E, K, w->topk_w, w->topk_e, B);
+        w->router, E, K, w->topk_w, w->topk_e, B, w->exact ? nullptr : w->row_done);
   else
     router_topk_exact<<<(B + 63) / 64, 64, 0, s>>>(w->router, E, K, w->topk_w, w->topk_e, B);
 }
@@ -570,6 +572,7 @@ struct WaveSlot {
   int first = 0, n = 0;
   std::vector<std::vector<int>> prompts;
   std::vector<int> cur, next, done;
+  bool done_changed = false; // done must be copied to the GPU before the next step
 };
 
 static void wave_slot_init(WaveSlot &ws, Tokenizer *tok, Requests *req,
@@ -607,6 +610,11 @@ static long long gpu_run_wave(GpuGroup &g, std::vector<WaveSlot> &slots,
     B[i] = slots[i].n;
     active += slots[i].n;
   }
+  for (int i = 0; i < n; i++)
+    if (B[i] > 0) {
+      HIP_CHECK(hipSetDevice(g.m[i]->device));
+      HIP_CHECK(hipMemset(g.m[i]->row_done, 0, B[i] * sizeof(int)));
+    }
   long long generated = 0;
   int pos = 0;
   while (pos < steps && active > 0) {
@@ -615,6 +623,11 @@ static long long gpu_run_wave(GpuGroup &g, std::vector<WaveSlot> &slots,
         HIP_CHECK(hipSetDevice(g.m[i]->device));
         HIP_CHECK(hipMemcpyAsync(g.m[i]->tokens, slots[i].cur.data(), B[i] * sizeof(int),
                                  hipMemcpyHostToDevice, g.m[i]->stream));
+        if (slots[i].done_changed) {
+          HIP_CHECK(hipMemcpyAsync(g.m[i]->row_done, slots[i].done.data(), B[i] * sizeof(int),
+                                   hipMemcpyHostToDevice, g.m[i]->stream));
+          slots[i].done_changed = false;
+        }
       }
     gpu_step_group(g, B.data(), pos);
     for (int i = 0; i < n; i++)
@@ -644,6 +657,7 @@ static long long gpu_run_wave(GpuGroup &g, std::vector<WaveSlot> &slots,
         }
         if (token == 199999 || token == 200002) {
           ws.done[b] = 1;
+          ws.done_changed = true;
           active--;
           if (pos - np + 1 >= 0)
             out[pos - np + 1] = -1;
