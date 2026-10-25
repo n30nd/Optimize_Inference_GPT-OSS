@@ -31,15 +31,18 @@ __global__ void rmsnorm_bf16_kernel(const float *__restrict__ x,
 }
 
 // RoPE on the query and key heads of each fp32 qkv row, then the rotated key
-// and the value are stored as bf16 in the cache at `slot`, in the chunk64
-// layout of fast_attention.hpp (slots a multiple of 64, head_dim 64).
+// is stored as bf16 in the cache at `slot`, in the chunk64 layout of
+// fast_attention.hpp (slots a multiple of 64, head_dim 64), and the value as
+// int8 codes vq plus one scale per head vs (vq_index_chunk64,
+// vs_index_chunk64): scale = max|v| / 127, code = round(v * 127 / max|v|).
+// blockDim must be a multiple of 64, so that each wave holds one head's value.
 __global__ void rope_kv_bf16_kernel(float *__restrict__ qkv, int row_stride,
                                     const float *__restrict__ cosv,
                                     const float *__restrict__ sinv,
                                     int n_q_heads, int n_kv_heads, int head_dim,
                                     bf16_t *__restrict__ kc,
-                                    bf16_t *__restrict__ vc, int slots,
-                                    int slot) {
+                                    int8_t *__restrict__ vq, float *__restrict__ vs,
+                                    int slots, int slot) {
   const int b = blockIdx.x;
   const int half = head_dim / 2;
   const int kv_dim = n_kv_heads * head_dim;
@@ -60,8 +63,19 @@ __global__ void rope_kv_bf16_kernel(float *__restrict__ qkv, int row_stride,
       kc[kv_index_chunk64(b, slot, kh, half + i, slots, kv_dim)] = f32_to_bf16(o2);
     }
   }
-  for (int i = threadIdx.x; i < kv_dim; i += blockDim.x)
-    vc[kv_index_chunk64(b, slot, i / head_dim, i % head_dim, slots, kv_dim)] = f32_to_bf16(v[i]);
+  for (int i = threadIdx.x; i < kv_dim; i += blockDim.x) {
+    const float x = v[i];
+    float amax = fabsf(x);
+#pragma unroll
+    for (int o = 32; o > 0; o >>= 1)
+      amax = fmaxf(amax, __shfl_xor(amax, o));
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    const float c = fminf(fmaxf(rintf(x * inv), -127.0f), 127.0f);
+    const int g = i / head_dim, d = i % head_dim;
+    vq[vq_index_chunk64(b, slot, g, d, slots, kv_dim)] = (int8_t)c;
+    if (d == 0)
+      vs[vs_index_chunk64(b, slot, g, slots, kv_dim)] = amax / 127.0f;
+  }
 }
 
 // SwiGLU of gpt-oss on rows of mlp1 output (gate/up interleaved) into bf16.

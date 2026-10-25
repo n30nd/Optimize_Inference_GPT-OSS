@@ -41,6 +41,14 @@
 //   A sliding-window layer keeps position t in slot t % window; the slots in
 //   use are always 0 .. n-1 with n = min(pos + 1, window), and softmax does
 //   not care about order, so both layer kinds simply walk slots 0 .. n-1.
+//
+// int8 V (Q8 = true, what the engine runs: attention_q8v_chunk64)
+//   V holds int8 codes c and one fp32 scale s per (sequence, slot, head),
+//   v ~= s * c. The scale of each position is multiplied into its weight
+//   (p * s, still split into hi + lo), so the second MFMA multiplies by the
+//   codes themselves, which bf16 holds exactly. Each lane loads its 16 codes
+//   (4 positions x 4 dims, stored in that order) with one 16-byte load, and
+//   its 4 scales with another.
 #pragma once
 
 #include <hip/hip_runtime.h>
@@ -91,6 +99,32 @@ __device__ inline __amdgpu_buffer_rsrc_t make_rsrc(const void *base, uint32_t by
                                            0x00020000);
 }
 
+// fp32 bits of signed byte R of w (one instruction: SDWA byte select with
+// sign extension; the compiler would emit shift + extract + convert).
+template <int R> __device__ inline uint32_t sbyte_to_f32(uint32_t w) {
+  float f;
+  if constexpr (R == 0)
+    asm("v_cvt_f32_i32_sdwa %0, sext(%1) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_0"
+        : "=v"(f) : "v"(w));
+  else if constexpr (R == 1)
+    asm("v_cvt_f32_i32_sdwa %0, sext(%1) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_1"
+        : "=v"(f) : "v"(w));
+  else if constexpr (R == 2)
+    asm("v_cvt_f32_i32_sdwa %0, sext(%1) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_2"
+        : "=v"(f) : "v"(w));
+  else
+    asm("v_cvt_f32_i32_sdwa %0, sext(%1) dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:BYTE_3"
+        : "=v"(f) : "v"(w));
+  return __float_as_uint(f);
+}
+
+// The 4 signed bytes of w as bf16x4, exactly (|code| <= 127 fits bf16's 8
+// bits): convert each to fp32, keep the upper halves (one v_perm per pair).
+__device__ inline bf16x4 sbytes_to_bf16x4(uint32_t w) {
+  return as_bf16x4(__builtin_amdgcn_perm(sbyte_to_f32<1>(w), sbyte_to_f32<0>(w), 0x07060302u),
+                   __builtin_amdgcn_perm(sbyte_to_f32<3>(w), sbyte_to_f32<2>(w), 0x07060302u));
+}
+
 __device__ inline float row_swap8(float x) { // value of lane (l ^ 8) within its row of 16
   return __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(x), 0x128, 0xf, 0xf, false));
 }
@@ -118,11 +152,16 @@ struct KVLayout {
 // Grid (n_kv_heads / NG, B), 64 * NG * NS threads: wave w works on key/value
 // head blockIdx.x * NG + w % NG and on history split w / NG. n = slots to
 // attend (>= 1).
-template <int NG, int NS, int TPS, typename OutT>
+//
+// Q8 = true: V is stored as int8 codes with one fp32 scale per (b, slot, g)
+// (v = scale * code, see vq_index_chunk64 / vs_index_chunk64 at the end of
+// this file); vc points at the codes, vs at the scales. The layout must keep
+// the 16 slots of a tile of one head together (L.st == 64).
+template <int NG, int NS, int TPS, typename OutT, bool Q8 = false>
 __global__ __launch_bounds__(64 * NG * NS) void attention_gqa8_kernel(
     const float *__restrict__ qkv, int row_stride, const bf16_t *__restrict__ kc,
-    const bf16_t *__restrict__ vc, KVLayout L, const float *__restrict__ sinks,
-    OutT *__restrict__ out, int out_stride, int n) {
+    const void *__restrict__ vc, const float *__restrict__ vs, KVLayout L,
+    const float *__restrict__ sinks, OutT *__restrict__ out, int out_stride, int n) {
   constexpr int D = 64, G = 8, NW = NG * NS;
   constexpr int STEP = 16 * TPS;
   __shared__ float s_o[NW][G][D];
@@ -155,15 +194,25 @@ __global__ __launch_bounds__(64 * NG * NS) void attention_gqa8_kernel(
   // that ends right after slot n - 1 of this (b, g): offsets are 32-bit, and
   // a row past the end reads as zeros, so the last, partial step needs no
   // special loads.
-  const bf16_t *kb = kc + b * L.sb + (size_t)g * L.sg;
-  const bf16_t *vb = vc + b * L.sb + (size_t)g * L.sg;
+  const size_t head_off = b * L.sb + (size_t)g * L.sg; // elements, from kc
+  const bf16_t *kb = kc + head_off;
   const uint32_t st2 = (uint32_t)L.st * 2, cs2 = (uint32_t)(L.cs * 2); // bytes
   const int cmask = (1 << L.cshift) - 1;
-  auto row_bytes = [&](int row) { // byte offset of a slot from kb / vb
+  auto row_bytes = [&](int row) { // byte offset of a slot from kb (and vb for bf16 V)
     return (uint32_t)(row >> L.cshift) * cs2 + (uint32_t)(row & cmask) * st2;
   };
   const uint32_t range = row_bytes(n - 1) + D * 2;
-  const __amdgpu_buffer_rsrc_t krs = make_rsrc(kb, range), vrs = make_rsrc(vb, range);
+  const __amdgpu_buffer_rsrc_t krs = make_rsrc(kb, range);
+  // bf16 V: same offsets as K. int8 V: one byte per element, so a tile's
+  // codes start at half its K byte offset; the range covers the whole tile
+  // of slot n - 1 (codes are always finite, and their weight is 0 past n).
+  // Scales: one float per slot, at 1/32 of the K byte offset; the range ends
+  // exactly after slot n - 1, so later slots read scale 0.
+  const __amdgpu_buffer_rsrc_t vrs =
+      Q8 ? make_rsrc((const int8_t *)vc + head_off, (row_bytes((n - 1) & ~15) >> 1) + 1024)
+         : make_rsrc((const bf16_t *)vc + head_off, range);
+  const __amdgpu_buffer_rsrc_t srs =
+      make_rsrc(Q8 ? vs + head_off / D : nullptr, Q8 ? (row_bytes(n - 1) >> 5) + 4 : 0);
 
   const float sink2 = sinks[g * G + head] * kLog2e;
   float m = sink2;   // running max (log2 units) of this head over this wave's positions
@@ -179,6 +228,7 @@ __global__ __launch_bounds__(64 * NG * NS) void attention_gqa8_kernel(
     // All loads of the step first, so they are in flight together.
     u32x4 kr[TPS][2];
     u32x2 vr[TPS][4];
+    u32x4 vq[TPS], sq[TPS]; // int8 V: codes, scales
     const uint32_t step_off = row_bytes(base); // a step never crosses a chunk
     const uint32_t koff = step_off + (uint32_t)col * st2 + grp * 16;
     const uint32_t voff = step_off + (uint32_t)(4 * grp) * st2 + col * 8;
@@ -187,11 +237,24 @@ __global__ __launch_bounds__(64 * NG * NS) void attention_gqa8_kernel(
       kr[t][0] = __builtin_amdgcn_raw_buffer_load_b128(krs, koff + 16 * t * st2, 0, 0);
       kr[t][1] = __builtin_amdgcn_raw_buffer_load_b128(krs, koff + 16 * t * st2 + 64, 0, 0);
     }
+    if constexpr (Q8) {
+      // Lane (grp, col) reads the 16 codes of positions 4 grp + 0..3, dims
+      // 4 col + 0..3 (one 1 KB tile per load instruction), and the 4 scales
+      // of the same positions.
 #pragma unroll
-    for (int t = 0; t < TPS; t++)
+      for (int t = 0; t < TPS; t++) {
+        vq[t] = __builtin_amdgcn_raw_buffer_load_b128(
+            vrs, (step_off >> 1) + t * 1024 + grp * 256 + col * 16, 0, 0);
+        sq[t] = __builtin_amdgcn_raw_buffer_load_b128(srs, (step_off >> 5) + t * 64 + grp * 16,
+                                                      0, 0);
+      }
+    } else {
 #pragma unroll
-      for (int r = 0; r < 4; r++)
-        vr[t][r] = __builtin_amdgcn_raw_buffer_load_b64(vrs, voff + (16 * t + r) * st2, 0, 0);
+      for (int t = 0; t < TPS; t++)
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+          vr[t][r] = __builtin_amdgcn_raw_buffer_load_b64(vrs, voff + (16 * t + r) * st2, 0, 0);
+    }
 
     // Scores: lane holds S^T[position base + 16 t + 4 grp + r][column col].
     float sc[TPS][4];
@@ -249,10 +312,21 @@ __global__ __launch_bounds__(64 * NG * NS) void attention_gqa8_kernel(
       for (int r = 0; r < 4; r++) {
         const float p = __builtin_amdgcn_exp2f(sc[t][r] - m);
         lsum += p;
-        pp[r] = bf16_piece(p, lo);
+        // int8 V: the position's scale goes into the weight, so the matrix
+        // cores see the codes themselves (exact in bf16).
+        pp[r] = bf16_piece(Q8 ? p * __uint_as_float(sq[t][r]) : p, lo);
       }
       // P as the MFMA A operand: row col, positions 4 grp + 0..3.
       const bf16x4 pa = as_bf16x4(pack_hi(pp[0], pp[1]), pack_hi(pp[2], pp[3]));
+      if constexpr (Q8) {
+        // Dword nn of vq holds the codes of positions 4 grp + 0..3 for dim
+        // 4 col + nn: exactly the B operand of output slice nn.
+#pragma unroll
+        for (int nn = 0; nn < 4; nn++)
+          o[nn] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(pa, sbytes_to_bf16x4(vq[t][nn]),
+                                                            o[nn], 0, 0, 0);
+        continue;
+      }
       // V as the B operand: positions 4 grp + 0..3, dim 4 col + nn.
       const u32x2 *v = vr[t];
       o[0] = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(
@@ -319,7 +393,18 @@ static void attention_gqa8(hipStream_t s, const float *qkv, int row_stride,
                            int n_kv_heads, const float *sinks, OutT *out,
                            int out_stride, int B, int n) {
   attention_gqa8_kernel<NG, NS, TPS, OutT><<<dim3(n_kv_heads / NG, B), 64 * NG * NS, 0, s>>>(
-      qkv, row_stride, kc, vc, layout, sinks, out, out_stride, n);
+      qkv, row_stride, kc, vc, nullptr, layout, sinks, out, out_stride, n);
+}
+
+// The same with int8 V codes vq and their scales vs (layout.st must be 64).
+template <int NG, int NS, int TPS, typename OutT>
+static void attention_gqa8_q8v(hipStream_t s, const float *qkv, int row_stride,
+                               const bf16_t *kc, const int8_t *vq, const float *vs,
+                               KVLayout layout, int n_kv_heads, const float *sinks, OutT *out,
+                               int out_stride, int B, int n) {
+  attention_gqa8_kernel<NG, NS, TPS, OutT, true>
+      <<<dim3(n_kv_heads / NG, B), 64 * NG * NS, 0, s>>>(qkv, row_stride, kc, vq, vs, layout,
+                                                         sinks, out, out_stride, n);
 }
 
 } // namespace fattn
@@ -445,4 +530,44 @@ static void attention_bf16_chunk64(hipStream_t s, const float *qkv, int row_stri
   else          // long histories: 8 splits of 16-position steps
     fattn::attention_gqa8<1, 8, 1>(s, qkv, row_stride, kc, vc, layout, kv_dim / 64, sinks, out,
                                    out_stride, B, n);
+}
+
+// ---- int8 V cache (docs/09) ----------------------------------------------
+// K stays bf16 in the chunk64 layout above. Each value vector (64 numbers of
+// one key/value head at one slot) is stored as 64 int8 codes c and one fp32
+// scale s = max|v| / 127, with v ~= s * c and c = round(v / s).
+// Codes keep the chunk64 blocks (one 4 KB block per head and 64 slots, at half
+// the byte offset of the same K block), and inside each 16-slot tile (1 KB)
+// they are in the order the attention lanes read them: the 4 codes of slots
+// 4q + 0..3 for dim i sit together, and a lane's 16 bytes are 4 dims x 4 slots.
+//   tile byte (slot % 16 = 4q + r, dim i = 4d + nn):  q * 256 + d * 16 + nn * 4 + r
+__host__ __device__ inline size_t vq_index_chunk64(int b, int slot, int g, int i, int slots64,
+                                                   int kv_dim) {
+  return kv_index_chunk64(b, slot & ~15, g, 0, slots64, kv_dim) + ((slot >> 2) & 3) * 256 +
+         (i >> 2) * 16 + (i & 3) * 4 + (slot & 3);
+}
+// Scales: per sequence and 64-slot chunk, each head's 64 scales together (256 B).
+__host__ __device__ inline size_t vs_index_chunk64(int b, int slot, int g, int slots64,
+                                                   int kv_dim) {
+  return kv_index_chunk64(b, slot, g, 0, slots64, kv_dim) / 64;
+}
+
+// attention_bf16_chunk64 with V as int8 codes vq and scales vs (above).
+static void attention_q8v_chunk64(hipStream_t s, const float *qkv, int row_stride,
+                                  const bf16_t *kc, const int8_t *vq, const float *vs,
+                                  int slots, int kv_dim, const float *sinks, bf16_t *out,
+                                  int out_stride, int B, int pos, int window) {
+  const int n = window > 0 ? min(pos + 1, window) : pos + 1;
+  const fattn::KVLayout layout{(long long)slots * kv_dim, 64, 64 * 64, 6, 64LL * kv_dim};
+  // Fastest measured split per case (docs/09): window layers 2 waves per
+  // head, full layers 4 (up to 128 positions) or 8 waves.
+  if (window > 0)
+    fattn::attention_gqa8_q8v<1, 2, 2>(s, qkv, row_stride, kc, vq, vs, layout, kv_dim / 64,
+                                       sinks, out, out_stride, B, n);
+  else if (n <= 128)
+    fattn::attention_gqa8_q8v<1, 4, 2>(s, qkv, row_stride, kc, vq, vs, layout, kv_dim / 64,
+                                       sinks, out, out_stride, B, n);
+  else
+    fattn::attention_gqa8_q8v<1, 8, 1>(s, qkv, row_stride, kc, vq, vs, layout, kv_dim / 64,
+                                       sinks, out, out_stride, B, n);
 }

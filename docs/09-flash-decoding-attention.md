@@ -320,23 +320,30 @@ GCD, so differences below ~3 % are noise):
 
 All in `getp-csrc/kernels/fast_attention.hpp` unless noted:
 
-- `:1-43` — the design in short (work split, matrix-core layout, memory access).
-- `:74` `bf16_piece()` — the hi/lo split, rounded to nearest; `:96` `row_swap8()` adds the two columns.
-- `:91` `make_rsrc()` — buffer descriptor whose range ends at slot n − 1.
-- `:113` `KVLayout` — where a slot lives; the engine's layout is `{slots·512, 512, 64, 30, 0}`.
-- `:124` `attention_gqa8_kernel` — the kernel. `:147` queries as the matrix-core operand; `:179` the
-  loop over this wave's steps; `:189` key loads; `:209` scores (hi + lo); `:211` masking of the last
-  step; `:233` lazy rescale; `:257` weights as the operand of the second multiply; `:273` per-wave
-  sums; `:291` merge of the splits and the sink.
-- `:395` `attention_bf16()` — the entry point the engine calls; `:409` picks 2 heads × 4 splits.
-- `:332` `attention_bf16_simple_kernel` — the previous kernel, kept as the fallback for other head
-  counts (`-DGETP_ATTN_SIMPLE` forces it, to build a "before" binary).
-- `:430` `kv_index_chunk64()`, `:438` `attention_bf16_chunk64()` — the proposed layout, ready to use.
-- Called from `getp-csrc/engine/gpu_engine.hpp:323` (`gpu_step_fast()`); the cache is written by
-  `rope_kv_bf16_kernel` (`getp-csrc/kernels/fast_misc.hpp:47`).
-- Unit test: `getp-csrc/tests/attn_test.cpp`. Benchmark: `getp-csrc/bench/attn_bench.cpp` (`variants`
-  for every idea above; `:80` the vector-only version, `:158` the loads-only version, `:63` the plain
-  read). PyTorch yardstick: `getp-csrc/bench/attn_torch_yardstick.py`.
+- `:1-52` — the design in short (work split, matrix-core layout, memory access, int8 V).
+- `:80` `bf16_piece()` — the hi/lo split, rounded to nearest; `:128` `row_swap8()` adds the two columns.
+- `:97` `make_rsrc()` — buffer descriptor whose range ends at slot n − 1.
+- `:104` `sbyte_to_f32()`, `:123` `sbytes_to_bf16x4()` — int8 codes to the matrix operand (SDWA, `v_perm`).
+- `:145` `KVLayout` — where a slot lives; chunk64 is `{slots·512, 64, 64·64, 6, 64·512}`.
+- `:161` `attention_gqa8_kernel` — the kernel (`Q8 = true`: int8 V). `:186` queries as the
+  matrix-core operand; `:211`, `:214` int8 V code and scale buffers; `:226` the loop over this wave's
+  steps; `:237` key loads; `:240` int8 V loads; `:270` scores (hi + lo); `:272` masking of the last
+  step; `:294` lazy rescale; `:317` weights (times the scale for int8 V); `:320` weights as the
+  operand of the second multiply; `:321` the int8 V multiply; `:345` per-wave sums; `:365` merge of
+  the splits and the sink.
+- `:391` `attention_gqa8()`, `:401` `attention_gqa8_q8v()` — launch helpers for any split.
+- `:478` `attention_bf16()` — row layout entry point; `:415` `attention_bf16_simple_kernel` — the
+  first kernel, kept as the fallback for other head counts (`-DGETP_ATTN_SIMPLE` forces it).
+- `:511` `kv_index_chunk64()`, `:519` `attention_bf16_chunk64()` — chunk64 with bf16 V.
+- `:544` `vq_index_chunk64()`, `:550` `vs_index_chunk64()`, `:556` `attention_q8v_chunk64()` — int8 V,
+  what the engine calls; `:564` the split per case.
+- Called from `layer_attention()` in `getp-csrc/engine/gpu_engine.hpp:396`; the cache is written by
+  `rope_kv_bf16_kernel` (`getp-csrc/kernels/fast_misc.hpp:39`, int8 V from `:66`), allocated in
+  `gpu_alloc_state()` (`gpu_engine.hpp:259`).
+- Unit test: `getp-csrc/tests/attn_test.cpp` (int8 V: `run_case_q8` `:243`, writer `check_writer`
+  `:384`); value-vector statistics on the real model: `getp-csrc/tests/attn_vstats.cpp`. Benchmark: `getp-csrc/bench/attn_bench.cpp` (`variants` for every idea above, `q8` for the
+  int8 V splits; `:83` the vector-only version, `:161` the loads-only version, `:196` its int8 V
+  version, `:66` the plain read). PyTorch yardstick: `getp-csrc/bench/attn_torch_yardstick.py`.
 
 ## What it gave
 
@@ -361,6 +368,204 @@ Long answers drift away from the reference with either kernel: the fast path sto
 every matrix input in bf16, so small differences pile up over 1,000 tokens. The new kernel is
 slightly *closer* to the reference, not further. The real pass/fail test is METEOR/BERTScore on the
 full input, run by the lead.
+
+## A smaller cache: the values stored as int8
+
+### The idea in plain words
+
+Attention spends its time *reading* the cache, and half of what it reads are the values (V). Each
+value is a bf16 number, 2 bytes. We now store each value in **1 byte**, as a whole number between
+−127 and 127, plus one "unit size" per group of 64 values that says what a step of 1 is worth. The
+keys (K) stay in bf16. Per slot and key/value head the kernel now reads 128 + 64 + 4 = **196 bytes
+instead of 256** (−23 %), and the full layers get faster by about that much.
+
+The stored values are now slightly rounded, so the answers change a little. That is a
+quality trade, not a free speed-up, so it was accepted only after the two answer-quality scores
+(METEOR and BERTScore) were measured on the full input for both models.
+
+### An everyday comparison
+
+A shop writes down 64 prices for every customer. Before, each price was written with three
+significant digits ("2.54", "0.0312", "−1.20"). Now each list starts with one line, "one unit =
+2 cents", and every price is written as a whole number of units between −127 and 127 ("127", "2",
+"−60"). The list is half as long. A price can be off by at most half a unit (1 cent). The unit is
+chosen per list, from that list's largest price, so a list of small prices gets small units.
+
+### The new words
+
+- **int8** — a whole number stored in 8 bits (1 byte), from −128 to 127. We use −127..127.
+- **quantize** — replace a number by the nearest step on a coarse grid; here the grid is
+  `scale × (−127, …, 127)`. **dequantize**: turn the stored whole number back into `scale × code`.
+- **code** — the stored whole number. **scale** — the size of one step, one fp32 number per 64 values.
+- **outlier** — one value much larger than the others in the same group of 64. It sets the scale, so
+  the other 63 values get coarser steps.
+- **SDWA (sub-dword addressing)** — a way for one gfx90a instruction to read just one byte (or half)
+  of a 32-bit register. **`v_perm`** — an instruction that builds a 32-bit word from any 4 bytes of
+  two registers.
+- **METEOR / BERTScore** — the two answer-quality scores of the course (section 3 of the project
+  brief): word overlap with the reference answers, and similarity of meaning. Pass marks 0.30 / 0.90.
+
+### How a value vector is stored
+
+```
+ one slot, one key/value head: 64 values (fp32, just computed by the QKV matrix multiply)
+     v =   0.31   -1.20   0.05   ...   2.54   ...   -0.48        largest |v| = 2.54
+ scale s = 2.54 / 127 = 0.0200                                   (1 fp32, 4 bytes)
+ codes c = round(v / s)
+         =   16     -60      2   ...    127   ...     -24        (64 int8, 64 bytes)
+ read back s × c
+         = 0.320  -1.200  0.040  ...  2.540   ...  -0.480        error at most s / 2 = 0.01
+```
+
+Before: 64 × 2 = 128 bytes. Now: 64 + 4 = 68 bytes. The cache writer (`rope_kv_bf16_kernel`) does
+this as it stores each new token: one wave holds one head's 64 values, finds the largest |v| with 6
+lane exchanges (`__shfl_xor`), and writes the codes and the scale.
+
+The chunk64 idea stays: each head's 64 slots are one block (now 4 KB of codes instead of 8 KB), so
+the kernel still reads long contiguous runs. The scales sit in their own array, 64 per block (256
+bytes). Inside each block of 16 slots (1 KB) the codes are in the order the lanes want them:
+
+```
+ 16 slots = 4 groups of 4 slots (256 bytes each)
+ one group = 16 pieces of 16 bytes; piece d holds dims 4d .. 4d+3 of the group's 4 slots:
+     [dim 4d: slot 0 1 2 3] [dim 4d+1: slot 0 1 2 3] [dim 4d+2: ...] [dim 4d+3: ...]
+ lane (grp, col) reads piece col of group grp: ONE 16-byte load; the 64 lanes read the 1 KB in order
+ (bf16 V needed 4 loads of 8 bytes per lane for the same tile)
+```
+
+Each 4-byte word of a lane is then exactly what one matrix-core multiply wants: the codes of 4
+consecutive positions for one dim.
+
+### How attention uses the codes
+
+```
+ out = Σ_t p_t · v_t / L  ≈  Σ_t p_t · (s_t · c_t) / L  =  Σ_t (p_t · s_t) · c_t / L
+       weights · values                                    new weight   · code
+ L   = exp(sink − M) + Σ_t p_t          (unchanged: the scale does not belong in the denominator)
+```
+
+So the kernel multiplies each position's weight by that position's scale (one multiply per
+weight, then the same hi + lo split as before), and gives the second matrix multiply the codes
+themselves. A code is a whole number with |c| ≤ 127, and bf16 holds every such number exactly, so the
+matrix multiply adds **no** rounding of its own: the only new error is the int8 rounding, made once
+when the token is stored.
+
+Turning 4 codes into the matrix operand: each code becomes an fp32 number with one instruction
+(`v_cvt_f32_i32` reading one byte, with SDWA), and the upper halves of two fp32 numbers, which are
+their exact bf16 bits, go into one register with one `v_perm`. That is 24 instructions per 16-position
+tile. Written in plain C++ (`(float)(int8_t)(w >> 8 * r)`), the compiler emits a shift, a bit-extract
+and the conversion per code, about 60 instructions per tile. Timed, both are equally fast on long
+histories, and the hand-written one is 2–3 % faster at position 64: the reads set the time.
+
+The positions past n are handled as before: the scale buffer ends exactly after slot n − 1, so later
+slots read scale 0 (the unused part of the cache can hold NaN). The codes of those positions are
+read as part of their 16-slot tile, but a code is always a finite whole number, and its weight is 0.
+
+### The numbers
+
+Kernel time on one GCD of mv-mi250-03 (`attn_bench`, mean of 30 calls, 2026-10-25; both rows of a
+pair from the same run). GB/s counts the bytes each version must read: 256 per slot and head for
+bf16 V, 196 for int8 V. The plain read of the same memory reaches 1,273 GB/s.
+
+**512 requests per GCD**
+
+| Layer | pos | n | bf16 V | GB/s | int8 V | GB/s | Change |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| window | 64 | 65 | 93.0 µs | 733 | 82.2 µs | 635 | −12 % |
+| window | 256 | 128 | 122.9 µs | 1,092 | 107.1 µs | 960 | −13 % |
+| window | 512 | 128 | 122.7 µs | 1,094 | 107.6 µs | 955 | −12 % |
+| window | 1023 | 128 | 122.9 µs | 1,092 | 107.1 µs | 959 | −13 % |
+| full | 64 | 65 | 105.0 µs | 649 | 100.3 µs | 520 | −4 % |
+| full | 256 | 257 | 240.8 µs | 1,119 | 205.0 µs | 1,007 | −15 % |
+| full | 512 | 513 | 459.7 µs | 1,170 | 357.5 µs | 1,152 | −22 % |
+| full | 1023 | 1024 | **935.1 µs** | 1,148 | **695.6 µs** | 1,182 | **−26 %** |
+
+**1,024 requests per GCD**
+
+| Layer | pos | n | bf16 V | GB/s | int8 V | GB/s | Change |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| window | 64 | 65 | 177.3 µs | 769 | 152.1 µs | 686 | −14 % |
+| window | 256 | 128 | 235.0 µs | 1,142 | 200.3 µs | 1,026 | −15 % |
+| window | 512 | 128 | 235.4 µs | 1,140 | 200.2 µs | 1,027 | −15 % |
+| window | 1023 | 128 | 235.6 µs | 1,139 | 200.3 µs | 1,026 | −15 % |
+| full | 64 | 65 | 197.2 µs | 691 | 189.2 µs | 552 | −4 % |
+| full | 256 | 257 | 463.6 µs | 1,162 | 395.6 µs | 1,043 | −15 % |
+| full | 512 | 513 | 884.6 µs | 1,216 | 692.0 µs | 1,190 | −22 % |
+| full | 1023 | 1024 | **1,776.5 µs** | 1,209 | **1,362.2 µs** | 1,207 | **−23 %** |
+
+- Full layers with long histories keep the same GB/s on fewer bytes, so the time falls with the bytes.
+  Window layers read only 128 positions per request: each wave does just 2 steps, and the fixed
+  work (queries, merge, launch) weighs more; the loads alone take 77 µs there, the kernel 107 µs.
+- Over one whole answer at 512 requests, attention costs on average about **7.2 ms per step with
+  bf16 V and 5.7 ms with int8 V** (12 full + 12 window layers, interpolated between the positions
+  above).
+- Memory: the cache of 512 requests at 1,024 positions takes 14.5 → 11.1 GB for 20b and
+  21.7 → 16.6 GB for 120b.
+- Split per case (`attention_q8v_chunk64`): window layers 2 waves per head (107 µs; 4 waves:
+  109 µs), full layers 4 waves up to 128 positions and 8 waves above (695 µs at pos 1023; 4 waves:
+  761 µs). All splits were measured (`attn_bench q8`).
+
+**Accuracy of the kernel** (`tests/attn_test.cpp`, second part; the same cases as above, plus value
+vectors with one outlier 8× larger than the rest):
+
+| Compared with an fp64 reference on … | int8 V kernel | bf16 V kernel |
+|---|---:|---|
+| … the dequantized values `s × c` (the kernel's own arithmetic), fp32 output | **4.3e-5** at most | 4.2e-5 on its bf16 values |
+| … the original fp32 values, bf16 output, largest error | 1.16e-2 | 7.75e-3 |
+| … the original fp32 values, root-mean-square error, full layer pos 1023 | 2.45e-4 | 1.30e-4 |
+| same, window layer pos 1023 | 6.6e-4 | 3.5e-4 |
+| same, with one 8× outlier per vector, window pos 1023 | 2.9e-3 | 4.9e-4 |
+
+So the kernel's own arithmetic is as exact as before, and the int8 rounding roughly doubles the
+typical error of the output against the original values (6× with strong outliers). The cache writer
+gives exactly the codes and scales of the CPU rule (56,832 codes checked, including all-zero and
+outlier vectors).
+
+**End to end** (`tools/bench.py`, `evaluation/input.txt`, 4,096 requests, 8 GCDs of mv-mi250-02):
+
+| Model | bf16 V (commit cdca2c5) | int8 V |
+|---|---|---|
+| gpt-oss-20b | 72,258 tok/s, METEOR 0.554, BERTScore 0.979 | **73,475 tok/s (+1.7 %)**, METEOR **0.533**, BERTScore **0.978** |
+| gpt-oss-120b | 40,164 tok/s, METEOR 0.576, BERTScore 0.982 | **40,949 tok/s (+2.0 %)**, METEOR **0.562**, BERTScore **0.981** |
+
+Both stay far above the pass marks (0.30 / 0.90). The meaning score (BERTScore) moves by 0.001; the
+word-overlap score (METEOR) drops by 0.021 (20b) and 0.014 (120b), more than the ±0.005 that bf16
+versions of the program differ among themselves (0.548–0.557 for 20b), so the drop is real. It is
+the size the other team saw (0.534 → 0.519). The speed gain is much smaller than the kernel gain because
+attention is only about 14 % of a step: the kernels save about 1.5 ms of a 55 ms step (20b, 512
+requests per GCD, estimate from the table above), and the whole timed run went from 56.4 to 55.5 s
+(20b) and from 100.7 to 98.9 s (120b).
+
+Smoke test (20b, 64 prompts × 128 tokens, one GCD): 45 → 43 of 64 answers identical to the
+reference, 84.5 % → 82.0 % of tokens before the first difference.
+
+**Why the rounding cannot easily be made smaller.** `tests/attn_vstats.cpp` runs 20b on 64 real
+prompts for 400 steps and measures the stored value vectors: their largest |v| is only **2.6–2.9×
+their root mean square** in every layer (random numbers give about 2.5), so no few large values
+waste the 255 steps. The int8 rounding noise is then about **0.6 % of a typical value**, in every
+layer (bf16 rounding: about 0.1 %). Taking out the bias or evening out the dims first would
+lower it only to 0.57–0.60 %. Doing better needs more bits per value, which is what we wanted to
+avoid.
+
+### Why the keys stay bf16
+
+Another team on the same course measured both halves: int8 V moved their METEOR from 0.534 to
+0.519, int8 K dropped it to 0.342. An error in a key changes the *score*, which goes through
+`exp()`: a small error in a large score becomes a large error in a weight, and it can move weight
+from one position to another. An error in a value only shifts the output a little, in proportion to
+the weight. So only V is stored as int8.
+
+### Ideas measured or considered, and not used
+
+| Idea | Result | Why not |
+|---|---|---|
+| int8 K as well | METEOR 0.342 in the other team's run | quality |
+| Multiply the scale into V (decode to bf16 `s × c`) instead of into the weight | not built | adds bf16 rounding (2^-9) on top of the int8 rounding, and costs a multiply per value instead of per weight |
+| Codes converted by the compiler (shift + extract + convert) | same speed at long histories, +2–3 % at pos 64 | kept the one-instruction SDWA version |
+| fp16 matrix multiply, codes decoded with one `v_perm` per 2 codes (fp16 bits 0x64 then the byte u = the number 1,024 + u) | not built | weights would be fp16: anything below 6e-5 loses precision or becomes 0, and the conversion is not the limit (row above) |
+| Subtract the value bias before rounding (add it back after attention), or divide each dim by a fixed size first ("smoothing") | rounding noise 0.61 % → 0.60 % (bias), 0.58 % (smoothing), 0.57 % (both) | not worth the work: the real value vectors are not peaky (below) |
+| 4 waves per head on window layers | 109 vs 107 µs | slower |
+| 8 waves per head on full layers up to 128 positions | 108 vs 100 µs at pos 64 | slower |
 
 ## Pitfalls
 
@@ -387,6 +592,14 @@ full input, run by the lead.
   call, so the numbers are memory numbers, not cache numbers.
 - **Shared GPUs.** Other jobs (including one on the other die of the same card) move timings by a
   few %. Each before/after pair in the two big tables comes from one run.
+- **int8 V: the scale goes into the weight, not into the denominator.** `L` sums the weights `p`;
+  the output sums `p · s · c`. Putting `p · s` into `L` gives plausible-looking but wrong outputs.
+- **int8 V: unused scales can be NaN.** A weight of 0 times a NaN scale is NaN. The scale buffer's
+  range ends right after slot n − 1, so the kernel reads 0 there. The test fills unused scales with
+  NaN and unused codes with random bytes.
+- **int8 V: one large value per vector costs the other 63 their precision.** The scale is set by the
+  largest |v|. The test's outlier cases show 6× the typical error; the quality scores on the real
+  model are the test that matters.
 
 ## Changes proposed outside this file
 
@@ -397,14 +610,13 @@ full input, run by the lead.
    plain head-major layout it never degrades at short histories. Ready to use:
    `kv_index_chunk64()` and `attention_bf16_chunk64()` at the end of `fast_attention.hpp` (tested in
    `attn_test.cpp`). The engine changes are two lines: the store index in `rope_kv_bf16_kernel`
-   (`fast_misc.hpp:47`), and calling `attention_bf16_chunk64` (with `slots` rounded up to 64) in
-   `gpu_step_fast()`.
+   and calling `attention_bf16_chunk64` (with `slots` rounded up to 64). **Done** (commit c61cc5d).
 2. **Per-request lengths, for continuous batching later.** Today all requests share `pos`, so one `n`
    serves the whole batch. With continuous batching the kernel needs `n` per request (an int array
    indexed by `b`); the kernel already handles any `n` per workgroup.
 3. **A smaller cache (int8 or fp8 keys/values)** would halve the bytes again, and the time with them.
    It changes the numbers, so it needs the METEOR/BERTScore gate; two of the reference teams used an
-   int8 cache.
+   int8 cache. **Done for V** (section "A smaller cache" above); K stays bf16 for quality.
 4. **Fusing RoPE and the cache write into the attention kernel** would save one launch per layer
    (about 10 µs): small, so not proposed now.
 

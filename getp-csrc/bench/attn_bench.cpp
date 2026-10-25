@@ -3,12 +3,15 @@
 // window layers (128 slots) and full layers (1024 slots).
 //
 //   hipcc --std=c++17 -O3 --offload-arch=gfx90a getp-csrc/bench/attn_bench.cpp -o attn_bench
-//   ./attn_bench            # before (previous kernel) vs after (attention_bf16)
+//   ./attn_bench            # chunk64 cache: bf16 V vs int8 V (the engine's kernel)
 //   ./attn_bench variants   # also every wave-count / step-size / layout variant
+//   ./attn_bench q8         # bf16 V vs int8 V and the int8 V variants only
 //
 // Each line: mean time per call over 30 calls (after 5 warm-up calls),
 // measured with hipEvents around the 30 calls, and the achieved bandwidth on
-// the bytes of cache the call must read: B * n * 8 heads * 64 * 2 (K, V) * 2 B.
+// the bytes of cache the call must read: B * n * 8 heads * 64 * 2 (K, V) * 2 B
+// with a bf16 cache; with int8 V, B * n * 8 * (64 * 2 + 64 + 4) B (K in bf16,
+// V codes, one fp32 scale per head and slot).
 #include <hip/hip_runtime.h>
 
 #include <stdio.h>
@@ -187,6 +190,53 @@ __global__ __launch_bounds__(64 * NS) void loads_only_kernel(const bf16_t *kc, c
     *out = x;
 }
 
+// The int8 V kernel's loads (K as above; per tile one 16-byte code load and
+// one 16-byte scale load per lane) with the arithmetic removed.
+template <int NS, int TPS>
+__global__ __launch_bounds__(64 * NS) void loads_only_q8_kernel(const bf16_t *kc, const int8_t *vq,
+                                                                const float *vs, fattn::KVLayout L,
+                                                                int n, uint32_t *out) {
+  constexpr int STEP = 16 * TPS;
+  const int g = blockIdx.x, b = blockIdx.y;
+  const int lane = threadIdx.x & 63, w = threadIdx.x >> 6, col = lane & 15, grp = lane >> 4;
+  const size_t ho = b * L.sb + (size_t)g * L.sg;
+  const uint32_t st2 = L.st * 2, cs2 = (uint32_t)(L.cs * 2);
+  const int cmask = (1 << L.cshift) - 1;
+  auto row_bytes = [&](int row) {
+    return (uint32_t)(row >> L.cshift) * cs2 + (uint32_t)(row & cmask) * st2;
+  };
+  const auto krs = fattn::make_rsrc(kc + ho, row_bytes(n - 1) + 128);
+  const auto vrs = fattn::make_rsrc(vq + ho, (row_bytes((n - 1) & ~15) >> 1) + 1024);
+  const auto srs = fattn::make_rsrc(vs + ho / 64, (row_bytes(n - 1) >> 5) + 4);
+  uint32_t x = 0;
+  for (int step = w; step < (n + STEP - 1) / STEP; step += NS) {
+    const uint32_t so = row_bytes(step * STEP);
+    const uint32_t koff = so + col * st2 + grp * 16;
+    for (int t = 0; t < TPS; t++) {
+      const auto a = __builtin_amdgcn_raw_buffer_load_b128(krs, koff + 16 * t * st2, 0, 0);
+      const auto c = __builtin_amdgcn_raw_buffer_load_b128(krs, koff + 16 * t * st2 + 64, 0, 0);
+      const auto v = __builtin_amdgcn_raw_buffer_load_b128(
+          vrs, (so >> 1) + t * 1024 + grp * 256 + col * 16, 0, 0);
+      const auto e = __builtin_amdgcn_raw_buffer_load_b128(srs, (so >> 5) + t * 64 + grp * 16, 0, 0);
+      x ^= a[0] ^ a[1] ^ a[2] ^ a[3] ^ c[0] ^ c[1] ^ c[2] ^ c[3] ^ v[0] ^ v[1] ^ v[2] ^ v[3] ^
+           e[0] ^ e[1] ^ e[2] ^ e[3];
+    }
+  }
+  if (x == 0x12345678u)
+    *out = x;
+}
+
+__global__ void fill_i8(int8_t *p, size_t n, uint32_t seed) {
+  for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n;
+       i += (size_t)gridDim.x * blockDim.x) {
+    uint32_t h = (uint32_t)i * 2654435761u ^ seed;
+    h ^= h >> 15;
+    h *= 2246822519u;
+    h ^= h >> 13;
+    p[i] = (int8_t)((int)(h % 255) - 127);
+  }
+}
+
 static float time_us(const std::function<void()> &f) {
   hipEvent_t a, b;
   CHECK(hipEventCreate(&a));
@@ -209,6 +259,7 @@ static float time_us(const std::function<void()> &f) {
 
 int main(int argc, char **argv) {
   const bool variants = argc > 1 && !strcmp(argv[1], "variants");
+  const bool q8only = argc > 1 && !strcmp(argv[1], "q8");
   const int Bmax = 1024;
   // Room for the padded layout below (slot stride KVD + 64 elements).
   const size_t full = (size_t)Bmax * 1024 * (KVD + 64), win = (size_t)Bmax * 128 * (KVD + 64);
@@ -223,6 +274,16 @@ int main(int argc, char **argv) {
   CHECK(hipMalloc(&out, (size_t)Bmax * OUT * 2));
   bf16_t *out2;
   CHECK(hipMalloc(&out2, (size_t)Bmax * OUT * 2));
+  int8_t *vqf, *vqw;
+  float *vsf, *vsw;
+  CHECK(hipMalloc(&vqf, full));
+  CHECK(hipMalloc(&vqw, win));
+  CHECK(hipMalloc(&vsf, full / 64 * 4));
+  CHECK(hipMalloc(&vsw, win / 64 * 4));
+  fill_i8<<<4096, 256>>>(vqf, full, 7);
+  fill_i8<<<4096, 256>>>(vqw, win, 8);
+  fill_f32<<<4096, 256>>>(vsf, full / 64, 9, 0.02f);
+  fill_f32<<<4096, 256>>>(vsw, win / 64, 10, 0.02f);
   fill_bf16<<<4096, 256>>>(kf, full, 1);
   fill_bf16<<<4096, 256>>>(vf, full, 2);
   fill_bf16<<<4096, 256>>>(kw, win, 3);
@@ -247,10 +308,13 @@ int main(int argc, char **argv) {
         const int n = window ? std::min(pos + 1, window) : pos + 1;
         const bf16_t *kc = window ? kw : kf, *vc = window ? vw : vf;
         const double bytes = (double)B * n * NKV * D * 2 * 2;
-        auto report = [&](const char *name, float us) {
+        const double bytes_q8 = (double)B * n * NKV * (D * 2 + D + 4);
+        auto report = [&](const char *name, float us, double by = 0) {
           printf("%-30s %-6s %5d %5d %5d %10.1f %8.0f\n", name, window ? "window" : "full", B,
-                 pos, n, us, bytes / (us * 1e-6) / 1e9);
+                 pos, n, us, (by > 0 ? by : bytes) / (us * 1e-6) / 1e9);
         };
+        const int8_t *vq = window ? vqw : vqf;
+        const float *vs = window ? vsw : vsf;
         const long long sb = (long long)slots * KVD;
         const fattn::KVLayout rowL{sb, KVD, D, 30, 0};                 // engine's layout
         const fattn::KVLayout headL{sb, D, slots * D, 30, 0};          // (b, g, slot, 64)
@@ -258,19 +322,49 @@ int main(int argc, char **argv) {
         auto chunkL = [&](int sh) { // (b, slot / T, g, slot % T, 64), T = 2^sh
           return fattn::KVLayout{sb, D, (1 << sh) * D, sh, (long long)(1 << sh) * KVD};
         };
+        const fattn::KVLayout c64{(long long)slots * KVD, D, 64 * D, 6, 64LL * KVD};
+        report("bf16 V (attention_bf16_chunk64)", time_us([&] {
+                 attention_bf16_chunk64(0, qkv, ROW, kc, vc, slots, KVD, NH, KVM, sinks, out, OUT,
+                                        B, pos, window);
+               }));
+        report("int8 V (attention_q8v_chunk64)", time_us([&] {
+                 attention_q8v_chunk64(0, qkv, ROW, kc, vq, vs, slots, KVD, sinks, out, OUT, B, pos,
+                                       window);
+               }), bytes_q8);
+        if (!variants && !q8only)
+          continue;
+#define Q8VAR(NG, NS, TPS)                                                    \
+  report("q8 NG" #NG " NS" #NS " TPS" #TPS, time_us([&] {                      \
+           fattn::attention_gqa8_q8v<NG, NS, TPS>(0, qkv, ROW, kc, vq, vs, c64, NKV, sinks, out, \
+                                                  OUT, B, n);                  \
+         }), bytes_q8)
+        Q8VAR(1, 2, 2);
+        Q8VAR(1, 4, 1);
+        Q8VAR(1, 4, 2);
+        Q8VAR(1, 4, 4);
+        Q8VAR(1, 8, 1);
+        Q8VAR(1, 8, 2);
+        Q8VAR(1, 16, 1);
+        Q8VAR(2, 4, 1);
+        Q8VAR(2, 4, 2);
+        Q8VAR(2, 8, 1);
+#undef Q8VAR
+        report("loads only, chunk64 int8 V", time_us([&] {
+                 loads_only_q8_kernel<4, 2><<<dim3(NKV, B), 256>>>(kc, vq, vs, c64, n,
+                                                                   (uint32_t *)out);
+               }), bytes_q8);
+        report("loads only, chunk64 bf16 V", time_us([&] {
+                 loads_only_kernel<4, 2><<<dim3(NKV, B), 256>>>(kc, vc, c64, n, (uint32_t *)out);
+               }));
+        if (q8only)
+          continue;
         report("before (simple)", time_us([&] {
                  attention_bf16_simple_kernel<<<dim3(NH, B), 64, (n + 1) * sizeof(float)>>>(
                      qkv, ROW, kc, vc, slots, KVD, KVM, sinks, out, OUT, pos, window);
                }));
-        report("after (attention_bf16)", time_us([&] {
+        report("row layout (attention_bf16)", time_us([&] {
                  attention_bf16(0, qkv, ROW, kc, vc, slots, KVD, NH, KVM, sinks, out, OUT, B,
                                 pos, window);
-               }));
-        if (!variants)
-          continue;
-        report("proposed: chunk64 layout", time_us([&] {
-                 attention_bf16_chunk64(0, qkv, ROW, kc, vc, slots, KVD, NH, KVM, sinks, out, OUT,
-                                        B, pos, window);
                }));
         report("gqa vector (no MFMA)", time_us([&] {
                  gqa_vector_kernel<<<dim3(NKV, B), 256, NKV * n * sizeof(float)>>>(

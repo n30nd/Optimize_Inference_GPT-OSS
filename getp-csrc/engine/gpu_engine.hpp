@@ -58,7 +58,9 @@ struct GpuLayer {
   const uint8_t *mlp1_blocks, *mlp1_scales, *mlp2_blocks, *mlp2_scales;
   const float *b_mlp1, *b_mlp2;
   float *kc, *vc;      // exact path KV cache (batch, slots, kv_dim)
-  bf16_t *kc16, *vc16; // fast path KV cache, chunk64 layout (fast_attention.hpp)
+  bf16_t *kc16;        // fast path K cache, chunk64 layout (fast_attention.hpp)
+  int8_t *vq8;         // fast path V cache: int8 codes (vq_index_chunk64)
+  float *vs;           //   and one scale per slot and head (vs_index_chunk64)
   int slots;           // positions kept: max_pos or the sliding window (fast path:
                        // rounded up to a multiple of 64)
   int window;          // 0 for full attention
@@ -217,7 +219,8 @@ static size_t gpu_state_bytes(const GpuWorker *w, int batch, int max_pos) {
     kv_positions += w->exact ? slots : (slots + 63) / 64 * 64;
   }
   const size_t act = w->exact ? 4 : 2; // bytes per KV / matrix-input element
-  size_t bytes = 2 * B * kv_positions * KVD * act          // KV cache
+  const size_t kv_bytes = w->exact ? 2 * 4 * KVD : 2 * KVD + KVD + 4 * c.n_kv_heads; // per slot
+  size_t bytes = B * kv_positions * kv_bytes               // KV cache
                  + B * (H + QKV + H + c.n_experts + K) * 4 // x qkv proj router topk_w
                  + B * (H + ATT) * act                     // t att
                  + R * (2 * c.intermediate_dim + H) * 4    // Yg Zg
@@ -246,13 +249,16 @@ static void gpu_alloc_state(GpuWorker *w, int batch, int max_pos) {
     if (!w->exact)
       g.slots = (g.slots + 63) / 64 * 64;
     g.kc = g.vc = nullptr;
-    g.kc16 = g.vc16 = nullptr;
+    g.kc16 = nullptr;
+    g.vq8 = nullptr;
+    g.vs = nullptr;
     if (w->exact) {
       g.kc = gpu_alloc<float>(own, B * g.slots * KVD);
       g.vc = gpu_alloc<float>(own, B * g.slots * KVD);
     } else {
       g.kc16 = gpu_alloc<bf16_t>(own, B * g.slots * KVD);
-      g.vc16 = gpu_alloc<bf16_t>(own, B * g.slots * KVD);
+      g.vq8 = gpu_alloc<int8_t>(own, B * g.slots * KVD);
+      g.vs = gpu_alloc<float>(own, B * g.slots * c.n_kv_heads);
     }
   }
   w->tokens = gpu_alloc<int>(own, B);
@@ -389,10 +395,10 @@ static void layer_attention(GpuWorker *w, int l, int B, int pos) {
       rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, g.rms_attn, w->t16, H);
     gemm_bf16(s, w->t16, B, g.w_qkv, g.b_qkv, w->qkv, QKV, H);
     rope_kv_bf16_kernel<<<B, 256, 0, s>>>(w->qkv, QKV, cosv, sinv, c.n_attn_heads,
-                                          c.n_kv_heads, D, g.kc16, g.vc16, g.slots, kv_slot);
-    attention_bf16_chunk64(s, w->qkv, QKV, g.kc16, g.vc16, g.slots, KVD, c.n_attn_heads,
-                           c.n_attn_heads / c.n_kv_heads, g.sinks, w->att16, ATT, B, pos,
-                           g.window);
+                                          c.n_kv_heads, D, g.kc16, g.vq8, g.vs, g.slots,
+                                          kv_slot);
+    attention_q8v_chunk64(s, w->qkv, QKV, g.kc16, g.vq8, g.vs, g.slots, KVD, g.sinks, w->att16,
+                          ATT, B, pos, g.window);
     gemm_bf16(s, w->att16, B, g.w_o, g.b_o, w->proj, H, ATT);
     // residual add and the MoE input norm in one pass
     add_rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, w->proj, g.rms_ffn, w->t16, H);
