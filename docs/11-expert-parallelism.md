@@ -68,6 +68,22 @@ Correctness: with the exact kernels, 120b split over two GCDs gives **bit-identi
 CPU** (2 prompts × 12 steps, `EP=2 tests/gpu_vs_cpu.cpp`), and 20b split the same way too. Full-run
 speed and scores: see the optimization log, rows 3 and 4.
 
+## Sending one finished row per token instead of each expert's row
+
+The first version let each GCD read, for every one of its tokens, the outputs of the experts its
+partner ran: about 2 rows of 2,880 fp32 numbers per token. Now the GCD that ran the experts first
+adds them up, weighted, for each of its partner's tokens (`moe_partial_ep_kernel`), and the partner
+reads **one** row per token (`moe_combine_partial_kernel`).
+
+```
+before: B reads A's expert rows  r1, r2 ─────────────► B adds w1·r1 + w2·r2 + its own
+after : A computes s = w1·r1 + w2·r2 for B's token ──► B reads s, adds s + its own
+```
+
+Half the bytes over the link, and one contiguous row per token. It changes the order of the
+additions, so the output changes slightly (checked with METEOR / BERTScore: 0.576 / 0.982). 120b
+on 8 GCDs: 35,815 → 36,132 tok/s (+0.9 %).
+
 ## Where it is in our code
 
 - `getp-csrc/engine/gpu_engine.hpp`: `GpuGroup`, `gpu_pair()` (peer access), `gpu_step_group()` (the
