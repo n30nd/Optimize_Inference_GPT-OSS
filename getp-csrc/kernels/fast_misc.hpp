@@ -102,3 +102,45 @@ __global__ void moe_combine_kernel(float *__restrict__ x,
     x[(size_t)b * H + i] += acc;
   }
 }
+
+// RMSNorm of x's rows into bf16, the arithmetic of rmsnorm_bf16_kernel, for a
+// row whose new values each thread holds in xs (elements t, t + 256, ...).
+// Called by a whole 256-thread block.
+__device__ inline void rmsnorm_row_bf16(const float *xs, int count,
+                                        const float *__restrict__ weight,
+                                        bf16_t *__restrict__ out, int H) {
+  __shared__ float part[256];
+  float ss = 0.0f;
+  for (int c = 0; c < count; c++)
+    ss = fmaf(xs[c], xs[c], ss);
+  part[threadIdx.x] = ss;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s)
+      part[threadIdx.x] += part[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(part[0] / H + 1e-5f);
+  for (int c = 0, j = threadIdx.x; c < count; c++, j += blockDim.x)
+    out[j] = f32_to_bf16(weight[j] * (inv * xs[c]));
+}
+
+#define FUSED_ROW_MAX 16 // H <= 256 * 16
+
+// x += y, then RMSNorm(x) into out: add_inplace_kernel followed by
+// rmsnorm_bf16_kernel, bit for bit. One block of 256 threads per row.
+__global__ __launch_bounds__(256) void add_rmsnorm_bf16_kernel(
+    float *__restrict__ x, const float *__restrict__ y,
+    const float *__restrict__ weight, bf16_t *__restrict__ out, int H) {
+  const int b = blockIdx.x;
+  float *xr = x + (size_t)b * H;
+  const float *yr = y + (size_t)b * H;
+  float xs[FUSED_ROW_MAX];
+  int count = 0;
+  for (int j = threadIdx.x; j < H; j += blockDim.x) {
+    const float v = __fadd_rn(xr[j], yr[j]);
+    xr[j] = v;
+    xs[count++] = v;
+  }
+  rmsnorm_row_bf16(xs, count, weight, out + (size_t)b * H, H);
+}

@@ -261,3 +261,72 @@ __global__ void moe_combine_partial_kernel(float *__restrict__ x,
     xr[i] = v;
   }
 }
+
+// Fast path, experts not split: moe_combine_ep_kernel<false> followed by
+// rmsnorm_bf16_kernel of the updated row with norm_w (the next layer's
+// attention norm, or the final norm), bit for bit. One 256-thread block per
+// token; a finished request (expert -1) keeps x and still gets its norm.
+__global__ __launch_bounds__(256) void moe_combine_rmsnorm_kernel(
+    float *__restrict__ x, const float *__restrict__ Z, const int *__restrict__ own_row,
+    const float *__restrict__ topk_w, const int *__restrict__ topk_e, int k, int H,
+    const float *__restrict__ norm_w, bf16_t *__restrict__ out) {
+  const int b = blockIdx.x;
+  const float *rows[MOE_MAX_TOPK];
+  const bool live = topk_e[(size_t)b * k] >= 0;
+  for (int j = 0; j < k; j++)
+    rows[j] = live ? Z + (size_t)own_row[b * k + j] * H : nullptr;
+  float *xr = x + (size_t)b * H;
+  float xs[FUSED_ROW_MAX];
+  int count = 0;
+  for (int i = threadIdx.x; i < H; i += blockDim.x) {
+    float v = xr[i];
+    if (live) {
+      float acc = 0.0f;
+      for (int j = 0; j < k; j++)
+        acc = fmaf(rows[j][i], topk_w[(size_t)b * k + j], acc);
+      v += acc;
+      xr[i] = v;
+    }
+    xs[count++] = v;
+  }
+  rmsnorm_row_bf16(xs, count, norm_w, out + (size_t)b * H, H);
+}
+
+// Fast path, experts split: moe_combine_partial_kernel followed by
+// rmsnorm_bf16_kernel of the updated row with norm_w. One 256-thread block
+// per token.
+__global__ __launch_bounds__(256) void moe_combine_partial_rmsnorm_kernel(
+    float *__restrict__ x, const float *__restrict__ Z_own, const int *__restrict__ own_row,
+    const float *__restrict__ S_peer, const float *__restrict__ topk_w,
+    const int *__restrict__ topk_e, int e_begin, int e_count, int k, int H,
+    const float *__restrict__ norm_w, bf16_t *__restrict__ out) {
+  const int b = blockIdx.x;
+  const float *rows[MOE_MAX_TOPK];
+  float wgt[MOE_MAX_TOPK];
+  int n = 0;
+  const bool live = topk_e[(size_t)b * k] >= 0;
+  for (int j = 0; live && j < k; j++) {
+    const int p = b * k + j;
+    const int e = topk_e[p] - e_begin;
+    if (e >= 0 && e < e_count) {
+      rows[n] = Z_own + (size_t)own_row[p] * H;
+      wgt[n++] = topk_w[p];
+    }
+  }
+  float *xr = x + (size_t)b * H;
+  const float *sp = S_peer + (size_t)b * H;
+  float xs[FUSED_ROW_MAX];
+  int count = 0;
+  for (int i = threadIdx.x; i < H; i += blockDim.x) {
+    float v = xr[i];
+    if (live) {
+      float acc = 0.0f;
+      for (int j = 0; j < n; j++)
+        acc = fmaf(rows[j][i], wgt[j], acc);
+      v += acc + sp[i];
+      xr[i] = v;
+    }
+    xs[count++] = v;
+  }
+  rmsnorm_row_bf16(xs, count, norm_w, out + (size_t)b * H, H);
+}

@@ -384,7 +384,9 @@ static void layer_attention(GpuWorker *w, int l, int B, int pos) {
         w->att, ATT, pos, g.window);
     gemm_bf16_exact(s, w->att, B, g.w_o, g.b_o, w->proj, H, ATT);
   } else {
-    rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, g.rms_attn, w->t16, H);
+    // later layers get t16 = RMSNorm(x) from the previous layer's combine
+    if (l == 0)
+      rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, g.rms_attn, w->t16, H);
     gemm_bf16(s, w->t16, B, g.w_qkv, g.b_qkv, w->qkv, QKV, H);
     rope_kv_bf16_kernel<<<B, 256, 0, s>>>(w->qkv, QKV, cosv, sinv, c.n_attn_heads,
                                           c.n_kv_heads, D, g.kc16, g.vc16, g.slots, kv_slot);
@@ -392,6 +394,9 @@ static void layer_attention(GpuWorker *w, int l, int B, int pos) {
                            c.n_attn_heads / c.n_kv_heads, g.sinks, w->att16, ATT, B, pos,
                            g.window);
     gemm_bf16(s, w->att16, B, g.w_o, g.b_o, w->proj, H, ATT);
+    // residual add and the MoE input norm in one pass
+    add_rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, w->proj, g.rms_ffn, w->t16, H);
+    return;
   }
   add_inplace_kernel<<<((size_t)B * H + 255) / 256, 256, 0, s>>>(w->x, w->proj, (size_t)B * H);
 }
@@ -407,8 +412,7 @@ static void layer_route(GpuWorker *w, int l, int B) {
   if (w->exact) {
     rmsnorm_exact<<<B, 256, H * sizeof(float), s>>>(w->x, g.rms_ffn, w->t, H);
     gemm_bf16_exact(s, w->t, B, g.w_router, g.b_router, w->router, E, H);
-  } else {
-    rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, g.rms_ffn, w->t16, H);
+  } else { // t16 = RMSNorm(x) from layer_attention
     gemm_bf16(s, w->t16, B, g.w_router, g.b_router, w->router, E, H);
   }
   if (E <= 256)
@@ -484,14 +488,18 @@ static void layer_combine(GpuWorker *w, int l, int B) {
     moe_combine_ep_kernel<true><<<B, 256, 0, w->stream>>>(
         w->x, w->Zg, w->own_row, Zp, rows_p, w->topk_w, w->topk_e, w->e_begin, w->e_count,
         c.experts_per_token, c.hidden_dim);
-  else if (p)
-    moe_combine_partial_kernel<<<B, 256, 0, w->stream>>>(
-        w->x, w->Zg, w->own_row, p->S, w->topk_w, w->topk_e, w->e_begin, w->e_count,
-        c.experts_per_token, c.hidden_dim);
-  else
-    moe_combine_ep_kernel<false><<<B, 256, 0, w->stream>>>(
-        w->x, w->Zg, w->own_row, Zp, rows_p, w->topk_w, w->topk_e, w->e_begin, w->e_count,
-        c.experts_per_token, c.hidden_dim);
+  else {
+    // the combine also writes t16 = RMSNorm(x) for the next layer (or the LM head)
+    const float *norm_w = l + 1 < c.n_layers ? w->layers[l + 1].rms_attn : w->rms_out;
+    if (p)
+      moe_combine_partial_rmsnorm_kernel<<<B, 256, 0, w->stream>>>(
+          w->x, w->Zg, w->own_row, p->S, w->topk_w, w->topk_e, w->e_begin, w->e_count,
+          c.experts_per_token, c.hidden_dim, norm_w, w->t16);
+    else
+      moe_combine_rmsnorm_kernel<<<B, 256, 0, w->stream>>>(
+          w->x, w->Zg, w->own_row, w->topk_w, w->topk_e, c.experts_per_token, c.hidden_dim,
+          norm_w, w->t16);
+  }
 }
 
 // Final RMSNorm, LM head, greedy next token.
@@ -504,8 +512,7 @@ static void step_logits(GpuWorker *w, int B) {
   if (w->exact) {
     rmsnorm_exact<<<B, 256, H * sizeof(float), s>>>(w->x, w->rms_out, w->t, H);
     gemm_bf16_exact(s, w->t, B, w->unemb, nullptr, w->logits, V, H);
-  } else {
-    rmsnorm_bf16_kernel<<<B, 256, 0, s>>>(w->x, w->rms_out, w->t16, H);
+  } else { // t16 = final RMSNorm(x) from the last layer's combine
     gemm_bf16(s, w->t16, B, w->unemb, nullptr, w->logits, V, H);
   }
   argmax_kernel<<<B, 256, 0, s>>>(w->logits, V, w->next);
