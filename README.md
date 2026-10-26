@@ -1,3 +1,35 @@
+# gpt-oss on 8× AMD MI250: results
+
+Batch generation (`-m getp`) for gpt-oss-20b and gpt-oss-120b on one machine with 4 AMD MI250
+cards (8 GCDs). Every GPU kernel is written from scratch in HIP; the program uses no GPU libraries.
+
+| | gpt-oss-20b | gpt-oss-120b |
+|---|---:|---:|
+| Given CPU program | 3.3 tok/s | 0.40 tok/s |
+| First GPU version (bit-identical to the CPU) | 3,348 tok/s | 1,188 tok/s |
+| **Now** | **~80,000 tok/s** | **~45,500 tok/s** |
+| METEOR / BERTScore (must be ≥ 0.30 / ≥ 0.90) | 0.533 / 0.978 | 0.552 / 0.981 |
+
+- Input: `evaluation/input.txt` (4,096 prompts, answers up to 1,024 tokens), all 8 GCDs.
+- 20b: a full model copy on each GCD, 512 requests each. 120b: each layer's experts are split
+  between the two GCDs of one card, 4 such pairs.
+- Yardstick: vLLM runs 20b at 6,539 tok/s on one GCD; this program does about 10,000 per GCD.
+- With the input repeated twice (8,192 prompts, 1,024 per GCD), 20b reaches 84,268 tok/s.
+
+**Slides:** [docs/slides.md](docs/slides.md) — the problem, each technique (what it fixes, whether it
+is used here, what it gave) and the results, written for newcomers. The Marp extension shows them
+as a deck; any Markdown viewer shows the pages one after another.
+
+**Technique docs:** [docs/](docs/) — one beginner-level document per technique, 01 to 12.
+
+Run with the Hugging Face model folder as the model path:
+
+```bash
+make runomp
+./run /path/to/gpt-oss-20b -m getp -i evaluation/input.txt -o output.txt
+python3 tools/bench.py -m /path/to/gpt-oss-20b -i evaluation/input.txt -g all -t mytag --score
+```
+
 # Environment Setup
 
 ```bash
