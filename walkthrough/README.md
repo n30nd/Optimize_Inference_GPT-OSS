@@ -30,21 +30,22 @@ the same repository), so `git show e824840` works in both.
 fast path). The course's own code ends at `865fca5` "add kickoff slide"; our first commit is
 `f0c4dbd`. Starting at `865fca5` lets you type the first GPU port (lesson 03) yourself.
 
-## One-time setup
+## Setup, in every new terminal
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough
-source /home/namvu/gpt-oss/.venv/bin/activate      # python with tiktoken, torch, bert-score
-export M20=/remote/vast0/share-mv/models/openai/gpt-oss-20b
-export M120=/remote/vast0/share-mv/models/openai/gpt-oss-120b
-export MODELS_ROOT=/home/namvu/gptoss-models         # holds bs_model/roberta-large-mnli for scoring
-export W=/home/namvu/walk-runs                       # run inputs and outputs, kept out of the repo
-mkdir -p $W
-(echo 64; sed -n 2,65p evaluation/input.txt) > $W/in64.txt   # first 64 prompts, for quick checks
+source walkthrough/env.sh
 ```
 
-Put the `source` and `export` lines in a small file and `source` it in every new terminal.
-`make runomp` also writes `tokenizer.bin` (the word list) next to `./run`; git ignores it.
+`walkthrough/env.sh` does four things:
+- turns on the python environment of the finished folder (it has `tiktoken`, which `make` needs
+  to write `tokenizer.bin`, plus `torch` and `bert-score` for scoring);
+- sets `M20` and `M120` (the two model folders), `MODELS_ROOT` (the scoring model) and
+  `W=/home/namvu/walk-runs` (run inputs and outputs, kept out of the repo);
+- creates `$W/in64.txt` (the first 64 prompts, for quick checks) if it is missing.
+
+Without it, `make runomp` stops with `ModuleNotFoundError: No module named 'tiktoken'`.
+`make runomp` also writes `tokenizer.bin` (the word list) next to `./run`; git ignores both.
 
 ## How one lesson goes
 

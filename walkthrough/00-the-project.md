@@ -72,8 +72,12 @@ Know what is asked, what we may change, and how to build, run, read the output a
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough
-make runomp        # hipcc, -O3, OpenMP; also writes tokenizer.bin
+source walkthrough/env.sh   # every new terminal: python with tiktoken, and $M20 $M120 $W
+make runomp                 # hipcc, -O3, OpenMP; also writes tokenizer.bin
 ```
+
+`make runomp` first runs `python3 export_tokenizer_bin.py` (`Makefile:42`), which needs the
+`tiktoken` package. The system python does not have it; the environment turned on by `env.sh` does.
 
 `make run` (no optimisation) and `make runfast` (-O3 without OpenMP) exist too; every lesson
 uses `make runomp`, as the course measures it.
