@@ -232,3 +232,36 @@ left. The README shows how to skip several lessons at once (`git cherry-pick f0c
 lessons 01–10). Checked on 2026-10-28: all 29 commits, applied in order, go in without a conflict
 and give exactly the files of `getp-gpu`. It is called "shortcut", not "fast path", because "fast
 path" already means the program's mixed-precision route (lesson 04).
+
+**The attention sink (`run.cpp:623-626`).** In attention, each head (one of many separate readers
+that look back at the earlier tokens side by side) gives every earlier token a score, and softmax
+turns the scores into shares that add up to exactly 1. gpt-oss adds one extra slot to that list:
+
+```cpp
+att[pos + 1] = w->attn_sinks[l * p->n_attn_heads + h];   // one learned number per layer and head
+softmax(att, pos + 2);                                   // the sink takes part in the split
+```
+
+- The sink is a number learned in training, stored as `attn_sinks` (layers × heads, `run.cpp:65`).
+  The mixing loop that follows (`run.cpp:631-641`) only goes over `t = 0..pos`: the sink has no
+  value to add, so its share is thrown away. The shares of the real tokens add up to *less* than 1:
+  `a_t = exp(s_t) / (Σ_j exp(s_j) + exp(sink))`.
+- Example, scores [1, 2]: without a sink the shares are 0.269 and 0.731. With sink = 2 they are
+  0.155, 0.422 and 0.422 for the sink, so the head passes on only 58% of a full mix. A large sink
+  means "this head mostly stays quiet"; a very negative one means normal attention.
+- Why: plain softmax forces the head to spread all of its focus over real tokens even when none of
+  them matter. Models without a sink learn to dump that focus on the first token of the text (the
+  "attention sinks" of the 2023 StreamingLLM paper). That trick breaks under a sliding window:
+  gpt-oss's even layers only see the last 128 tokens (`run.cpp:617`), and once the first token
+  leaves the window there is nowhere to dump. It also creates a few huge numbers inside the model,
+  which makes storing it in fewer bits harder. A learned sink is a "look at nothing" choice that
+  is always there. (Evan Miller's "Attention is off by one" adds a fixed +1 below the line; that
+  is a sink fixed at 0.)
+- Other models: GPT-2, Llama, Mistral and Qwen 2/3 use plain softmax, with no sink. gpt-oss has
+  one, so every engine that runs it (this program, vLLM) must add it. The original Python code does
+  the same: it adds the sink as an extra column before softmax and drops that column after.
+- Catch in the given code: `s->att` gives each head `seq_len` slots (`run.cpp:155-156`), so at the
+  last position (`pos = seq_len - 1`) `att[pos + 1]` writes one slot past the head's part: into
+  the next head's slot 0, which another thread may be using, or past the end of the buffer for the
+  last head. Normal runs stop before `seq_len` and never reach it; `seq_len + 1` slots per head
+  would fix it.
