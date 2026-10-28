@@ -4,6 +4,7 @@ rocm-smi index, PCI bus, busy % and memory %, and which ones are free.
 
     tools/gpus.py              # table
     tools/gpus.py --free 2     # print 2 free HIP indices, e.g. "4,5" (exit 1 if not enough)
+    tools/gpus.py --free all   # print every free HIP index (exit 1 if none)
 """
 
 import argparse
@@ -50,7 +51,7 @@ def smi_cards():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--free", type=int, metavar="N", help="print N free HIP indices, comma-separated")
+    ap.add_argument("--free", metavar="N|all", help="print N (or all) free HIP indices, comma-separated")
     args = ap.parse_args()
 
     buses, cards = hip_buses(), smi_cards()
@@ -62,10 +63,11 @@ def main():
 
     if args.free is not None:
         ids = [str(r[0]) for r in rows if r[5]]
-        if len(ids) < args.free:
+        want = max(1, len(ids)) if args.free == "all" else int(args.free)
+        if len(ids) < want:
             print(f"only {len(ids)} free GPU(s): {','.join(ids)}", file=sys.stderr)
             sys.exit(1)
-        print(",".join(ids[: args.free]))
+        print(",".join(ids[:want]))
         return
 
     print(f"{'HIP':>3} {'rocm-smi':>8} {'PCI bus':>14} {'busy%':>6} {'VRAM%':>6}  state")

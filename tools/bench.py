@@ -12,9 +12,9 @@
 - hash = first 12 hex digits of sha256(output file). Same hash means the same
   generated tokens.
 - --score compares the output with the reference answers using
-  evaluation/eval.py (METEOR, BERTScore F1) on one free GPU. Only meaningful
-  when the input is evaluation/input.txt. Needs MODELS_ROOT to hold
-  bs_model/roberta-large-mnli.
+  tools/score.py (eval.py's METEOR and BERTScore F1, split over every free
+  GPU). Only meaningful when the input is evaluation/input.txt. Needs
+  MODELS_ROOT to hold bs_model/roberta-large-mnli.
 """
 
 import argparse
@@ -66,12 +66,12 @@ def parse_log(text: str) -> dict:
 
 
 def score(output: Path, reference: Path, run_dir: Path) -> dict:
-    gpu = sh([str(TOOLS / "gpus.py"), "--free", "1"])
-    cmd = [str(TOOLS / "gpulock.sh"), gpu, "--", sys.executable,
-           str(REPO / "evaluation/eval.py"), "-s", str(output), "-r", str(reference)]
+    gpus = sh([str(TOOLS / "gpus.py"), "--free", "all"])
+    cmd = [str(TOOLS / "gpulock.sh"), gpus, "--", sys.executable,
+           str(TOOLS / "score.py"), "-s", str(output), "-r", str(reference)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     (run_dir / "score.log").write_text(proc.stdout + proc.stderr)
-    res = {"score_passed": proc.returncode == 0}
+    res = {"score_passed": proc.returncode == 0, "score_gpus": gpus}
     for key in ("meteor", "bertscore_f1"):
         found = re.findall(rf"^{key}\t([0-9.]+)", proc.stdout, re.M)
         if found:
