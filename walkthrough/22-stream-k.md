@@ -5,6 +5,7 @@
 | Reference commit | `1131a42` "Stream-K for qkv and attention-out; router K parts on more CUs" |
 | Starts from | `64f5f16` (lesson 21) |
 | To type | 319 lines of program code in 1 file (62 removed); 54 lines of tests and benchmarks and 145 of docs (optional) |
+| Shortcut | `git cherry-pick 1131a42` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 76,149 tok/s (+0.3 %), 120b 42,176 tok/s (+0.1 %) |
 
 **In plain words:** a GPU die has 104 workers. When a job is cut into 160 equal pieces, 56 workers
@@ -95,6 +96,22 @@ Read while typing (line numbers at `1131a42`):
   `stream_fits`, `:838` `gemm_pick_config`.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 1131a42
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 1131a42 -- $(git show --name-only --format= 1131a42)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

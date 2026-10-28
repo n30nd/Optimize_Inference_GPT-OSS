@@ -5,6 +5,7 @@
 | Reference commit | `5d9e8e7` "Fuse SwiGLU (and, without a partner GCD, the row gather) into mlp1" |
 | Starts from | `9813b7a` (lesson 10) |
 | To type | 24 lines of program code in 2 files (22 in the engine, 2 comment lines in the kernel); no tests or docs |
+| Shortcut | `git cherry-pick 5d9e8e7` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 64,099 → **66,710** tok/s (+4.1 %); 120b measured together with lesson 13 (35,815) |
 
 **In plain words:** the first expert multiply wrote a big table of results to memory, and the
@@ -82,6 +83,22 @@ Read while typing (line numbers at `5d9e8e7`):
   with `swiglu_bf16_kernel` (`getp-csrc/kernels/fast_misc.hpp:68`).
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 5d9e8e7
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 5d9e8e7 -- $(git show --name-only --format= 5d9e8e7)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

@@ -5,6 +5,7 @@
 | Reference commit | `0214995` "Add a tool that repeats an input file's prompts to a given count" |
 | Starts from | `5d9e8e7` (lesson 11) |
 | To type | 25 lines of tools in 1 file (`tools/make_input.py`); no program code |
+| Shortcut | `git cherry-pick 0214995` — copies the finished commit instead of typing (section 5) |
 | Speed after | official input unchanged (66,710 tok/s); with 8,192 prompts: **75,640** tok/s (20b) |
 
 **In plain words:** the official input has 4,096 questions, which gives each of the 8 GPU dies
@@ -62,6 +63,22 @@ New words:
 The whole tool is the loop at `tools/make_input.py:19–21`: `print(prompts[i % len(prompts)])`.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 0214995
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 0214995 -- $(git show --name-only --format= 0214995)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

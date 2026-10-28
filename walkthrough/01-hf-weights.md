@@ -5,6 +5,7 @@
 | Reference commit | `f0c4dbd` "Load gpt-oss weights straight from the Hugging Face folder" |
 | Starts from | `865fca5` (lesson 00) |
 | To type | 1,091 lines of program code in 6 files (432 of them are file-reading plumbing); 166 lines of tests (optional) |
+| Shortcut | `git cherry-pick f0c4dbd` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 3.3 tok/s, 120b 0.40 tok/s — still the CPU, one prompt at a time |
 
 **In plain words:** the program could only read the model from one special file that does not
@@ -87,6 +88,22 @@ Read while typing: `hf_model.hpp` lines 23–27 (the 16 MXFP4 values) and `mxfp4
 only the weight read differs.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick f0c4dbd
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout f0c4dbd -- $(git show --name-only --format= f0c4dbd)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

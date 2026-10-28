@@ -5,6 +5,7 @@
 | Reference commit | `29f59e2` "Group MoE rows with one block per expert instead of one thread" |
 | Starts from | `30dd744` (lesson 08) |
 | To type | 88 lines of program code in 2 files (+88 −46) |
+| Shortcut | `git cherry-pick 29f59e2` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 7,858 tok/s together with lesson 08 (was 5,741); measured as one step |
 
 **In plain words:** before the experts can work, every token's 4 choices must be sorted into
@@ -75,6 +76,22 @@ Read while typing (line numbers at `29f59e2`):
 - `getp-csrc/engine/gpu_engine.hpp:390-392` — the two launches, `<<<w->e_count, MOE_GROUP_THREADS>>>`.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 29f59e2
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 29f59e2 -- $(git show --name-only --format= 29f59e2)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

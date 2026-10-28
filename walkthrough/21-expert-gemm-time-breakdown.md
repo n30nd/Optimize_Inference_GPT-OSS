@@ -5,6 +5,7 @@
 | Reference commit | `64f5f16` "docs/08: where the expert GEMM's time goes; bench replays real routing" |
 | Starts from | `9b2edc9` + `7faed85` (lesson 20) |
 | To type | no program code; 26 lines of benchmark (optional); 67 lines of docs (optional) |
+| Shortcut | `git cherry-pick 64f5f16` — copies the finished commit instead of typing (section 5) |
 | Speed after | unchanged: 20b 75,811 tok/s, 120b 42,113 tok/s |
 
 **In plain words:** the expert multiply, the biggest single cost, ran at about half of what the
@@ -84,6 +85,22 @@ Read while typing (line numbers at `64f5f16`):
 - `docs/08-moe-grouped-gemm-mxfp4.md:446` — section 9.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 64f5f16
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 64f5f16 -- $(git show --name-only --format= 64f5f16)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

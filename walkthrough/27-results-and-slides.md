@@ -5,6 +5,7 @@
 | Reference commit | `feddb1c` "Add the results to the README and the slides in docs/slides.md" |
 | Starts from | `7a1833c` (lesson 26) |
 | To type | no program code; 32 lines of `README.md` and 575 lines of `docs/slides.md` (docs: type or copy) |
+| Shortcut | `git cherry-pick feddb1c` — copies the finished commit instead of typing (section 5) |
 | Speed after | unchanged: 20b ~80,000 tok/s, 120b ~45,500 tok/s |
 
 **In plain words:** the program is done for now. This last commit writes down what it achieves

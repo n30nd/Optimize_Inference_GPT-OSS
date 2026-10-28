@@ -5,6 +5,7 @@
 | Reference commit | `9eb944f` "Small kernels: loads first, count and place in one kernel, query rotated in attention" |
 | Starts from | `25d09b2` (lesson 24) |
 | To type | 648 lines of program code in 6 files (232 removed) — typed in 5 parts below; 1,365 lines of tests and benchmarks and 160 of docs (optional) |
+| Shortcut | `git cherry-pick 9eb944f` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 80,000 tok/s (+1.4 %), 120b 45,200 tok/s (+2.3 %) |
 
 **In plain words:** between the big multiplications run a dozen small jobs: add two lists of
@@ -117,6 +118,22 @@ Read while typing (line numbers at `9eb944f`):
   `t16_peer`; `:564` the gather reads that local copy.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 9eb944f
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 9eb944f -- $(git show --name-only --format= 9eb944f)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

@@ -5,6 +5,7 @@
 | Reference commit | `265650c` "Fuse the residual adds with the RMSNorms that follow them" |
 | Starts from | `c15ec95` (lesson 16) |
 | To type | 131 lines of program code in 3 files |
+| Shortcut | `git cherry-pick 265650c` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 73,212 tok/s, 120b 40,765 tok/s (8 GCDs, official input) |
 
 **In plain words:** twice per layer, the program added a result into each request's running list
@@ -79,6 +80,22 @@ Read while typing (line numbers at `265650c`):
   but still gets its norm, because the next layer's attention reads `t16` for every row.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 265650c
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 265650c -- $(git show --name-only --format= 265650c)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

@@ -5,6 +5,7 @@
 | Reference commit | `d68a11d` "Exchange one partial sum per token between expert-split GCDs" |
 | Starts from | `85e8426` (lesson 13) |
 | To type | 90 lines of program code in 2 files (78 in `getp-csrc/kernels/moe_ep.hpp`, 12 in the engine); no tests or docs |
+| Shortcut | `git cherry-pick d68a11d` — copies the finished commit instead of typing (section 5) |
 | Speed after | 120b 35,815 → **36,132** tok/s (+0.9 %); 20b unchanged (it has no partner) |
 
 **In plain words:** for gpt-oss-120b, the two halves of a card each hold half of the experts
@@ -81,6 +82,22 @@ Read while typing (line numbers at `d68a11d`):
 - `getp-csrc/engine/gpu_engine.hpp:455–458` — the combine reads the partner's `p->S`.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick d68a11d
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout d68a11d -- $(git show --name-only --format= d68a11d)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

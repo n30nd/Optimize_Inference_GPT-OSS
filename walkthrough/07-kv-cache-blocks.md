@@ -5,6 +5,7 @@
 | Reference commit | `c61cc5d` "Store the fast-path KV cache in 64-slot blocks per key/value head" |
 | Starts from | `03e8e9d` (lesson 06) |
 | To type | 22 lines of program code in 3 files (+22 −18) |
+| Shortcut | `git cherry-pick c61cc5d` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 5,741 tok/s (was 5,697); 120b 2,835 tok/s on the fast path (was 1,188 on the exact path) |
 
 **In plain words:** the stored history was kept in an order where each reader needed a small
@@ -71,6 +72,22 @@ Read while typing (line numbers at `c61cc5d`):
 - `getp-csrc/engine/gpu_engine.hpp:213` — `g.slots = (g.slots + 63) / 64 * 64;`
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick c61cc5d
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout c61cc5d -- $(git show --name-only --format= c61cc5d)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

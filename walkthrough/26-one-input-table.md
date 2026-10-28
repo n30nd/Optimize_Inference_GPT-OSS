@@ -5,6 +5,7 @@
 | Reference commit | `7a1833c` "Paired GCDs: one input table, so mlp1 gathers the partner's rows itself" |
 | Starts from | `9eb944f` (lesson 25) |
 | To type | 72 lines of program code in 2 files (70 removed); 6 lines of tools; 19 lines of tests and benchmarks and 98 of docs (optional) |
+| Shortcut | `git cherry-pick 7a1833c` — copies the finished commit instead of typing (section 5) |
 | Speed after | 120b 45,468 tok/s (+0.5 %); 20b 80,341 tok/s (unchanged path) |
 
 **In plain words:** on 120b each GPU die received its partner's rows into a separate in-tray,
@@ -84,6 +85,22 @@ Read while typing (line numbers at `7a1833c`):
   (the table's second half starts at row `batch`).
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 7a1833c
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 7a1833c -- $(git show --name-only --format= 7a1833c)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

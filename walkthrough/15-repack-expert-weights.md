@@ -5,6 +5,7 @@
 | Reference commit | `cdca2c5` "Repack the MXFP4 expert weights at load time for contiguous reads" |
 | Starts from | `d68a11d` (lesson 14) |
 | To type | 212 lines of program code in 2 files (kernel +176 −79, engine +36 −6); 94 lines of tests and benchmark (optional); 216 lines of docs (optional) |
+| Shortcut | `git cherry-pick cdca2c5` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 67,394 → **72,258** tok/s (+7.2 %); 120b 36,132 → **40,164** (+11.2 %) |
 
 **In plain words:** the expert weights were stored in the order the model file uses: one long
@@ -95,6 +96,22 @@ Read while typing (line numbers at `cdca2c5`):
   mlp1 and mlp2.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick cdca2c5
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout cdca2c5 -- $(git show --name-only --format= cdca2c5)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

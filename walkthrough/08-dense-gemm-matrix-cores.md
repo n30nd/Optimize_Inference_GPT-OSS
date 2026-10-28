@@ -5,6 +5,7 @@
 | Reference commit | `30dd744` "Run the dense matrix multiplies on the matrix cores" |
 | Starts from | `c61cc5d` (lesson 07) |
 | To type | 511 lines of program code in 1 file (+511 −47); 558 lines of tests and benchmarks (optional); 267 lines of docs (optional) |
+| Shortcut | `git cherry-pick 30dd744` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 7,858 tok/s together with lesson 09 (was 5,741); measured as one step |
 
 **In plain words:** most of the model's arithmetic is "multiply a table of numbers by another
@@ -101,6 +102,22 @@ Read while typing (line numbers at `30dd744`, file `getp-csrc/kernels/fast_gemm.
 - `:474` `gemm_pick_config()` and `:524` `gemm_bf16()` — the choice per shape.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 30dd744
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 30dd744 -- $(git show --name-only --format= 30dd744)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

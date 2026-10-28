@@ -5,6 +5,7 @@
 | Reference commit | `e824840` "Run getp on the GPUs, reproducing the CPU arithmetic bit for bit" |
 | Starts from | `e8c283e` (lesson 02) |
 | To type | 978 lines of program code in 7 files; 434 lines of tests (optional); 491 lines of docs (optional) |
+| Shortcut | `git cherry-pick e824840` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 3,348 tok/s (was 3.3 on the CPU: ×1,000) |
 
 **In plain words:** we move the work to the 8 GPU dies. Each die gets a full copy of the model
@@ -105,6 +106,22 @@ Spots to read while typing (line numbers at `e824840`):
   layer; `:278` `gpu_run_wave` — the host loop: upload tokens, step, download next tokens.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick e824840
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout e824840 -- $(git show --name-only --format= e824840)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

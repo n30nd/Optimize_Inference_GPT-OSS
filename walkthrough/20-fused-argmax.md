@@ -5,6 +5,7 @@
 | Reference commit | `9b2edc9` "Pick the greedy next token inside the LM-head multiply", then the docs-only commit `7faed85` |
 | Starts from | `fa89592` (lesson 19) |
 | To type | 150 lines of program code in 2 files; 122 lines of test (optional); 30 + 1 lines of docs (optional / cherry-picked) |
+| Shortcut | `git cherry-pick 9b2edc9 7faed85` — copies the finished commits instead of typing (section 5) |
 | Speed after | 20b 75,811 tok/s, 120b 42,113 tok/s (8 GCDs, official input); 20b 84,268 tok/s on 8,192 prompts |
 
 **In plain words:** at the end of every step the program gives all 201,088 possible next words a
@@ -74,6 +75,22 @@ Read while typing (line numbers at `9b2edc9`):
 - `getp-csrc/engine/gpu_engine.hpp:535` — the fast path's whole LM head + choice is now one call.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit, and the docs-only commit `7faed85` after it, as they are:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 9b2edc9 7faed85
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 9b2edc9 -- $(git show --name-only --format= 9b2edc9)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

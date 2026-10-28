@@ -5,6 +5,7 @@
 | Reference commit | `d28c548` "Split gpt-oss-120b's experts between the two GCDs of each card" |
 | Starts from | `3163e03` (lesson 04) |
 | To type | 562 lines of program code in 2 files (+421 −179 in the engine, 141 new); 36 lines of tests (optional); 91 lines of docs (optional) |
+| Shortcut | `git cherry-pick d28c548` — copies the finished commit instead of typing (section 5) |
 | Speed after | 120b 1,188 tok/s — the first GPU run of 120b, measured on the **exact** path; 20b unchanged (5,217) |
 
 **In plain words:** the big model is slightly larger than one GPU die's memory. Most of it is the
@@ -86,6 +87,22 @@ Read while typing (line numbers at `d28c548`):
   than 60 % of a GCD; `GPTOSS_EP` overrides.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick d28c548
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout d28c548 -- $(git show --name-only --format= d28c548)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

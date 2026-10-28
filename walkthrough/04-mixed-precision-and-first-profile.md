@@ -5,6 +5,7 @@
 | Reference commit | `3163e03` "Add a mixed-precision fast path for getp" |
 | Starts from | `e824840` (lesson 03) |
 | To type | 467 lines of program code in 6 files; 2 lines of tests; 81 lines of docs (optional) |
+| Shortcut | `git cherry-pick 3163e03` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 5,217 tok/s (was 3,348: +56 %) |
 
 **In plain words:** we store the numbers that go into the big multiplications at half size, but
@@ -80,6 +81,22 @@ Spots to read while typing (line numbers at `3163e03`):
   kernel names differ.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 3163e03
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 3163e03 -- $(git show --name-only --format= 3163e03)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

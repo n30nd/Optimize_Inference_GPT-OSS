@@ -5,6 +5,7 @@
 | Reference commit | `c15ec95` "Route finished requests to no expert" |
 | Starts from | `cdca2c5` (lesson 15) |
 | To type | 32 lines of program code in 3 files |
+| Shortcut | `git cherry-pick c15ec95` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 72,453 tok/s, 120b 40,633 tok/s (8 GCDs, official input) |
 
 **In plain words:** all requests on a GPU move forward together, one word per step. Some answers
@@ -80,6 +81,22 @@ Read while typing (line numbers at `c15ec95`):
   computing every row, so it stays bit-identical to the CPU.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick c15ec95
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout c15ec95 -- $(git show --name-only --format= c15ec95)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

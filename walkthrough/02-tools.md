@@ -5,6 +5,7 @@
 | Reference commit | `e8c283e` "Add tools to pick GPUs, queue jobs, benchmark and compare outputs" |
 | Starts from | `f0c4dbd` (lesson 01) |
 | To type | 409 lines of tools in 6 files, 3 lines of `.gitignore`; no program code |
+| Shortcut | `git cherry-pick e8c283e` — copies the finished commit instead of typing (section 5) |
 | Speed after | unchanged (no program change) |
 
 **In plain words:** before changing the program we build the measuring tape. These small tools
@@ -62,6 +63,22 @@ tools/bench.py -m <model> -i <input> -g all -t <name> --score
 | 7 | `.gitignore` | +3 | ignore `results/` | yes |
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick e8c283e
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout e8c283e -- $(git show --name-only --format= e8c283e)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

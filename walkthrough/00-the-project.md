@@ -131,6 +131,23 @@ It builds, waits until all 8 GPUs are free of our own jobs, runs all 4,096 promp
 the answers. Expect about **80,000 tok/s**, METEOR **0.533**, BERTScore **0.978**, fingerprint
 `58023f92ead7`. For 120b (`-m $M120`): about **45,500 tok/s**, METEOR 0.552, BERTScore 0.981.
 
+**When GPUs 4–7 are taken by someone else's job** (check with `python3 tools/gpus.py`), give
+`bench.py` only the free ones: `-g 0,1,2,3` instead of `-g all`. `-g all` does not wait for other
+people's jobs, only for ours; it shares their GPUs, and the slowest GPU sets the pace. On
+2026-10-28, with GPUs 4–7 busy:
+
+| `-g` | tok/s | METEOR | BERTScore | fingerprint |
+|---|---:|---:|---:|---|
+| `all` (4 of the 8 shared) | 44,085 | — | — | `58023f92ead7` |
+| `0,1,2,3` | 40,478 | 0.533 | 0.978 | `58023f92ead7` |
+
+With 4 GCDs, expect about half of every 8-GCD number in the lesson pages. Compare 4-GCD runs only
+with 4-GCD runs. The answers do not change with the number of GCDs (same fingerprint).
+
+`bench.py` prints nothing until it is done: about 2 minutes to run plus about 3 minutes to score
+(BERTScore alone takes 2 minutes). To watch it, look at `run.log` and then `score.log` in the
+newest folder under `$W/results/`.
+
 ## 8. Where we start and where we end
 
 | | 20b tok/s | 120b tok/s |
@@ -160,4 +177,58 @@ the answers. Expect about **80,000 tok/s**, METEOR **0.533**, BERTScore **0.978*
 
 ## 11. Discussion notes
 
-(empty: we write here during the walk-through)
+**Why `source walkthrough/env.sh` and not `bash walkthrough/env.sh`.** `source` runs the file
+inside the current terminal, so the settings it makes (the python environment, `$M20`, `$W`, …)
+stay there. `bash env.sh` runs it in a separate shell that closes at once, and the settings are lost.
+
+**`generate` mode and `chat` mode (`run.cpp`).** `-m` picks the function `main()` calls
+(`run.cpp:1232-1238`).
+
+| | `generate` (`run.cpp:923`) | `chat` (`run.cpp:1025`) |
+|---|---|---|
+| Where the text comes from | one string, `-i "…"` | the keyboard, one turn at a time |
+| Turns | 1 | many, until `-n` positions are used up (`pos` is never reset, so the model still sees earlier turns) |
+| Text put around your words | none | the Llama 2 template `[INST] … [/INST]` (`run.cpp:1068-1075`) |
+| Stops on | token 199999 or 200002, gpt-oss's real end tokens (`run.cpp:978-982`) | token `2`, Llama 2's end token (`run.cpp:1093-1096`) |
+
+- `chat` was copied from llama2.c and never adapted: in gpt-oss's word list token `2` is `#`, so
+  the model hands the turn back whenever it writes `#`, and its real end (200002) is not noticed.
+- Neither mode is scored. `simple_getp_generate()` (`getp-csrc/getp_run.cpp:25`) is `generate`'s
+  loop without the printing, so understanding `generate()` means understanding the starting `getp`.
+
+**Why a warm-up (question 1).**
+- Some jobs are done once, before any question is answered. `warm_up()` is outside the clock
+  (`getp-csrc/getp_eval.cpp:123-132`), and its own comment sets the one rule: "Do not inference
+  here" — prepare, but do not answer.
+- At `865fca5` it is empty because the CPU program has nothing left to prepare: `main()` already
+  opened the model (`build_transformer`, `run.cpp:1218`) with `mmap` (the file looks as if it were
+  in memory; each part is really read from disk the first time it is used, `run.cpp:288-289`).
+  Catch: so the first question, inside the clock, pays for reading the model from disk.
+- On the GPU there is much to prepare. In the finished program `gpu_warm_up()`
+  (`getp-csrc/engine/gpu_engine.hpp:864`) copies each GCD's share of the weights into GPU memory,
+  picks the batch size (how many questions a GCD handles at once), reserves the working memory and
+  the KV cache (the model's memory of the earlier tokens of each question), and pairs the two GCDs
+  of a card for 120b. Done in `inference()` instead, this would cost 20–40 s of score.
+- The name: first runs are slow (disk reads, GPU code loading, first touch of memory). `generate()`
+  does the same thing on a small scale: it starts its clock only after the first token
+  (`run.cpp:990-993`).
+
+**GPUs 4–7 are always busy: run on 0–3.** Someone else's job keeps GPUs 4–7 busy. `bench.py -g
+all` still runs there because `tools/gpulock.sh` only waits for *our* lock files
+(`/tmp/gptoss-gpu-locks/gpu<N>.lock`), not for other people. It gave 44,085 tok/s instead of
+~80,000. That run finished at 13:25, but it left no `score.log`, so it was stopped during
+scoring. Most likely it only *looked* stuck: `bench.py` prints nothing until the very end, and
+scoring adds about 3 minutes after the run. Fix: `-g 0,1,2,3`. That gave 40,478 tok/s, METEOR
+0.533, BERTScore 0.978 and the same fingerprint `58023f92ead7` (numbers in section 7). The finished
+program needs no change: it uses however many GPUs it sees (`hipGetDeviceCount`,
+`getp-csrc/engine/gpu_engine.hpp:866`). For 120b, GPUs 0,1 and 2,3 are the two dies of the same
+card, so the pairs stay correct.
+
+**A shortcut for every lesson: copy the commit instead of typing it.** Each lesson page (01–27)
+now has a "Shortcut" row in its header and a "Shortcut — skip the typing" block at the top of
+section 5: `git cherry-pick <commit>` copies the finished commit onto `walk-through-project` with
+the same name, so there is nothing to type, compare or save; only the build and the checks are
+left. The README shows how to skip several lessons at once (`git cherry-pick f0c4dbd^..9813b7a` =
+lessons 01–10). Checked on 2026-10-28: all 29 commits, applied in order, go in without a conflict
+and give exactly the files of `getp-gpu`. It is called "shortcut", not "fast path", because "fast
+path" already means the program's mixed-precision route (lesson 04).

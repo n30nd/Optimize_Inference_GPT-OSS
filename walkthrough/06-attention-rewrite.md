@@ -5,6 +5,7 @@
 | Reference commit | `03e8e9d` "Rewrite decode attention around grouped-query sharing and matrix cores" |
 | Starts from | `d28c548` (lesson 05) |
 | To type | 372 lines of program code in 1 file (+372 −9); 672 lines of tests and benchmarks (optional); 425 lines of docs (optional) |
+| Shortcut | `git cherry-pick 03e8e9d` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 5,697 tok/s (was 5,217) |
 
 **In plain words:** at every step each request looks back at everything it has written so far.
@@ -100,6 +101,22 @@ Read while typing (line numbers at `03e8e9d`, file `getp-csrc/kernels/fast_atten
 - `:393` `attention_bf16()` — the entry point the engine calls.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 03e8e9d
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 03e8e9d -- $(git show --name-only --format= 03e8e9d)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

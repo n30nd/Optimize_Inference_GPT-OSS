@@ -79,6 +79,21 @@ The steps, the same for every lesson:
 7. Discuss. The notes go into section 9 of the lesson page, saved in their own commit
    (`git commit -m "walkthrough: notes for lesson NN" walkthrough/`).
 
+**Shortcut — skip the typing of a lesson.** Instead of steps 3, 4 and 6, copy the finished
+commit onto your branch (each page's header and section 5 give the exact command):
+
+```bash
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick f0c4dbd                   # lesson 01; same name as the original, already saved
+```
+
+Then build and run the checks of section 5 as usual. Lessons 18 and 20 take two commits each
+(`git cherry-pick 027549a 6b315b5`, `git cherry-pick 9b2edc9 7faed85`). To skip several lessons in
+one go, give a range: `git cherry-pick <first commit>^..<last commit>`, e.g. lessons 01–10:
+`git cherry-pick f0c4dbd^..9813b7a` (`^` means "the commit before", so the range starts at
+`f0c4dbd` itself). All 29 commits were applied this way, one after another, on 2026-10-28: each
+applied cleanly, and the result equals `getp-gpu` file for file.
+
 Quick check after a lesson (one GCD, 64 prompts, 128 positions, about a minute):
 
 ```bash
@@ -95,7 +110,8 @@ sha256sum $W/out64_120.txt | cut -c1-12
 ```
 
 Same fingerprint as the lesson page says = the same answers, word for word. The full measurement
-(8 GCDs, all 4,096 prompts, with the quality scores) is in each lesson's section 5.
+(8 GCDs, all 4,096 prompts, with the quality scores) is in each lesson's section 5. If only GPUs
+0–3 are free, run it with `-g 0,1,2,3` and expect about half the tok/s (lesson 00, section 7).
 
 ## The lessons
 

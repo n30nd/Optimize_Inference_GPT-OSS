@@ -5,6 +5,7 @@
 | Reference commit | `027549a` "Store the V half of the fast-path KV cache as int8", then the docs-only commit `6b315b5` |
 | Starts from | `265650c` (lesson 17) |
 | To type | 171 lines of program code in 3 files; 540 lines of tests and benchmarks (optional); 232 + 111 lines of docs (optional / cherry-picked) |
+| Shortcut | `git cherry-pick 027549a 6b315b5` — copies the finished commits instead of typing (section 5) |
 | Speed after | 20b 74,718 tok/s, 120b 41,589 tok/s (8 GCDs, official input) |
 
 **In plain words:** for every word already written, the program keeps two lists of numbers per
@@ -90,6 +91,22 @@ Read while typing (line numbers at `027549a`):
   codes sit in the order the lanes load them, so each lane gets its 16 codes with one 16-byte load.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit, and the docs-only commit `6b315b5` after it, as they are:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 027549a 6b315b5
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 027549a -- $(git show --name-only --format= 027549a)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

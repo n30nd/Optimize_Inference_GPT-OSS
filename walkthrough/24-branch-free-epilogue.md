@@ -5,6 +5,7 @@
 | Reference commit | `25d09b2` "Expert GEMM: branch-free epilogue through buffer descriptors" |
 | Starts from | `a9b23f7` (lesson 23) |
 | To type | 79 lines of program code in 1 file (50 removed); 34 lines of benchmark and 221 of docs (optional) |
+| Shortcut | `git cherry-pick 25d09b2` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 78,566 tok/s (+3.0 %), 120b 44,164 tok/s (+2.8 %) |
 
 **In plain words:** the expert multiply spent 13 % of its time writing its results, when writing
@@ -94,6 +95,22 @@ Read while typing (line numbers at `25d09b2`):
   the same in every lane turns each buffer load into a loop).
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 25d09b2
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 25d09b2 -- $(git show --name-only --format= 25d09b2)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

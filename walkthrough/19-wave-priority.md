@@ -5,6 +5,7 @@
 | Reference commit | `fa89592` "Raise the wave priority of small expert items; zero-pad the mlp1 input" |
 | Starts from | `027549a` + `6b315b5` (lesson 18) |
 | To type | 30 lines of program code in 2 files; 142 lines of benchmark (optional); 184 lines of docs (optional) |
+| Shortcut | `git cherry-pick fa89592` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 74,746 tok/s, 120b 41,737 tok/s (8 GCDs, official input) |
 
 **In plain words:** we suspected one kind of memory read in the expert multiply was wasteful, and
@@ -87,6 +88,22 @@ Read while typing (line numbers at `fa89592`):
 - `getp-csrc/engine/gpu_engine.hpp:288-292` — the zero padding of `t16`.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick fa89592
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout fa89592 -- $(git show --name-only --format= fa89592)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

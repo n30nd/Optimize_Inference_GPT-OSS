@@ -5,6 +5,7 @@
 | Reference commit | `a9b23f7` "120b: balance the expert work of a GCD pair; signals instead of events" |
 | Starts from | `1131a42` (lesson 22) |
 | To type | 251 lines of program code in 4 files (42 removed), of which 53 are a generated table; 294 lines of tools; 316 lines of prompt lists and 142 of docs (optional) |
+| Shortcut | `git cherry-pick a9b23f7` — copies the finished commit instead of typing (section 5) |
 | Speed after | 120b 42,981 tok/s (+1.7 %); 20b 76,461 tok/s (unchanged path) |
 
 **In plain words:** for 120b the two GPU dies of one card share the experts, and in every layer
@@ -99,6 +100,22 @@ Read while typing (line numbers at `a9b23f7`):
   where the router renumbers its choice.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick a9b23f7
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout a9b23f7 -- $(git show --name-only --format= a9b23f7)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

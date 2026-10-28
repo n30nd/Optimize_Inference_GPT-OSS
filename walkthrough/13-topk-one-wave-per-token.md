@@ -5,6 +5,7 @@
 | Reference commit | `85e8426` "Pick each token's top-4 experts with one wavefront per token" |
 | Starts from | `0214995` (lesson 12) |
 | To type | 64 lines of program code in 2 files (59 in `getp-csrc/kernels/moe.hpp`, 5 in the engine); no tests or docs |
+| Shortcut | `git cherry-pick 85e8426` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 66,710 → **67,394** tok/s (+1.0 %); 120b (lessons 11 + 13 together) 32,651 → **35,815** (+9.7 %) |
 
 **In plain words:** for every token, a small step picks the 4 experts with the highest scores.
@@ -84,6 +85,22 @@ Read while typing (line numbers at `85e8426`):
 - `getp-csrc/engine/gpu_engine.hpp:377–381` — the launch: `(B + 3) / 4` blocks of 256 threads.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 85e8426
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 85e8426 -- $(git show --name-only --format= 85e8426)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough

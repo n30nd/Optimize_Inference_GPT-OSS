@@ -5,6 +5,7 @@
 | Reference commit | `9813b7a` "Run the MoE expert multiplies on the matrix cores, reading MXFP4" |
 | Starts from | `29f59e2` (lesson 09) |
 | To type | 658 lines of program code in 1 file (`getp-csrc/kernels/fast_moe_gemm.hpp`, 14 lines removed); 869 lines of tests and benchmarks (optional); 370 lines of docs (optional) |
+| Shortcut | `git cherry-pick 9813b7a` — copies the finished commit instead of typing (section 5) |
 | Speed after | 20b 7,858 → **64,099** tok/s (×8.2); 120b 2,835 → **32,485** tok/s (with lessons 08–09) |
 
 **In plain words:** after lessons 08 and 09, almost all of the time (96 %) went into one job:
@@ -134,6 +135,22 @@ Spots worth reading twice while typing:
   different per lane and every load becomes a small loop.
 
 ## 5. Type, compare, build, check
+
+**Shortcut — skip the typing.** Take the finished commit as it is:
+
+```bash
+cd /home/namvu/gpt-oss-walkthrough
+git status --short -- . ':!walkthrough'   # must print nothing (no half-typed files)
+git cherry-pick 9813b7a
+```
+
+`git cherry-pick` copies a commit from the finished branch onto yours, with the same name, so
+there is nothing to type, compare or save. Go straight to `make runomp` and the checks below.
+If you already typed part of it and want to stop there, take the finished version of every file
+of the commit over yours, then save as usual:
+`git checkout 9813b7a -- $(git show --name-only --format= 9813b7a)`
+
+**Or type it:**
 
 ```bash
 cd /home/namvu/gpt-oss-walkthrough
