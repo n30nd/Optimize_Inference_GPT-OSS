@@ -136,6 +136,40 @@ busy 21.56 s, 32 steps, 673.9 ms per step
     …       (9 more kernels, each 0.2 % or less)
 ```
 
+**The same kind of run as a picture (Perfetto).** rocprofv3 can also write a `.pftrace` file that
+the web page https://ui.perfetto.dev draws as a timeline: one row per CPU thread and per GPU
+stream, one box per call. Keep the run short; 64 prompts × 16 steps gives a 3 MB file in ~15 s:
+
+```bash
+tools/gpulock.sh 2 -- rocprofv3 --runtime-trace --output-format pftrace -d $W/prof04pf -o p -- \
+  ./run $M20 -m getp -i $W/in64.txt -o $W/out64pf.txt -n 16
+ls -lh $W/prof04pf/p_results.pftrace
+```
+
+- `--runtime-trace` records the kernels **and** the HIP calls on the CPU side (`hipLaunchKernel`,
+  `hipMemcpy`, …) and the memory copies. `--kernel-trace` alone gives only the kernels.
+- `--output-format csv pftrace` writes both kinds of file in one run, if you also want
+  `kernel_shares.py`.
+
+Bring the file to your own computer. From a terminal **on your computer** (not the server):
+`scp mi250-02:/home/namvu/walk-runs/prof04pf/p_results.pftrace .`
+— or in VS Code: File → Add Folder to Workspace → `/home/namvu/walk-runs`, then right-click the
+file → Download.
+
+Open https://ui.perfetto.dev → "Open trace file" (left menu) → pick the file. The page reads the
+file inside your browser; it is not uploaded. Keys: `W`/`S` zoom in/out, `A`/`D` move left/right.
+Click a box for its details; drag across a row to get, at the bottom, a table of every name in that
+range with its count and total time.
+
+The rows you will see (from a test run of lesson 03's program, 16 steps):
+
+| Row | What is in it |
+|---|---|
+| `THREAD 1` | the main thread: 365 × `hipMemcpy` (uploading the weights, ~4.7 s), `hipMalloc` |
+| `STREAM 0` | the GPU side of those uploads (`MEMORY_COPY_HOST_TO_DEVICE`) |
+| `THREAD 2` | the GPU's worker thread: ~390 `hipLaunchKernel` per step (about 60 µs each in this recorded run), then a long `hipMemcpyAsync` per step (`gpu_engine.hpp:304`): the CPU waiting until the step's kernels are done |
+| `STREAM 1` | the kernels, back to back: zoom into one step to see the 24 layers, each a long expert multiply with small kernels between |
+
 Full run (8 GCDs, about 13 minutes):
 
 ```bash
@@ -203,4 +237,229 @@ What the profile says, in numbers:
 
 ## 9. Discussion notes
 
-(empty: we write here during the walk-through)
+### 9.1 What "behind a fixed function" means (section 1, goal 2)
+
+"Fixed function" means a function whose **name and inputs never change again**, while what is
+inside it may be thrown away and rewritten. The rest of the program only ever calls that name.
+
+`gemm_bf16` is not a kernel. It is an ordinary function that runs on the CPU (a *host function*)
+and whose only job is to launch the kernel. At `3163e03`
+(`getp-csrc/kernels/fast_gemm.hpp:63-67`):
+
+```cpp
+static void gemm_bf16(hipStream_t s, const bf16_t *A, int M, const bf16_t *W,
+                      const float *bias, float *C, int N, int K) {
+  dim3 grid((N + GEMM_BN - 1) / GEMM_BN, (M + GEMM_BM - 1) / GEMM_BM);
+  gemm_f32acc_kernel<<<grid, 256, 0, s>>>(A, M, Bf16Rows{W, K}, bias, C, N, K);
+}
+```
+
+- Line 1–2, the doorway: what goes in (`A` M×K bf16, `W` N×K bf16, `bias`), what comes out
+  (`C` M×N fp32), and on which queue of GPU work (`s`, the stream).
+- Line 3–4, the room behind it: pick the grid size and launch one simple kernel.
+
+`gpu_engine.hpp` (the code that runs the 24 layers) calls only the doorway, never the kernel:
+
+```
+gpu_engine.hpp (3163e03)                       fast_gemm.hpp
+  line 318  gemm_bf16(... w_qkv ...)    ─┐
+  line 325  gemm_bf16(... w_o ...)      ─┤      gemm_bf16(...)        ← stays the same
+  line 329  gemm_bf16(... w_router ...) ─┼───►  ─────────────────
+  line 343  gemm_bf16(... unemb ...)    ─┘      how it does it        ← lessons rewrite this
+```
+
+The payoff, in the later commits:
+
+| Lesson | Commit | Rewrote | `fast_*.hpp` grew by | Touched `gpu_engine.hpp`? |
+|---|---|---|---:|---|
+| 06 | `03e8e9d` | `attention_bf16` | +381 | no |
+| 08 | `30dd744` | `gemm_bf16` | +558 | no |
+| 10 | `9813b7a` | `gemm_grouped_mxfp4` | +672 | no |
+
+At `30dd744` the inside of `gemm_bf16` picks one of several matrix-core kernels by the shape
+`M, N, K`, yet its first two lines are the same as at `3163e03`, character for character. So:
+- the three rewrites could be worked on side by side, each in its own file, and land in any order
+  (section 7);
+- each rewrite is tested on its own (`gemm_test.cpp`, `attn_test.cpp`, `moe_gemm_test.cpp`) against
+  the same inputs and outputs the simple version had;
+- if a rewrite is wrong, only that file is suspect.
+
+The simple kernels of this lesson are therefore placeholders: correct and slow, with the doorway
+already in its final shape.
+
+### 9.2 The trace file and `kernel_shares.py`
+
+`rocprofv3 --kernel-trace` writes one row per kernel launch. Our run (lesson 03 build, HIP GPU 2,
+512 prompts, 32 steps) has 12,601 rows. The columns, with values from that run:
+
+| Column | What it is | In our run |
+|---|---|---|
+| `Kind` | type of record | always `KERNEL_DISPATCH` (one kernel launch) |
+| `Agent_Id` | which processor ran it; rocprofv3 numbers every one, see `p_agent_info.csv` | `Agent 4`: agents 0–1 are the two CPUs, 2–9 the 8 GCDs in HIP order, so 4 = HIP GPU 2 |
+| `Queue_Id` | the hardware queue (list in memory the GPU takes launch orders from) | 2 for the 121 copies at load time, 1 for the model's kernels |
+| `Stream_Id` | the HIP stream | 0 = default stream (`hipMemcpy` at load), 1 = `w->stream` (`gpu_engine.hpp:215`) |
+| `Thread_Id` | Linux number of the CPU thread that launched it | 1395177 = main thread (loading), 1395509 = this GPU's worker thread (`gpu_engine.hpp:363`) |
+| `Dispatch_Id` | launch counter | 1 … 12,601 |
+| `Kernel_Id` | one number per different kernel | 15 different kernels |
+| `Kernel_Name` | full C++ name with argument types | the script keeps only the part before `(` |
+| `Correlation_Id` | links this row to the CPU-side call, if those are traced too (`--hip-trace`) | equal to `Dispatch_Id` here |
+| `Start_Timestamp`, `End_Timestamp` | nanoseconds on the GPU's clock; only End − Start means something | first copy: 6,560 ns |
+| `LDS_Block_Size` | bytes of `__shared__` memory per block, rounded up | gemm 16,896 (two 32 × 65 float tiles = 16,640) |
+| `Scratch_Size` | bytes per thread pushed out to slow memory because registers ran out | 0 everywhere (good) |
+| `VGPR_Count` | vector registers per thread (each thread has its own) | gemm 108, attention 120 |
+| `Accum_VGPR_Count` | AGPRs: a second register set on MI250, made for matrix-core results | used here as spare storage (attention 128) |
+| `SGPR_Count` | scalar registers: one value shared by the whole wave of 64 threads | 16–112 |
+| `Workgroup_Size_X/Y/Z` | threads per block (`blockDim`) | 256 or 64 |
+| `Grid_Size_X/Y/Z` | **total threads**, not blocks | embed `<<<512, 256>>>` → 131,072 = 512 × 256 |
+
+The last 7 columns are fixed when the kernel is compiled or launched; the same kernel shows the
+same values on every row. Registers matter later: the more a thread uses, the fewer threads fit on
+a compute unit at once.
+
+What the script does: per agent and per kernel name, add up `End − Start` and count the rows;
+`busy` = sum over all kernels; one step = one call of `embed_kernel`; sort by time, print share,
+seconds, calls and µs per call. `busy` is a sum of kernel times, not clock time — with one stream
+that is the same (here 33.97 s busy vs 33.98 s from the first to the last model kernel: the GPU
+was idle for about 15 ms in all).
+
+Our lesson 03 run printed 1,061.7 ms per step, with the same order as the reference profile in
+section 5: expert multiply 69.9 %, dense multiply 27.8 %, attention 0.7 %. The lesson page's exact
+step time is 1.08 s, so this is the "before" picture for this lesson.
+
+### 9.3 Full-length profile of lesson 03's program (before `3163e03`)
+
+The same profile, but without `-n 32`, so all 1,024 steps run (lesson 03 build, still at
+`35f01e8`, HIP GPU 2, 512 prompts). It took 20 minutes:
+
+```
+$ tools/gpulock.sh 2 -- rocprofv3 --kernel-trace --output-format csv -d $W/prof04 -o p -- \
+    ./run $M20 -m getp -i $W/in512.txt -o $W/out512.txt
+...
+elapsed time(s): 1199.450000, achieved throughput TPS (tok/s): 423.077244
+...
+$ python3 walkthrough/kernel_shares.py $W/prof04/p_kernel_trace.csv
+Agent 4: busy 1198.80 s, 1024 steps, 1170.7 ms per step
+   share  total s   calls   us/call  kernel
+   64.7%  776.128   49152   15790.4  gemm_grouped_mxfp4_exact_kernel
+   25.2%  302.511   74752    4046.9  gemm_exact_kernel<Bf16Rows>
+    8.5%  102.491   24576    4170.3  attention_exact
+    0.7%    7.830   24576     318.6  moe_group_kernel
+    0.3%    3.137   50176      62.5  rmsnorm_exact
+    0.2%    1.871   24576      76.1  swiglu_exact
+    0.1%    1.247   24576      50.7  router_topk_exact
+    0.1%    1.236   24576      50.3  moe_combine_exact
+    0.1%    0.853   24576      34.7  moe_gather_kernel
+    0.0%    0.448    1024     437.5  argmax_kernel
+    0.0%    0.423   24576      17.2  rope_exact
+    0.0%    0.408   24576      16.6  add_inplace_kernel
+    0.0%    0.196   24576       8.0  kv_write_kernel
+    0.0%    0.014    1024      13.5  embed_kernel
+    0.0%    0.011    2169       5.0  __amd_rocclr_copyBuffer
+```
+
+(The model settings and rocprofv3's own log lines are left out. This run wrote over the 32-step
+`p_kernel_trace.csv` of 9.2.)
+
+Compared with the 32-step run of 9.2:
+
+| | 32 steps (9.2) | 1,024 steps |
+|---|---:|---:|
+| ms per step | 1,061.7 | 1,170.7 |
+| expert multiply, µs per call | 15,452 | 15,790 |
+| dense multiply, µs per call | 4,039 | 4,047 |
+| attention, µs per call | 328 | **4,170** (×12.7) |
+| attention share | 0.7 % | **8.5 %** |
+
+The multiplies cost the same per call at every step; attention does not. Splitting the trace by
+step (each step starts at its `embed_kernel`) and by layer:
+
+| step | whole step, ms | attention, ms | in the 12 sliding-window layers | in the 12 full layers |
+|---:|---:|---:|---:|---:|
+| 1 | 1,035 | 5.0 | 2.5 | 2.5 |
+| 127 | 1,135 | 43.5 | 22.8 | 20.7 |
+| 255 | 1,152 | 63.0 | 22.9 | 40.1 |
+| 511 | 1,169 | 102.3 | 22.9 | 79.4 |
+| 767 | 1,201 | 142.0 | 22.9 | 119.1 |
+| 1,023 | 1,255 | **185.1** | 22.9 | **162.2** |
+
+- gpt-oss alternates two kinds of layer. The even layers (0, 2, …) only look back 128 positions
+  (`sliding window: 128`, `gpu_engine.hpp:168`), so their attention stops growing at step 128:
+  22.9 ms from then on.
+- The odd layers look back at every earlier position, so their time grows in a straight line with
+  the step: about 0.16 ms more per step, 162 ms at the last step.
+- At the last step attention is 185 of 1,255 ms = **15 %** of the step, not 0.7 %.
+
+This answers question 3 of section 8: a profile of 32 short steps hides attention, because it
+measures only the start of the answers, where the histories are short. To see it properly, profile
+the full answer length (or profile single steps late in the answer), and split the time by step.
+Once the multiplies get 8–10× faster (lessons 08 and 10), the same 185 ms would be a much larger
+share, which is why attention is third on the list of section 7 although the short profile gave
+it 1 %.
+
+### 9.4 Full-length profile after the cherry-pick (fast path)
+
+Same command as 9.3, on HIP GPU 1. The `./run` was built from `f48c918`, which already holds
+lesson 05 on top of lesson 04 (`8a5abb0`). For 20b on one GCD that changes only the three small
+MoE kernels (`moe_group_ep_kernel`, `moe_gather_ep_kernel`, `moe_combine_ep_kernel` instead of
+`moe_group_kernel`, `gather_bf16_kernel`, `moe_combine_kernel`); lesson 05 does not touch the
+`fast_*.hpp` kernels, so the three big kernels are this lesson's.
+
+```
+$ tools/gpulock.sh 1 -- rocprofv3 --kernel-trace --output-format csv -d $W/prof04 -o p -- \
+    ./run $M20 -m getp -i $W/in512.txt -o $W/out512.txt
+...
+getp: fast path, 1 GPU(s) in 1 group(s) of 1, 512 requests per GPU per wave, KV cache for 1024 positions
+...
+elapsed time(s): 772.801000, achieved throughput TPS (tok/s): 659.004064
+...
+$ python3 walkthrough/kernel_shares.py $W/prof04/p_kernel_trace.csv
+Agent 3: busy 772.28 s, 1024 steps, 754.2 ms per step
+   share  total s   calls   us/call  kernel
+   62.6%  483.564   49152    9838.1  gemm_grouped_mxfp4_f32acc_kernel
+   25.6%  197.846   74752    2646.7  gemm_f32acc_kernel<Bf16Rows>
+    9.9%   76.543   24576    3114.5  attention_bf16_kernel
+    0.9%    7.333   24576     298.4  moe_group_ep_kernel
+    0.2%    1.531   24576      62.3  swiglu_bf16_kernel
+    0.2%    1.276   24576      51.9  router_topk_exact
+    0.1%    1.121   24576      45.6  moe_combine_ep_kernel<false>
+    0.1%    0.923   50176      18.4  rmsnorm_bf16_kernel
+    0.1%    0.753   24576      30.7  moe_gather_ep_kernel<unsigned short>
+    0.1%    0.504   24576      20.5  rope_kv_bf16_kernel
+    0.1%    0.441    1024     430.8  argmax_kernel
+    0.1%    0.414   24576      16.8  add_inplace_kernel
+    0.0%    0.015    1024      14.2  embed_kernel
+    0.0%    0.012    2169       5.6  __amd_rocclr_copyBuffer
+```
+
+(Model settings and rocprofv3's log lines left out; this run wrote over the trace of 9.3.)
+
+The first 32 steps of this trace average **674.3 ms**, the reference's 673.9 ms of section 5.
+
+Before (9.3, exact path) → after (fast path), 512 prompts, 1,024 steps, one GCD:
+
+| | exact (9.3) | fast (this run) | change |
+|---|---:|---:|---:|
+| tok/s (one GCD, under rocprofv3) | 423 | 659 | **+56 %** |
+| ms per step | 1,170.7 | 754.2 | −36 % |
+| expert multiply, µs per call | 15,790 | 9,838 | −38 % |
+| dense multiply, µs per call | 4,047 | 2,647 | −35 % |
+| attention, µs per call | 4,170 | 3,115 | −25 % |
+| attention share | 8.5 % | 9.9 % | |
+
++56 % on one GCD is the same gain as the 8-GCD run of section 6 (3,348 → 5,217 tok/s).
+
+Attention by step and layer, as in 9.3:
+
+| step | whole step, ms | attention, ms | 12 sliding-window layers | 12 full layers |
+|---:|---:|---:|---:|---:|
+| 1 | 660 | 4.4 | 2.2 | 2.2 |
+| 127 | 715 | 32.7 | 17.3 | 15.5 |
+| 255 | 733 | 46.7 | 17.3 | 29.4 |
+| 511 | 754 | 75.8 | 17.3 | 58.5 |
+| 767 | 781 | 104.6 | 17.3 | 87.3 |
+| 1,023 | 815 | **132.8** | 17.3 | **115.6** |
+
+- The multiplies got faster by more than attention did, so attention's share went **up**: 16 % of
+  the last step (133 of 815 ms), against 15 % before.
+- The order of section 7 still holds: expert multiply (63 %), dense multiply (26 %), attention
+  (10 %, growing with the step), the rest under 2 %.
